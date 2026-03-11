@@ -4,6 +4,7 @@ import pandas as pd
 import os
 from util.db_tool import DbTools  # 请确保这个模块存在
 import time
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -40,39 +41,43 @@ def process_stock(item, processed):
                                         end_date="20260308", adjust="hfq")
         print(index_data)
 
-        for index, row in index_data.iterrows():
-            # 跳过已处理的记录
+        pending_updates = []
+        for _, row in index_data.iterrows():
             progress_key = f"{stock_code},{row['日期']}"
             if progress_key in processed:
                 continue
 
-            # 插入数据库，并处理可能的错误
-            retry_count = 3
-            for attempt in range(retry_count):
-                try:
-                    DbTools().create_stock_info(
-                        stock_code=row['股票代码'],
-                        open_price=row['开盘'],
-                        close_price=row['收盘'],
-                        high_price=row['最高'],
-                        low_price=row['最低'],
-                        volume=row['成交量'],
-                        turnover=row['成交额'],
-                        amplitude=row['振幅'],
-                        price_change_rate=row['涨跌幅'],
-                        price_change_amount=row['涨跌额'],
-                        turnover_rate=row['换手率'],
-                        date=row['日期']
-                    )
-                    # 保存进度
-                    save_progress(stock_code, row['日期'])
-                    break  # 插入成功，退出重试循环
-                except Exception as e:
-                    print(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt == retry_count - 1:
-                        log_error(stock_code, row['日期'], str(e))  # 记录错误信息
-                    else:
-                        time.sleep(5)  # 等待几秒钟后重试
+            pending_updates.append({
+                'stock_code': row['股票代码'],
+                'open_price': row['开盘'],
+                'close_price': row['收盘'],
+                'high_price': row['最高'],
+                'low_price': row['最低'],
+                'volume': row['成交量'],
+                'turnover': row['成交额'],
+                'amplitude': row['振幅'],
+                'price_change_rate': row['涨跌幅'],
+                'price_change_amount': row['涨跌额'],
+                'turnover_rate': row['换手率'],
+                'date': row['日期'],
+            })
+
+        if not pending_updates:
+            return
+
+        retry_count = 3
+        for attempt in range(retry_count):
+            try:
+                asyncio.run(DbTools().batch_stock_info(pending_updates))
+                for update in pending_updates:
+                    save_progress(stock_code, update['date'])
+                break
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == retry_count - 1:
+                    log_error(stock_code, 'BATCH', str(e))
+                else:
+                    time.sleep(5)
 
     except Exception as e:
         error_message = f"Error processing {stock_code}: {e}"
