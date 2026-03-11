@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from datetime import datetime
 
@@ -14,6 +15,20 @@ def get_timestamp():
 
 
 class DbTools:
+    # 针对数据库 DECIMAL/NUMERIC 列做统一上限保护，避免 1264 Out of range
+    FIELD_LIMITS = {
+        'open_price': 999999.99,
+        'close_price': 999999.99,
+        'high_price': 999999.99,
+        'low_price': 999999.99,
+        'volume': 999999999999.99,
+        'turnover': 99999999999999.99,
+        'amplitude': 999.99,
+        'price_change_rate': 999.99,
+        'price_change_amount': 999999.99,
+        'turnover_rate': 999.99,
+    }
+
     def __init__(self):
         self.db_info = self.load_db_info()
         self.pool = None
@@ -22,6 +37,32 @@ class DbTools:
         db_info_path = os.path.join(get_config_path(), 'db_info.json')
         with open(db_info_path, 'r') as f:
             return json.load(f)
+
+    def _normalize_numeric(self, field, value):
+        """统一清洗不合法数值：空值/NaN/Inf/越界 -> None。"""
+        if value is None:
+            return None
+
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        if not math.isfinite(num):
+            return None
+
+        limit = self.FIELD_LIMITS.get(field)
+        if limit is not None and abs(num) > limit:
+            return None
+
+        return num
+
+    def _sanitize_update(self, update):
+        sanitized = dict(update)
+        for field in self.FIELD_LIMITS:
+            sanitized[field] = self._normalize_numeric(field, update.get(field))
+        sanitized['date'] = str(update.get('date', ''))
+        return sanitized
 
     async def init_pool(self):
         if self.pool is not None:
@@ -52,10 +93,12 @@ class DbTools:
         if self.pool is None:
             await self.init_pool()
 
+        sanitized_updates = [self._sanitize_update(update) for update in updates]
+
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                stock_code = updates[0]['stock_code']
-                update_dates = [update['date'] for update in updates]
+                stock_code = sanitized_updates[0]['stock_code']
+                update_dates = [update['date'] for update in sanitized_updates]
 
                 placeholders = ','.join(['%s'] * len(update_dates))
                 query_check = (
@@ -79,8 +122,8 @@ class DbTools:
                         update['turnover_rate'],
                         update['date'],
                     )
-                    for update in updates
-                    if str(update['date']) not in existing_dates
+                    for update in sanitized_updates
+                    if update['date'] and str(update['date']) not in existing_dates
                 ]
 
                 if not rows_to_insert:
