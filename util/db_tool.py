@@ -23,10 +23,10 @@ class DbTools:
         'low_price': 999999.99,
         'volume': 999999999999.99,
         'turnover': 99999999999999.99,
-        'amplitude': 999.99,
-        'price_change_rate': 999.99,
-        'price_change_amount': 999999.99,
-        'turnover_rate': 999.99,
+        'amplitude': 99999999999999.99,
+        'price_change_rate': 99999999999999.99,
+        'price_change_amount': 99999999999999.99,
+        'turnover_rate': 99999999999999.99,
     }
 
     def __init__(self):
@@ -71,7 +71,7 @@ class DbTools:
             host=self.db_info.get('host'),
             port=int(self.db_info.get('port', 3306)),
             user=self.db_info.get('user'),
-            password=self.db_info.get('password'),
+            password=self.db_info.get('passwd'),
             db=self.db_info.get('database') or self.db_info.get('db'),
             charset=self.db_info.get('charset', 'utf8mb4'),
             autocommit=False,
