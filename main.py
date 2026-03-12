@@ -1,16 +1,36 @@
+import asyncio
 import json
+import os
+import time
+from datetime import datetime
+
 import akshare as ak
 import pandas as pd
-import os
-from util.db_tool import DbTools  # 请确保这个模块存在
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from util.db_tool import DbTools
+
+API_RETRY_COUNT = 5
+API_RETRY_SLEEP_SECONDS = 3
+MAX_CONCURRENCY = 8
 
 
-def save_progress(stock_code, date):
-    """保存进度到文件"""
+def normalize_stock_code(stock_code):
+    """标准化股票代码，避免 000356 被解析为 356。"""
+    code = str(stock_code).strip()
+    if '.' in code:
+        code = code.split('.')[0]
+    code = ''.join(ch for ch in code if ch.isdigit())
+    if not code:
+        return ""
+    return code.zfill(6)
+
+
+def save_progress_batch(progress_lines):
+    """批量保存进度，减少频繁文件 IO。"""
+    if not progress_lines:
+        return
     with open('progress.log', 'a') as f:
-        f.write(f'{stock_code},{date}\n')
+        f.writelines(progress_lines)
 
 
 def load_progress():
@@ -19,8 +39,7 @@ def load_progress():
         return set()
     with open('progress.log', 'r') as f:
         lines = f.readlines()
-    processed = set(line.strip() for line in lines)
-    return processed
+    return set(line.strip() for line in lines)
 
 
 def log_error(stock_code, date, error_message):
@@ -29,73 +48,113 @@ def log_error(stock_code, date, error_message):
         f.write(f"{stock_code},{date},{error_message}\n")
 
 
-def process_stock(item, processed):
-    stock_code = item['代码']
+def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RETRY_SLEEP_SECONDS, **kwargs):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                print(f"{func.__name__} attempt {attempt}/{retries} failed: {e}")
+                time.sleep(sleep_seconds)
+    raise last_error
+
+
+def get_stock_history(stock_code, end_date):
+    """同步调用 akshare，带重试，供 asyncio.to_thread 使用。"""
+    info_df = fetch_with_retry(ak.stock_individual_info_em, symbol=stock_code)
+    listing_date_series = info_df.loc[info_df['item'] == '上市时间', 'value']
+    if listing_date_series.empty:
+        raise ValueError(f"未找到上市时间: {stock_code}")
+    listing_date = str(listing_date_series.values[0])
+
+    history_df = fetch_with_retry(
+        ak.stock_zh_a_hist,
+        symbol=stock_code,
+        period="daily",
+        start_date=listing_date,
+        end_date=end_date,
+        adjust="hfq",
+    )
+    return history_df
+
+
+async def process_stock(item, processed, db_tools, semaphore, progress_lock, end_date):
+    raw_code = item['代码']
+    stock_code = normalize_stock_code(raw_code)
+    if not stock_code:
+        log_error(raw_code, "N/A", "invalid stock code")
+        return
 
     try:
-        stock_individual_info_em_df = ak.stock_individual_info_em(symbol=str(stock_code))
-        listing_date = stock_individual_info_em_df.loc[stock_individual_info_em_df['item'] == '上市时间', 'value'].values[0]
-        print(listing_date)
-        index_data = ak.stock_zh_a_hist(symbol=str(stock_code), period="daily", start_date=listing_date,
-                                        end_date="20260308", adjust="hfq")
-        print(index_data)
+        async with semaphore:
+            index_data = await asyncio.to_thread(get_stock_history, stock_code, end_date)
 
-        for index, row in index_data.iterrows():
-            # 跳过已处理的记录
-            progress_key = f"{stock_code},{row['日期']}"
+        if index_data is None or index_data.empty:
+            return
+
+        pending_updates = []
+        new_progress_lines = []
+
+        for _, row in index_data.iterrows():
+            row_date = str(row['日期'])
+            progress_key = f"{stock_code},{row_date}"
             if progress_key in processed:
                 continue
 
-            # 插入数据库，并处理可能的错误
-            retry_count = 3
-            for attempt in range(retry_count):
-                try:
-                    DbTools().create_stock_info(
-                        stock_code=row['股票代码'],
-                        open_price=row['开盘'],
-                        close_price=row['收盘'],
-                        high_price=row['最高'],
-                        low_price=row['最低'],
-                        volume=row['成交量'],
-                        turnover=row['成交额'],
-                        amplitude=row['振幅'],
-                        price_change_rate=row['涨跌幅'],
-                        price_change_amount=row['涨跌额'],
-                        turnover_rate=row['换手率'],
-                        date=row['日期']
-                    )
-                    # 保存进度
-                    save_progress(stock_code, row['日期'])
-                    break  # 插入成功，退出重试循环
-                except Exception as e:
-                    print(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt == retry_count - 1:
-                        log_error(stock_code, row['日期'], str(e))  # 记录错误信息
-                    else:
-                        time.sleep(5)  # 等待几秒钟后重试
+            pending_updates.append({
+                'stock_code': normalize_stock_code(row.get('股票代码', stock_code)) or stock_code,
+                'open_price': row['开盘'],
+                'close_price': row['收盘'],
+                'high_price': row['最高'],
+                'low_price': row['最低'],
+                'volume': row['成交量'],
+                'turnover': row['成交额'],
+                'amplitude': row['振幅'],
+                'price_change_rate': row['涨跌幅'],
+                'price_change_amount': row['涨跌额'],
+                'turnover_rate': row['换手率'],
+                'date': row_date,
+            })
+            new_progress_lines.append(f"{progress_key}\n")
+
+        if not pending_updates:
+            return
+
+        await db_tools.batch_stock_info(pending_updates)
+
+        async with progress_lock:
+            await asyncio.to_thread(save_progress_batch, new_progress_lines)
+            processed.update(line.strip() for line in new_progress_lines)
 
     except Exception as e:
         error_message = f"Error processing {stock_code}: {e}"
         print(error_message)
-        log_error(stock_code, "N/A", error_message)  # 记录无法获取数据的错误
+        log_error(stock_code, "N/A", error_message)
 
 
-def run():
-    df = pd.read_csv('allstock_em.csv')
+async def run():
+    df = pd.read_csv('allstock_em.csv', dtype={'代码': str})
     df_data = json.loads(df.to_json(orient='records'))
-    processed = load_progress()  # 加载已处理的记录
+    processed = load_progress()
 
-    # 使用多线程处理
-    with ThreadPoolExecutor(max_workers=10) as executor:  # 你可以调整max_workers以控制线程数
-        futures = {executor.submit(process_stock, item, processed): item['代码'] for item in df_data}
+    db_tools = DbTools()
+    await db_tools.init_pool()
 
-        for future in as_completed(futures):
-            stock_code = futures[future]
-            try:
-                future.result()  # 获取线程执行结果
-            except Exception as e:
-                print(f"Error in thread processing {stock_code}: {e}")
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    progress_lock = asyncio.Lock()
+    end_date = datetime.now().strftime("%Y%m%d")
+
+    try:
+        tasks = [
+            process_stock(item, processed, db_tools, semaphore, progress_lock, end_date)
+            for item in df_data
+        ]
+        await asyncio.gather(*tasks)
+    finally:
+        await db_tools.close()
 
 
 if __name__ == '__main__':
-    run()
+    asyncio.run(run())
