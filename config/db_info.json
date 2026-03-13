@@ -1,0 +1,9 @@
+{
+      "host": "localhost",
+      "user": "root",
+      "passwd": "865418267",
+      "port": 3306,
+      "db": "stock_info",
+      "charset": "utf8mb4",
+      "use_unicode": true
+    }
