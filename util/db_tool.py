@@ -1,97 +1,223 @@
 import json
+import math
 import os
 from datetime import datetime
-import pandas as pd
-import pymysql
+
+import aiomysql
 from config.get_config_path import get_config_path
 
 
-
 def get_timestamp():
-    # 获取当前时间
     current_time = datetime.now()
     timestamp = int(current_time.timestamp())
     date_string = current_time.strftime("%Y-%m-%d")
-    # 组合日期和时间戳
-    date_timestamp_string = f"{date_string}_{timestamp}"
-    return date_timestamp_string
+    return f"{date_string}_{timestamp}"
+
 
 class DbTools:
+    FIELD_LIMITS = {
+        'open_price': 999999.99,
+        'close_price': 999999.99,
+        'high_price': 999999.99,
+        'low_price': 999999.99,
+        'volume': 999999999999.99,
+        'turnover': 99999999999999.99,
+        'amplitude': 999.99,
+        'price_change_rate': 999.99,
+        'price_change_amount': 999999.99,
+        'turnover_rate': 999.99,
+        'pe_ttm': 9999999999.9999,
+        'pb': 9999999999.9999,
+        'total_market_value': 9999999999999999999999.99,
+        'circulating_market_value': 9999999999999999999999.99,
+    }
+
     def __init__(self):
         self.db_info = self.load_db_info()
-        self.conn = self.connect(self.db_info)
+        self.pool = None
 
     def load_db_info(self):
-        # 从 JSON 文件加载数据库信息
         db_info_path = os.path.join(get_config_path(), 'db_info.json')
         with open(db_info_path, 'r') as f:
-            db_info_json = json.load(f)
-        return db_info_json
+            return json.load(f)
 
-    def connect(self, db_info):
-        try:
-            conn = pymysql.connect(**db_info)
-            print("Connected to amazon_mysql database!")
-            return conn
-        except Exception as error:
-            print("Error while connecting to amazon_mysql:", error)
+    def _normalize_numeric(self, field, value):
+        if value is None:
             return None
 
-    def connect_close(self):
         try:
-            self.conn.close()
-        except Exception as error:
-            print("Error while connecting to amazon_mysql:", error)
+            num = float(value)
+        except (TypeError, ValueError):
             return None
 
-    def create_stock_info(self, stock_code, open_price, close_price, high_price, low_price, volume,
-                          turnover, amplitude, price_change_rate, price_change_amount, turnover_rate, date):
-        conn = self.conn
-        cursor = conn.cursor()
+        if not math.isfinite(num):
+            return None
 
-        # 检查是否存在完全相同的记录
-        check_query = "SELECT COUNT(*) FROM stock_data WHERE stock_code = %s AND date = %s"
-        cursor.execute(check_query, (stock_code, date))
-        result = cursor.fetchone()
+        limit = self.FIELD_LIMITS.get(field)
+        if limit is not None and abs(num) > limit:
+            return None
 
-        if result[0] > 0:
-            print("Record already exists, skipping insertion.")
-        else:
-            # 插入新记录
-            query = "INSERT INTO stock_data (stock_code, open_price, close_price, high_price, low_price, volume, turnover, amplitude, price_change_rate, price_change_amount, turnover_rate, date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-            values = (
-                stock_code, open_price, close_price, high_price, low_price, volume,
-                turnover, amplitude, price_change_rate, price_change_amount, turnover_rate, date)
-            cursor.execute(query, values)
-            conn.commit()
-            print("Record inserted successfully into create_stock_info table")
-        self.connect_close()
+        return num
 
+    def _sanitize_update(self, update):
+        sanitized = dict(update)
+        for field in [
+            'open_price', 'close_price', 'high_price', 'low_price', 'volume', 'turnover',
+            'amplitude', 'price_change_rate', 'price_change_amount', 'turnover_rate'
+        ]:
+            sanitized[field] = self._normalize_numeric(field, update.get(field))
+        sanitized['date'] = str(update.get('date', ''))
+        return sanitized
+
+    async def init_pool(self):
+        if self.pool is not None:
+            return
+        self.pool = await aiomysql.create_pool(
+            host=self.db_info.get('host'),
+            port=int(self.db_info.get('port', 3306)),
+            user=self.db_info.get('user'),
+            password=self.db_info.get('password'),
+            db=self.db_info.get('database') or self.db_info.get('db'),
+            charset=self.db_info.get('charset', 'utf8mb4'),
+            autocommit=False,
+            minsize=1,
+            maxsize=10,
+        )
+
+    async def close(self):
+        if self.pool is None:
+            return
+        self.pool.close()
+        await self.pool.wait_closed()
+        self.pool = None
 
     async def batch_stock_info(self, updates):
-        try:
-            async with self.conn.cursor() as cursor:
-                for update in updates:
-                    # 查询是否已经存在相同的记录
-                    query_check = """
-                    SELECT COUNT(*) FROM stock_data
-                    WHERE `stock_code` = %s AND `date` = %s
-                    """
-                    await cursor.execute(query_check, (update['stock_code'], update['date']))
-                    result = await cursor.fetchone()
+        if not updates:
+            return
 
-                    # 如果不存在，则执行插入操作
-                    if result[0] == 0:
-                        query_insert = """
-                        INSERT INTO expanded_asin_info (`market`, `classification_id`, `Asin`, `Rank`, `Date`)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """
-                        await cursor.execute(query_insert, (
-                        update['market'], update['classification_id'], update['Asin'], update['Rank'], update['Date']))
-                await self.conn.commit()
-                print("Records inserted successfully into expanded_asin_info table")
-        except Exception as e:
-            print(f"Error occurred when inserting into expanded_asin_info: {e}")
-        finally:
-            # 确保连接关闭
-            await self.close_connection()
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_updates = [self._sanitize_update(update) for update in updates]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                stock_code = sanitized_updates[0]['stock_code']
+                update_dates = [update['date'] for update in sanitized_updates]
+
+                placeholders = ','.join(['%s'] * len(update_dates))
+                query_check = (
+                    f"SELECT `date` FROM stock_data WHERE `stock_code` = %s AND `date` IN ({placeholders})"
+                )
+                await cursor.execute(query_check, [stock_code, *update_dates])
+                existing_dates = {str(row[0]) for row in await cursor.fetchall()}
+
+                rows_to_insert = [
+                    (
+                        update['stock_code'],
+                        update['open_price'],
+                        update['close_price'],
+                        update['high_price'],
+                        update['low_price'],
+                        update['volume'],
+                        update['turnover'],
+                        update['amplitude'],
+                        update['price_change_rate'],
+                        update['price_change_amount'],
+                        update['turnover_rate'],
+                        update['date'],
+                    )
+                    for update in sanitized_updates
+                    if update['date'] and str(update['date']) not in existing_dates
+                ]
+
+                if not rows_to_insert:
+                    return
+
+                query_insert = """
+                INSERT INTO stock_data (
+                    stock_code,
+                    open_price,
+                    close_price,
+                    high_price,
+                    low_price,
+                    volume,
+                    turnover,
+                    amplitude,
+                    price_change_rate,
+                    price_change_amount,
+                    turnover_rate,
+                    date
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                await cursor.executemany(query_insert, rows_to_insert)
+                await conn.commit()
+
+    async def upsert_stock_basic_info(self, basic_rows):
+        """插入 stock_zh_a_spot_em 的代码和名称，插入前先查重。"""
+        if not basic_rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                codes = [row['stock_code'] for row in basic_rows if row.get('stock_code')]
+                if not codes:
+                    return 0
+
+                placeholders = ','.join(['%s'] * len(codes))
+                query_existing = f"SELECT stock_code FROM stock_basic_info WHERE stock_code IN ({placeholders})"
+                await cursor.execute(query_existing, codes)
+                existing_codes = {row[0] for row in await cursor.fetchall()}
+
+                rows_to_insert = [
+                    (row['stock_code'], row['stock_name'])
+                    for row in basic_rows
+                    if row['stock_code'] not in existing_codes
+                ]
+
+                if not rows_to_insert:
+                    return 0
+
+                query_insert = """
+                INSERT INTO stock_basic_info (stock_code, stock_name)
+                VALUES (%s, %s)
+                """
+                await cursor.executemany(query_insert, rows_to_insert)
+                await conn.commit()
+                return len(rows_to_insert)
+
+    async def update_stock_data_valuation(self, valuation_rows, spot_date):
+        """按 stock_code + date 更新 stock_data 的估值字段。"""
+        if not valuation_rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        rows_to_update = []
+        for row in valuation_rows:
+            rows_to_update.append((
+                self._normalize_numeric('pe_ttm', row.get('pe_ttm')),
+                self._normalize_numeric('pb', row.get('pb')),
+                self._normalize_numeric('total_market_value', row.get('total_market_value')),
+                self._normalize_numeric('circulating_market_value', row.get('circulating_market_value')),
+                row['stock_code'],
+                spot_date,
+            ))
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_update = """
+                UPDATE stock_data
+                SET pe_ttm = %s,
+                    pb = %s,
+                    total_market_value = %s,
+                    circulating_market_value = %s
+                WHERE stock_code = %s AND date = %s
+                """
+                await cursor.executemany(query_update, rows_to_update)
+                await conn.commit()
+                return cursor.rowcount

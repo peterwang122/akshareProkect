@@ -1,4 +1,5 @@
 akshare==1.18.35
+aiomysql==0.2.0
 beautifulsoup4==4.12.3
 certifi==2024.8.30
 charset-normalizer==3.3.2
@@ -24,3 +25,4 @@ urllib3==2.2.2
 vnpy_akshare==1.0.0
 webencodings==0.5.1
 xlrd==2.0.1
+PyMySQL==1.1.1
