@@ -15,7 +15,6 @@ MAX_CONCURRENCY = 8
 
 
 def normalize_stock_code(stock_code):
-    """标准化股票代码，避免 000356 被解析为 356。"""
     code = str(stock_code).strip()
     if '.' in code:
         code = code.split('.')[0]
@@ -26,7 +25,6 @@ def normalize_stock_code(stock_code):
 
 
 def save_progress_batch(progress_lines):
-    """批量保存进度，减少频繁文件 IO。"""
     if not progress_lines:
         return
     with open('progress.log', 'a') as f:
@@ -34,7 +32,6 @@ def save_progress_batch(progress_lines):
 
 
 def load_progress():
-    """加载进度文件，返回已处理的记录集合"""
     if not os.path.exists('progress.log'):
         return set()
     with open('progress.log', 'r') as f:
@@ -43,7 +40,6 @@ def load_progress():
 
 
 def log_error(stock_code, date, error_message):
-    """记录错误信息"""
     with open('error.log', 'a') as f:
         f.write(f"{stock_code},{date},{error_message}\n")
 
@@ -62,7 +58,6 @@ def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RET
 
 
 def get_stock_history(stock_code, end_date):
-    """同步调用 akshare，带重试，供 asyncio.to_thread 使用。"""
     info_df = fetch_with_retry(ak.stock_individual_info_em, symbol=stock_code)
     listing_date_series = info_df.loc[info_df['item'] == '上市时间', 'value']
     if listing_date_series.empty:
@@ -78,6 +73,40 @@ def get_stock_history(stock_code, end_date):
         adjust="hfq",
     )
     return history_df
+
+
+def get_stock_spot():
+    return fetch_with_retry(ak.stock_zh_a_spot_em)
+
+
+async def sync_spot_data(db_tools, spot_date):
+    spot_df = await asyncio.to_thread(get_stock_spot)
+    if spot_df is None or spot_df.empty:
+        return
+
+    basic_rows = []
+    valuation_rows = []
+    for _, row in spot_df.iterrows():
+        stock_code = normalize_stock_code(row.get('代码'))
+        if not stock_code:
+            continue
+
+        basic_rows.append({
+            'stock_code': stock_code,
+            'stock_name': str(row.get('名称', '')).strip(),
+        })
+
+        valuation_rows.append({
+            'stock_code': stock_code,
+            'pe_ttm': row.get('市盈率-动态'),
+            'pb': row.get('市净率'),
+            'total_market_value': row.get('总市值'),
+            'circulating_market_value': row.get('流通市值'),
+        })
+
+    inserted = await db_tools.upsert_stock_basic_info(basic_rows)
+    updated = await db_tools.update_stock_data_valuation(valuation_rows, spot_date)
+    print(f"stock_basic_info inserted: {inserted}, stock_data valuation updated rows: {updated}")
 
 
 async def process_stock(item, processed, db_tools, semaphore, progress_lock, end_date):
@@ -145,6 +174,7 @@ async def run():
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     progress_lock = asyncio.Lock()
     end_date = datetime.now().strftime("%Y%m%d")
+    spot_date = datetime.now().strftime("%Y-%m-%d")
 
     try:
         tasks = [
@@ -152,6 +182,7 @@ async def run():
             for item in df_data
         ]
         await asyncio.gather(*tasks)
+        await sync_spot_data(db_tools, spot_date)
     finally:
         await db_tools.close()
 

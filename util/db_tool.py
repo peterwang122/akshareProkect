@@ -15,7 +15,6 @@ def get_timestamp():
 
 
 class DbTools:
-    # 针对数据库 DECIMAL/NUMERIC 列做统一上限保护，避免 1264 Out of range
     FIELD_LIMITS = {
         'open_price': 999999.99,
         'close_price': 999999.99,
@@ -23,10 +22,14 @@ class DbTools:
         'low_price': 999999.99,
         'volume': 999999999999.99,
         'turnover': 99999999999999.99,
-        'amplitude': 99999999999999.99,
-        'price_change_rate': 99999999999999.99,
-        'price_change_amount': 99999999999999.99,
-        'turnover_rate': 99999999999999.99,
+        'amplitude': 999.99,
+        'price_change_rate': 999.99,
+        'price_change_amount': 999999.99,
+        'turnover_rate': 999.99,
+        'pe_ttm': 9999999999.9999,
+        'pb': 9999999999.9999,
+        'total_market_value': 9999999999999999999999.99,
+        'circulating_market_value': 9999999999999999999999.99,
     }
 
     def __init__(self):
@@ -39,7 +42,6 @@ class DbTools:
             return json.load(f)
 
     def _normalize_numeric(self, field, value):
-        """统一清洗不合法数值：空值/NaN/Inf/越界 -> None。"""
         if value is None:
             return None
 
@@ -59,7 +61,10 @@ class DbTools:
 
     def _sanitize_update(self, update):
         sanitized = dict(update)
-        for field in self.FIELD_LIMITS:
+        for field in [
+            'open_price', 'close_price', 'high_price', 'low_price', 'volume', 'turnover',
+            'amplitude', 'price_change_rate', 'price_change_amount', 'turnover_rate'
+        ]:
             sanitized[field] = self._normalize_numeric(field, update.get(field))
         sanitized['date'] = str(update.get('date', ''))
         return sanitized
@@ -71,7 +76,7 @@ class DbTools:
             host=self.db_info.get('host'),
             port=int(self.db_info.get('port', 3306)),
             user=self.db_info.get('user'),
-            password=self.db_info.get('passwd'),
+            password=self.db_info.get('password'),
             db=self.db_info.get('database') or self.db_info.get('db'),
             charset=self.db_info.get('charset', 'utf8mb4'),
             autocommit=False,
@@ -147,3 +152,72 @@ class DbTools:
                 """
                 await cursor.executemany(query_insert, rows_to_insert)
                 await conn.commit()
+
+    async def upsert_stock_basic_info(self, basic_rows):
+        """插入 stock_zh_a_spot_em 的代码和名称，插入前先查重。"""
+        if not basic_rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                codes = [row['stock_code'] for row in basic_rows if row.get('stock_code')]
+                if not codes:
+                    return 0
+
+                placeholders = ','.join(['%s'] * len(codes))
+                query_existing = f"SELECT stock_code FROM stock_basic_info WHERE stock_code IN ({placeholders})"
+                await cursor.execute(query_existing, codes)
+                existing_codes = {row[0] for row in await cursor.fetchall()}
+
+                rows_to_insert = [
+                    (row['stock_code'], row['stock_name'])
+                    for row in basic_rows
+                    if row['stock_code'] not in existing_codes
+                ]
+
+                if not rows_to_insert:
+                    return 0
+
+                query_insert = """
+                INSERT INTO stock_basic_info (stock_code, stock_name)
+                VALUES (%s, %s)
+                """
+                await cursor.executemany(query_insert, rows_to_insert)
+                await conn.commit()
+                return len(rows_to_insert)
+
+    async def update_stock_data_valuation(self, valuation_rows, spot_date):
+        """按 stock_code + date 更新 stock_data 的估值字段。"""
+        if not valuation_rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        rows_to_update = []
+        for row in valuation_rows:
+            rows_to_update.append((
+                self._normalize_numeric('pe_ttm', row.get('pe_ttm')),
+                self._normalize_numeric('pb', row.get('pb')),
+                self._normalize_numeric('total_market_value', row.get('total_market_value')),
+                self._normalize_numeric('circulating_market_value', row.get('circulating_market_value')),
+                row['stock_code'],
+                spot_date,
+            ))
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_update = """
+                UPDATE stock_data
+                SET pe_ttm = %s,
+                    pb = %s,
+                    total_market_value = %s,
+                    circulating_market_value = %s
+                WHERE stock_code = %s AND date = %s
+                """
+                await cursor.executemany(query_update, rows_to_update)
+                await conn.commit()
+                return cursor.rowcount
