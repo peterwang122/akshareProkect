@@ -167,7 +167,7 @@ class DbTools:
         sanitized['turnover'] = self._normalize_numeric('turnover', row.get('turnover'))
         sanitized['settle_price'] = self._normalize_numeric('settle_price', row.get('settle_price'))
         sanitized['pre_settle_price'] = self._normalize_numeric('pre_settle_price', row.get('pre_settle_price'))
-        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'get_futures_daily'
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'futures_hist_em'
         return sanitized
 
     def _sanitize_excel_emotion_row(self, row):

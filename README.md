@@ -170,10 +170,30 @@ playwright install chromium
 - 用途：中金所期货日线行情
 - 主要接口：
   - `ak.get_futures_daily`
+  - `ak.futures_hist_em`
+- 默认行为：
+  - `backfill` / `daily` 会同时执行这两条链路
+- `futures_hist_em` 固定采集标的：
+  - `ICM`：中证500股指主连
+  - `ICM0`：中证500股指当月连续
+  - `IFM`：沪深300股指主连
+  - `IFM0`：沪深300股指当月连续
+  - `IHM`：上证50股指主连
+  - `IHM0`：上证50股指当月连续
+  - `IMM`：中证1000股指主连
+  - `IMM0`：中证1000股指当月连续
 - 固定参数：
-  - `market="CFFEX"`
+  - `market="CFFEX"`：用于 `ak.get_futures_daily`
+  - `period="daily"`：用于 `ak.futures_hist_em`
+  - 回补起始日：`2010-04-16`
 - 写入表：
   - `futures_daily_data`
+- 备注：
+  - 两种来源都会写入 `futures_daily_data`，通过 `data_source` 区分
+  - `ak.get_futures_daily` 主要用于原来的中金所期货日线链路
+  - `ak.futures_hist_em` 主要用于主连和当月连续链路
+  - 通过 `start_date` 和 `end_date` 控制历史区间与日更区间
+  - 接口缺失字段落库时写为 `NULL`，作为 `NA` 处理
 
 ### 7. 中金所指数期权
 
@@ -274,6 +294,12 @@ python run.py forex usd-once
 ```bash
 python run.py futures backfill
 python run.py futures daily
+python run.py futures backfill 2010-04-16 2026-03-22 IFM IFM0
+python run.py futures daily 2026-03-22 ICM IMM0
+python run.py futures market-backfill
+python run.py futures market-daily
+python run.py futures hist-backfill
+python run.py futures hist-daily 2026-03-22 IFM IFM0
 ```
 
 ### 中金所期权

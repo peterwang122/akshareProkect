@@ -84,8 +84,18 @@ if __name__ == "__main__":
     #     symbol="美元指数"
     # )
     # print(df_usd_index)
-    index_code = "301071"
-    start_date = "20210924"
-    end_date = "20210925"
-    index_data = ak.stock_zh_a_hist(symbol=index_code, period="daily", start_date=start_date, end_date=end_date, adjust="hfq")
-    print(index_data)
+    # index_code = "301071"
+    # start_date = "20210924"
+    # end_date = "20210925"
+    # index_data = ak.stock_zh_a_hist(symbol=index_code, period="daily", start_date=start_date, end_date=end_date, adjust="hfq")
+    # print(index_data)
+
+    forex_spot_em_df = ak.futures_hist_table_em()
+    with pd.option_context(
+        'display.max_rows', None,
+        'display.max_columns', None,
+        'display.width', None,
+        'display.max_colwidth', None
+    ):
+        print(forex_spot_em_df)
+        #futures_contract_info_cffex
