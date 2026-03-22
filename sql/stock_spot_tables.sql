@@ -15,5 +15,10 @@ ALTER TABLE stock_data
   ADD COLUMN total_market_value DECIMAL(24,2) NULL COMMENT '总市值',
   ADD COLUMN circulating_market_value DECIMAL(24,2) NULL COMMENT '流通市值';
 
+-- 2.1) 扩充 stock_data，增加创建时间和更新时间
+ALTER TABLE stock_data
+  ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间';
+
 -- 3) 建议索引（用于 date + stock_code 更新）
 CREATE INDEX idx_stock_data_code_date ON stock_data(stock_code, date);

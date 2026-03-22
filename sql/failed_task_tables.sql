@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS daily_task_failures (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  task_name VARCHAR(64) NOT NULL COMMENT 'Top-level task name, e.g. option_daily',
+  task_stage VARCHAR(32) NOT NULL DEFAULT 'task' COMMENT 'task/list/spot/daily',
+  task_key VARCHAR(255) NOT NULL COMMENT 'Unique task identity',
+  payload_json JSON NULL COMMENT 'Retry payload',
+  error_message TEXT NULL COMMENT 'Last error message',
+  status VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/RESOLVED',
+  result_status VARCHAR(16) NOT NULL DEFAULT 'FAILED' COMMENT 'FAILED/SUCCESS',
+  retry_count INT NOT NULL DEFAULT 0 COMMENT 'Manual retry count',
+  first_failed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'First failure time',
+  last_failed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Last failure time',
+  last_retry_at DATETIME NULL COMMENT 'Last manual retry time',
+  resolved_at DATETIME NULL COMMENT 'Resolved time',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_task_identity (task_name, task_stage, task_key),
+  KEY idx_status_failed_at (status, last_failed_at),
+  KEY idx_task_name_status (task_name, status)
+) COMMENT='Pending failed daily tasks for manual retry';

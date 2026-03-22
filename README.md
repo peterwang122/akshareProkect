@@ -1,201 +1,376 @@
 # akshareProkect
 
-一个基于 **AKShare + asyncio + aiomysql** 的 A 股历史行情采集与入库工具。  
-程序会读取股票列表，抓取每只股票从上市日至今天的日线数据（后复权），并批量写入 MySQL。
+基于 `AKShare + asyncio + aiomysql + Playwright` 的数据采集入库项目。当前统一使用新入口：
 
----
+```bash
+python run.py <domain> <command> [args]
+```
 
-## 1. 项目能力
+正式入口已经切换到 [run.py](/C:/Users/Administrator/PycharmProjects/akshareProkect/run.py)。旧脚本已移到 [scripts/legacy](/C:/Users/Administrator/PycharmProjects/akshareProkect/scripts/legacy)，不再作为正式命令入口。
 
-- 自动读取股票代码并标准化（保留前导 0，如 `000356`）。
-- 调用 AKShare 获取：
-  - 上市时间：`stock_individual_info_em`
-  - 历史日线：`stock_zh_a_hist`
-- 内置失败重试机制，降低接口偶发失败影响。
-- 使用 `asyncio` 控制并发抓取，提高处理效率。
-- 使用 `aiomysql` 连接池 + `executemany` 进行批量入库。
-- 入库前做数值清洗（NaN/Inf/越界），避免 MySQL 1264 错误。
-- 通过 `progress.log` 支持断点续跑。
-- 通过 `error.log` 记录失败股票与错误信息。
+数据库展示说明见 [docs/DATABASE_DISPLAY_GUIDE.md](/C:/Users/Administrator/PycharmProjects/akshareProkect/docs/DATABASE_DISPLAY_GUIDE.md)。
 
----
-
-## 2. 目录结构
+## 目录结构
 
 ```text
 akshareProkect/
-├── main.py                  # 主流程：读股票、抓数据、批量入库
-├── requirements.txt         # 依赖
-├── allstock_em.csv          # 股票清单（需包含“代码”列）
-├── progress.log             # 进度日志（运行时生成）
-├── error.log                # 错误日志（运行时生成）
-├── config/
-│   ├── get_config_path.py
-│   └── db_info.json         # 数据库配置（需自行创建）
-└── util/
-    └── db_tool.py           # aiomysql 连接池、数据清洗、批量写库
+|-- run.py
+|-- README.md
+|-- requirements.txt
+|-- config/
+|   |-- db_info.json
+|   `-- get_config_path.py
+|-- sql/
+|   |-- stock_spot_tables.sql
+|   |-- index_tables.sql
+|   |-- cffex_tables.sql
+|   |-- douyin_emotion_tables.sql
+|   |-- forex_tables.sql
+|   |-- futures_tables.sql
+|   |-- option_tables.sql
+|   |-- excel_emotion_tables.sql
+|   `-- failed_task_tables.sql
+|-- src/
+|   `-- akshare_project/
+|       |-- collectors/
+|       |-- core/
+|       `-- db/
+|-- docs/
+|   `-- DATABASE_DISPLAY_GUIDE.md
+|-- data/
+|   `-- input/
+|-- runtime/
+|   |-- logs/
+|   |-- state/
+|   |-- cache/
+|   `-- artifacts/
+`-- scripts/
+    |-- legacy/
+    `-- test.py / test1.py
 ```
 
----
+## 安装与配置
 
-## 3. 环境要求
+### 环境要求
 
 - Python 3.9+
-- MySQL 5.7 / 8.0
-- 可访问 AKShare 数据源的网络
+- MySQL 5.7 或 8.0
+- 可访问 AKShare 数据源和中金所网页
 
----
-
-## 4. 安装
+### 安装依赖
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 ```
 
----
+### 数据库配置
 
-## 5. 配置
+数据库配置文件路径：
 
-### 5.1 股票列表文件
+- [config/db_info.json](/C:/Users/Administrator/PycharmProjects/akshareProkect/config/db_info.json)
 
-在项目根目录准备 `allstock_em.csv`，至少包含 `代码` 列：
-
-```csv
-代码
-000001
-000002
-600519
-832000
-```
-
-> 建议把 `代码` 列作为字符串保存，避免前导零丢失。
-
-### 5.2 数据库连接
-
-在 `config/db_info.json` 中配置 MySQL：
+当前代码读取的密码字段名是 `passwd`：
 
 ```json
 {
   "host": "127.0.0.1",
   "port": 3306,
   "user": "root",
-  "password": "your_password",
+  "passwd": "your_password",
   "database": "your_database",
   "charset": "utf8mb4"
 }
 ```
 
----
+### 输入文件目录
 
-## 6. 数据表要求
+建议将输入文件放在 [data/input](/C:/Users/Administrator/PycharmProjects/akshareProkect/data/input)：
 
-程序默认写入 `stock_data` 表，使用字段：
+- `allstock_em.csv`
+- `allstock.csv`
+- `情绪指标.xlsx`
 
-- `stock_code`
-- `open_price`
-- `close_price`
-- `high_price`
-- `low_price`
-- `volume`
-- `turnover`
-- `amplitude`
-- `price_change_rate`
-- `price_change_amount`
-- `turnover_rate`
-- `date`
+其中：
 
-建议建立联合唯一索引：`(stock_code, date)`。
+- 股票链路会优先读取 `data/input/allstock_em.csv`
+- Excel 情绪导入会优先扫描 `data/input/*.xlsx`
 
-参考建表 SQL（可按你生产库规范调整精度）：
+## 数据链路与接口说明
 
-```sql
-CREATE TABLE IF NOT EXISTS stock_data (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  stock_code VARCHAR(16) NOT NULL,
-  open_price DECIMAL(12,4) NULL,
-  close_price DECIMAL(12,4) NULL,
-  high_price DECIMAL(12,4) NULL,
-  low_price DECIMAL(12,4) NULL,
-  volume DECIMAL(20,2) NULL,
-  turnover DECIMAL(22,2) NULL,
-  amplitude DECIMAL(8,4) NULL,
-  price_change_rate DECIMAL(8,4) NULL,
-  price_change_amount DECIMAL(12,4) NULL,
-  turnover_rate DECIMAL(8,4) NULL,
-  date DATE NOT NULL,
-  UNIQUE KEY uk_stock_date (stock_code, date)
-);
-```
+### 1. 股票
 
----
+- 用途：A 股历史行情回补、按指定日期修复缺失日线、同步股票基础信息和估值字段
+- 主要接口：
+  - `ak.stock_individual_info_em`
+  - `ak.stock_zh_a_hist`
+  - `ak.stock_zh_a_spot_em`
+- 写入表：
+  - `stock_basic_info`
+  - `stock_data`
+- 备注：
+  - 正式日常采集仍走 `stock_zh_a_hist`
+  - `stock_zh_a_spot_em` 仅用于基础信息与估值字段补充，不直接作为 `stock_data` 正式日线来源
 
-## 7. 运行
+### 2. 指数
+
+- 用途：指数基础信息、历史日线、当日快照
+- 主要接口：
+  - `ak.stock_zh_index_spot_sina`
+  - `ak.index_zh_a_hist`
+  - `ak.stock_zh_index_daily_em`
+- 写入表：
+  - `index_basic_info`
+  - `index_daily_data`
+- 备注：
+  - 日更优先使用 `stock_zh_index_spot_sina`
+  - 历史回补会在 `index_zh_a_hist` 与 `stock_zh_index_daily_em` 之间做兜底
+
+### 3. CFFEX 会员排名
+
+- 用途：中金所 IF/IH/IC/IM/TS/TF/T/TL 的成交、持买、持卖排名
+- 数据来源：
+  - [中金所会员排名页面](http://www.cffex.com.cn/ccpm/)
+  - 通过 `Playwright + HTML 解析` 抓取，不是 AKShare 接口
+- 写入表：
+  - `cffex_member_rankings`
+- 备注：
+  - 已过滤 `合计` 行
+  - 支持历史回补、当日同步、单日调试
+
+### 4. 抖音情绪指标
+
+- 用途：从抖音号 `1368194981` 的视频中提取上证50、沪深300、中证500、中证1000情绪指标
+- 数据来源：
+  - 抖音网页播放页
+  - 页面内 `识别画面` + AI 总结面板
+  - 必要时 OCR 兜底
+- 写入表：
+  - `douyin_index_emotion_daily`
+- 备注：
+  - 不是 AKShare 数据源
+  - 浏览器缓存会写入 `runtime/cache/douyin_playwright_profile`
+
+### 5. 外汇
+
+- 用途：外汇品种基础信息、历史日线、当日快照、美元指数
+- 主要接口：
+  - `ak.forex_spot_em`
+  - `ak.forex_hist_em`
+  - `ak.index_global_hist_em(symbol="美元指数")`
+- 写入表：
+  - `forex_basic_info`
+  - `forex_daily_data`
+- 备注：
+  - 日更会更新今天快照，并尝试刷新最近已收盘历史日
+  - 可手动执行 `repair-history`，把仍停留在 `forex_spot_em` 口径的历史记录回刷成 `forex_hist_em`
+
+### 6. 中金所期货
+
+- 用途：中金所期货日线行情
+- 主要接口：
+  - `ak.get_futures_daily`
+- 固定参数：
+  - `market="CFFEX"`
+- 写入表：
+  - `futures_daily_data`
+
+### 7. 中金所指数期权
+
+- 用途：上证50、沪深300、中证1000指数期权的合约链与日线行情
+- 主要接口：
+  - 上证50：
+    - `ak.option_cffex_sz50_list_sina`
+    - `ak.option_cffex_sz50_spot_sina`
+    - `ak.option_cffex_sz50_daily_sina`
+  - 沪深300：
+    - `ak.option_cffex_hs300_list_sina`
+    - `ak.option_cffex_hs300_spot_sina`
+    - `ak.option_cffex_hs300_daily_sina`
+  - 中证1000：
+    - `ak.option_cffex_zz1000_list_sina`
+    - `ak.option_cffex_zz1000_spot_sina`
+    - `ak.option_cffex_zz1000_daily_sina`
+- 写入表：
+  - `option_cffex_spot_data`
+  - `option_cffex_daily_data`
+- 备注：
+  - `spot` 表存合约链快照
+  - `daily` 表存最终日线
+  - 请求成功但全天无成交、无日线数据的期权按正常情况跳过，不记失败
+
+### 8. Excel 情绪导入
+
+- 用途：将整理好的 Excel 情绪指标批量导入数据库
+- 数据来源：
+  - `pandas.read_excel`
+- 写入表：
+  - `excel_index_emotion_daily`
+
+## 数据库表概览
+
+| 模块 | 主要表 |
+|---|---|
+| 股票 | `stock_basic_info`, `stock_data` |
+| 指数 | `index_basic_info`, `index_daily_data` |
+| CFFEX 排名 | `cffex_member_rankings` |
+| 抖音情绪 | `douyin_index_emotion_daily` |
+| 外汇 | `forex_basic_info`, `forex_daily_data` |
+| 期货 | `futures_daily_data` |
+| 期权 | `option_cffex_spot_data`, `option_cffex_daily_data` |
+| Excel 情绪 | `excel_index_emotion_daily` |
+| 失败任务 | `daily_task_failures` |
+
+## 运行命令
+
+### 股票
 
 ```bash
-python main.py
+python run.py stock backfill
+python run.py stock daily
+python run.py stock repair-missing-date 2026-03-16
 ```
 
-执行过程：
+### 指数
 
-1. 读取 `allstock_em.csv`
-2. 并发抓取股票信息和历史行情
-3. 过滤已处理进度
-4. 批量写入数据库
-5. 更新 `progress.log` / `error.log`
+```bash
+python run.py index backfill
+python run.py index daily
+```
 
----
+### CFFEX 会员排名
 
-## 8. 可调参数（`main.py`）
+```bash
+python run.py cffex backfill
+python run.py cffex backfill IF IH IM
+python run.py cffex daily
+python run.py cffex daily T TF TL
+python run.py cffex single 2025-03-14 IM
+```
 
-- `API_RETRY_COUNT`：AKShare 请求失败最大重试次数（默认 5）
-- `API_RETRY_SLEEP_SECONDS`：重试间隔秒数（默认 3）
-- `MAX_CONCURRENCY`：并发股票处理数（默认 8）
+### 抖音情绪
 
-调优建议：
+```bash
+python run.py douyin backfill
+python run.py douyin daily
+```
 
-- 如果经常触发限流：降低 `MAX_CONCURRENCY`，提高重试间隔。
-- 如果机器资源充足且网络稳定：可适当提高并发。
+### 外汇与美元指数
 
----
+```bash
+python run.py forex backfill
+python run.py forex backfill USDCNH EURUSD GBPUSD
+python run.py forex daily
+python run.py forex daily USDCNH EURUSD GBPUSD
+python run.py forex repair-history
+python run.py forex repair-history USDCNH EURUSD GBPUSD
+python run.py forex usd-backfill
+python run.py forex usd-daily
+python run.py forex usd-once
+```
 
-## 9. 日志说明
+### 中金所期货
 
-### progress.log
+```bash
+python run.py futures backfill
+python run.py futures daily
+```
 
-- 格式：`stock_code,date`
-- 用于断点续跑，程序会跳过已完成记录。
+### 中金所期权
 
-### error.log
+```bash
+python run.py option backfill
+python run.py option daily
+python run.py option repair-missing-date 2026-03-16
+```
 
-- 格式：`stock_code,date,error_message`
-- 常见问题：
-  - AKShare 接口限流或网络异常
-  - 数据库连接配置错误
-  - 字段值异常（程序已做统一清洗）
+### Excel 情绪导入
 
----
+```bash
+python run.py emotion-excel import
+python run.py emotion-excel import data/input/情绪指标.xlsx
+```
 
-## 10. 常见问题
+### 一键日更与失败任务
 
-### Q1：为什么有些股票没有入库？
-可能原因：
+```bash
+python run.py runner daily
+python run.py runner retry-failures
+python run.py runner retry-failures option_daily 20
+```
 
-- 股票代码无效或数据源不存在对应数据
-- 接口在多次重试后仍失败
-- 数据全部在 `progress.log` 中已被标记完成
+`runner daily` 当前包含：
 
-### Q2：出现 Out of range 报错怎么办？
+- `index_daily`
+- `cffex_daily`
+- `forex_daily`
+- `usd_index_once`
+- `futures_daily`
+- `option_daily`
 
-当前代码已对异常值进行清洗并转为 `NULL`，如仍出现，建议同步检查：
+`runner daily` 当前不包含：
 
-- `stock_data` 表字段精度是否过小
-- 是否有触发器/约束导致插入失败
+- 股票日更
+- 抖音情绪采集
+- Excel 情绪导入
 
----
+## 日志、状态与运行产物
 
-## 11. 后续优化建议
+### 日志目录
 
-- 增加增量更新模式（例如仅更新最近 N 天）。
-- 增加命令行参数（并发、重试、输入文件路径）。
-- 增加单元测试与集成测试。
-- 将配置统一迁移到 `.env` 或 YAML 配置文件。
+- [runtime/logs](/C:/Users/Administrator/PycharmProjects/akshareProkect/runtime/logs)
+
+按模块输出单一日志文件，例如：
+
+- `stock.log`
+- `index.log`
+- `cffex.log`
+- `forex.log`
+- `futures.log`
+- `option.log`
+- `douyin_emotion.log`
+- `runner.log`
+- `failed_tasks.log`
+- `excel_emotion.log`
+
+### 状态目录
+
+- [runtime/state](/C:/Users/Administrator/PycharmProjects/akshareProkect/runtime/state)
+
+用于保存断点与进度，例如：
+
+- `stock.progress`
+- `index.progress`
+- `cffex.progress`
+- `forex.progress`
+- `option.progress`
+- `douyin_emotion.progress`
+- `futures.progress`
+
+### 运行产物目录
+
+- 缓存：[runtime/cache](/C:/Users/Administrator/PycharmProjects/akshareProkect/runtime/cache)
+- 产物：[runtime/artifacts](/C:/Users/Administrator/PycharmProjects/akshareProkect/runtime/artifacts)
+
+当前典型内容：
+
+- 抖音浏览器 profile：`runtime/cache/douyin_playwright_profile`
+- 抖音截图/帧图：`runtime/artifacts/douyin_emotion_frames`
+
+## SQL 文件
+
+- [sql/stock_spot_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/stock_spot_tables.sql)
+- [sql/index_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/index_tables.sql)
+- [sql/cffex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/cffex_tables.sql)
+- [sql/douyin_emotion_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/douyin_emotion_tables.sql)
+- [sql/forex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/forex_tables.sql)
+- [sql/futures_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/futures_tables.sql)
+- [sql/option_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/option_tables.sql)
+- [sql/excel_emotion_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/excel_emotion_tables.sql)
+- [sql/failed_task_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/failed_task_tables.sql)
+
+## 说明
+
+- 正式入口已经切换到 [run.py](/C:/Users/Administrator/PycharmProjects/akshareProkect/run.py)。
+- 旧入口脚本已移到 [scripts/legacy](/C:/Users/Administrator/PycharmProjects/akshareProkect/scripts/legacy)，仅作历史保留。
+- 文件日志只负责运行诊断；失败任务补采仍以 `daily_task_failures` 为数据库级追踪来源。

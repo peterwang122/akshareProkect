@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS douyin_index_emotion_daily (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  emotion_date DATE NOT NULL COMMENT '视频对应日期',
+  video_id VARCHAR(64) NOT NULL COMMENT '抖音视频唯一标识',
+  account_id VARCHAR(32) NOT NULL DEFAULT '1368194981' COMMENT '抖音号',
+  account_name VARCHAR(64) NULL COMMENT '抖音账号名称',
+  video_title VARCHAR(255) NULL COMMENT '视频标题',
+  video_url VARCHAR(512) NOT NULL COMMENT '视频链接',
+  hs300_emotion DECIMAL(8, 2) NULL COMMENT '沪深300情绪指标',
+  zz500_emotion DECIMAL(8, 2) NULL COMMENT '中证500情绪指标',
+  zz1000_emotion DECIMAL(8, 2) NULL COMMENT '中证1000情绪指标',
+  sz50_emotion DECIMAL(8, 2) NULL COMMENT '上证50情绪指标',
+  raw_ocr_text TEXT NULL COMMENT 'OCR/页面提取原文',
+  extraction_method VARCHAR(32) NOT NULL DEFAULT 'ocr' COMMENT '提取方式',
+  extraction_status VARCHAR(16) NOT NULL DEFAULT 'SUCCESS' COMMENT 'SUCCESS/PARTIAL/FAILED',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_emotion_date (emotion_date),
+  UNIQUE KEY uk_video_id (video_id),
+  KEY idx_account_date (account_id, emotion_date)
+) COMMENT='抖音四大指数情绪指标日度汇总';

@@ -4,7 +4,8 @@ import os
 from datetime import datetime
 
 import aiomysql
-from config.get_config_path import get_config_path
+
+from akshare_project.core.paths import get_config_dir
 
 
 def get_timestamp():
@@ -40,7 +41,7 @@ class DbTools:
         self.pool = None
 
     def load_db_info(self):
-        db_info_path = os.path.join(get_config_path(), 'db_info.json')
+        db_info_path = os.path.join(get_config_dir(), 'db_info.json')
         with open(db_info_path, 'r') as f:
             return json.load(f)
 

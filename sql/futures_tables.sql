@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS futures_daily_data (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  market VARCHAR(16) NOT NULL COMMENT 'Exchange market, e.g. CFFEX',
+  symbol VARCHAR(32) NOT NULL COMMENT 'Contract symbol, e.g. IF1005',
+  variety VARCHAR(32) NULL COMMENT 'Futures variety code, e.g. IF',
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  open_price DECIMAL(18, 6) NULL COMMENT 'Open price',
+  high_price DECIMAL(18, 6) NULL COMMENT 'High price',
+  low_price DECIMAL(18, 6) NULL COMMENT 'Low price',
+  close_price DECIMAL(18, 6) NULL COMMENT 'Close price',
+  volume DECIMAL(20, 2) NULL COMMENT 'Volume',
+  open_interest DECIMAL(20, 2) NULL COMMENT 'Open interest',
+  turnover DECIMAL(24, 2) NULL COMMENT 'Turnover',
+  settle_price DECIMAL(18, 6) NULL COMMENT 'Settlement price',
+  pre_settle_price DECIMAL(18, 6) NULL COMMENT 'Previous settlement price',
+  data_source VARCHAR(32) NOT NULL DEFAULT 'get_futures_daily' COMMENT 'Data source',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_symbol_trade_date (symbol, trade_date),
+  KEY idx_market_trade_date (market, trade_date),
+  KEY idx_variety_trade_date (variety, trade_date)
+) COMMENT='CFFEX futures daily market data from AKShare get_futures_daily';

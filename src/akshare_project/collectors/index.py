@@ -1,31 +1,43 @@
 import asyncio
 import os
 import re
+import sys
 import time
 from datetime import datetime
 
 import akshare as ak
 
-from util.db_tool import DbTools
+from akshare_project.core.logging_utils import echo_and_log, get_logger
+from akshare_project.core.progress import ProgressStore
+from akshare_project.core.retry import fetch_with_retry as shared_fetch_with_retry
+from akshare_project.db.db_tool import DbTools
 
 API_RETRY_COUNT = 5
 API_RETRY_SLEEP_SECONDS = 3
 MAX_CONCURRENCY = 5
-INDEX_PROGRESS_LOG = 'index_progress.log'
-INDEX_ERROR_LOG = 'index_error.log'
+LOGGER = get_logger('index')
+PROGRESS_STORE = ProgressStore('index')
+
 COL_CODE = '\u4ee3\u7801'
 COL_NAME = '\u540d\u79f0'
 COL_DATE = '\u65e5\u671f'
 COL_OPEN = '\u5f00\u76d8'
 COL_CLOSE = '\u6536\u76d8'
+COL_LATEST = '\u6700\u65b0\u4ef7'
 COL_HIGH = '\u6700\u9ad8'
 COL_LOW = '\u6700\u4f4e'
+COL_PRE_CLOSE = '\u6628\u6536'
+COL_SPOT_OPEN = '\u4eca\u5f00'
 COL_VOLUME = '\u6210\u4ea4\u91cf'
 COL_AMOUNT = '\u6210\u4ea4\u989d'
 COL_AMPLITUDE = '\u632f\u5e45'
 COL_CHANGE_RATE = '\u6da8\u8dcc\u5e45'
 COL_CHANGE_AMOUNT = '\u6da8\u8dcc\u989d'
 COL_TURNOVER_RATE = '\u6362\u624b\u7387'
+
+
+def print(*args, **kwargs):
+    echo_and_log(LOGGER, *args, **kwargs)
 
 
 def parse_index_code(raw_code):
@@ -43,35 +55,26 @@ def parse_index_code(raw_code):
 
 
 def save_progress_batch(progress_lines):
-    if not progress_lines:
-        return
-    with open(INDEX_PROGRESS_LOG, 'a') as f:
-        f.writelines(progress_lines)
+    PROGRESS_STORE.append_lines(progress_lines)
 
 
 def load_progress():
-    if not os.path.exists(INDEX_PROGRESS_LOG):
-        return set()
-    with open(INDEX_PROGRESS_LOG, 'r') as f:
-        return {line.strip() for line in f if line.strip()}
+    return PROGRESS_STORE.load()
 
 
 def log_error(index_code, trade_date, error_message):
-    with open(INDEX_ERROR_LOG, 'a') as f:
-        f.write(f'{index_code},{trade_date},{error_message}\n')
+    LOGGER.error('%s,%s,%s', index_code, trade_date, error_message)
 
 
 def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RETRY_SLEEP_SECONDS, **kwargs):
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last_error = e
-            if attempt < retries:
-                print(f'{func.__name__} attempt {attempt}/{retries} failed: {e}')
-                time.sleep(sleep_seconds)
-    raise last_error
+    return shared_fetch_with_retry(
+        func,
+        *args,
+        retries=retries,
+        sleep_seconds=sleep_seconds,
+        logger=LOGGER,
+        **kwargs,
+    )
 
 
 def get_all_index_spot():
@@ -91,15 +94,15 @@ def get_index_history(index_code, simple_code, end_date):
         )
         if history_df is not None and not history_df.empty:
             return history_df, 'index_zh_a_hist'
-    except Exception as e:
-        last_error = e
+    except Exception as exc:
+        last_error = exc
 
     try:
         history_df = fetch_with_retry(ak.stock_zh_index_daily_em, symbol=index_code)
         if history_df is not None and not history_df.empty:
             return history_df, 'stock_zh_index_daily_em'
-    except Exception as e:
-        last_error = e
+    except Exception as exc:
+        last_error = exc
 
     if last_error is not None:
         raise last_error
@@ -137,6 +140,15 @@ def first_value(row, candidates):
     return None
 
 
+def calculate_amplitude(high_price, low_price, pre_close):
+    try:
+        if high_price is None or low_price is None or pre_close in (None, 0):
+            return None
+        return (float(high_price) - float(low_price)) / float(pre_close) * 100
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def build_index_daily_rows(index_code, history_df, source_name):
     daily_rows = []
     for _, row in history_df.iterrows():
@@ -160,6 +172,34 @@ def build_index_daily_rows(index_code, history_df, source_name):
             'data_source': source_name,
         })
     return daily_rows
+
+
+def build_index_spot_daily_rows(spot_df, trade_date):
+    rows = []
+    for _, row in spot_df.iterrows():
+        index_code, _, _ = parse_index_code(row.get(COL_CODE))
+        if not index_code:
+            continue
+
+        high_price = row.get(COL_HIGH)
+        low_price = row.get(COL_LOW)
+        pre_close = row.get(COL_PRE_CLOSE)
+        rows.append({
+            'index_code': index_code,
+            'open_price': row.get(COL_SPOT_OPEN),
+            'close_price': row.get(COL_LATEST),
+            'high_price': high_price,
+            'low_price': low_price,
+            'volume': row.get(COL_VOLUME),
+            'turnover': row.get(COL_AMOUNT),
+            'amplitude': calculate_amplitude(high_price, low_price, pre_close),
+            'price_change_rate': row.get(COL_CHANGE_RATE),
+            'price_change_amount': row.get(COL_CHANGE_AMOUNT),
+            'turnover_rate': None,
+            'trade_date': trade_date,
+            'data_source': 'stock_zh_index_spot_sina',
+        })
+    return rows
 
 
 async def process_index(index_row, processed, db_tools, semaphore, progress_lock, end_date):
@@ -203,13 +243,13 @@ async def process_index(index_row, processed, db_tools, semaphore, progress_lock
             await asyncio.to_thread(save_progress_batch, new_progress_lines)
             processed.update(line.strip() for line in new_progress_lines)
 
-    except Exception as e:
-        error_message = f'Error processing {index_code}: {e}'
+    except Exception as exc:
+        error_message = f'Error processing {index_code}: {exc}'
         print(error_message)
         log_error(index_code, 'N/A', error_message)
 
 
-async def run():
+async def backfill_history():
     db_tools = DbTools()
     await db_tools.init_pool()
 
@@ -233,9 +273,49 @@ async def run():
             for index_row in index_rows
         ]
         await asyncio.gather(*tasks)
+        print('index history backfill finished.')
     finally:
         await db_tools.close()
 
 
+async def sync_daily_from_spot():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        spot_df = await asyncio.to_thread(get_all_index_spot)
+        if spot_df is None or spot_df.empty:
+            print('No index spot data fetched.')
+            return 0
+
+        trade_date = datetime.now().strftime('%Y-%m-%d')
+        basic_rows = build_index_basic_rows(spot_df)
+        daily_rows = build_index_spot_daily_rows(spot_df, trade_date)
+
+        basic_upserted = await db_tools.upsert_index_basic_info(basic_rows)
+        daily_upserted = await db_tools.upsert_index_daily_snapshots(daily_rows)
+        print(
+            'index daily finished, '
+            f'index_basic_info upserted: {basic_upserted}, '
+            f'index_daily_data upserted: {daily_upserted}'
+        )
+        return daily_upserted
+    finally:
+        await db_tools.close()
+
+
+async def main():
+    command = sys.argv[1].strip().lower() if len(sys.argv) > 1 else 'backfill'
+
+    if command == 'backfill':
+        await backfill_history()
+        return
+    if command == 'daily':
+        await sync_daily_from_spot()
+        return
+
+    raise ValueError('supported commands: backfill, daily')
+
+
 if __name__ == '__main__':
-    asyncio.run(run())
+    asyncio.run(main())
