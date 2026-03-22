@@ -205,6 +205,29 @@
 
 - `futures_daily_data`
 
+数据来源：
+
+- `ak.get_futures_daily`
+- `ak.futures_hist_em`
+
+说明：
+
+- 两条来源都会写入同一张 `futures_daily_data` 表
+- 需要通过 `data_source` 区分数据来源后再展示
+- `get_futures_daily` 主要是中金所常规期货日线
+- `futures_hist_em` 主要是 8 个连续合约日线
+
+`futures_hist_em` 当前固定采集的连续合约：
+
+- `ICM`：中证500股指主连
+- `ICM0`：中证500股指当月连续
+- `IFM`：沪深主连
+- `IFM0`：沪深当月连续
+- `IHM`：上证主连
+- `IHM0`：上证当月连续
+- `IMM`：中证1000股指主连
+- `IMM0`：中证1000股指当月连续
+
 关键字段：
 
 - `market`
@@ -220,6 +243,18 @@
 - `turnover`
 - `settle_price`
 - `pre_settle_price`
+- `data_source`
+
+`data_source` 常见值：
+
+- `get_futures_daily`
+- `futures_hist_em`
+
+前端展示建议：
+
+- 如果做普通期货合约页，可优先展示 `data_source = 'get_futures_daily'`
+- 如果做主连 / 当月连续专题页，可筛选 `data_source = 'futures_hist_em'`
+- 同一 `symbol + trade_date` 是唯一键，列表页按 `symbol` 分组最直接
 
 推荐展示：
 

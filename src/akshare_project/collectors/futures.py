@@ -31,10 +31,10 @@ COL_OPEN_INTEREST = "\u6301\u4ed3\u91cf"
 CONTINUOUS_SYMBOLS = {
     "ICM": {"name": "\u4e2d\u8bc1500\u80a1\u6307\u4e3b\u8fde", "variety": "IC"},
     "ICM0": {"name": "\u4e2d\u8bc1500\u80a1\u6307\u5f53\u6708\u8fde\u7eed", "variety": "IC"},
-    "IFM": {"name": "\u6caa\u6df1300\u80a1\u6307\u4e3b\u8fde", "variety": "IF"},
-    "IFM0": {"name": "\u6caa\u6df1300\u80a1\u6307\u5f53\u6708\u8fde\u7eed", "variety": "IF"},
-    "IHM": {"name": "\u4e0a\u8bc150\u80a1\u6307\u4e3b\u8fde", "variety": "IH"},
-    "IHM0": {"name": "\u4e0a\u8bc150\u80a1\u6307\u5f53\u6708\u8fde\u7eed", "variety": "IH"},
+    "IFM": {"name": "\u6caa\u6df1\u4e3b\u8fde", "variety": "IF"},
+    "IFM0": {"name": "\u6caa\u6df1\u5f53\u6708\u8fde\u7eed", "variety": "IF"},
+    "IHM": {"name": "\u4e0a\u8bc1\u4e3b\u8fde", "variety": "IH"},
+    "IHM0": {"name": "\u4e0a\u8bc1\u5f53\u6708\u8fde\u7eed", "variety": "IH"},
     "IMM": {"name": "\u4e2d\u8bc11000\u80a1\u6307\u4e3b\u8fde", "variety": "IM"},
     "IMM0": {"name": "\u4e2d\u8bc11000\u80a1\u6307\u5f53\u6708\u8fde\u7eed", "variety": "IM"},
 }
@@ -191,19 +191,31 @@ def group_rows_by_symbol(rows):
 
 
 def get_hist_daily_range(symbol, start_date, end_date):
+    symbol_meta = CONTINUOUS_SYMBOLS[symbol]
     return fetch_with_retry(
         ak.futures_hist_em,
-        symbol=symbol,
+        symbol=symbol_meta["name"],
         period=PERIOD,
         start_date=start_date.strftime("%Y%m%d"),
         end_date=end_date.strftime("%Y%m%d"),
     )
 
 
+def get_row_value(row, aliases, position=None):
+    for alias in aliases:
+        if alias in row.index:
+            return row.get(alias)
+    if position is not None and len(row) > position:
+        return row.iloc[position]
+    return None
+
+
 def build_hist_rows(symbol, symbol_meta, df):
     rows = []
     for _, row in df.iterrows():
-        trade_date = normalize_trade_date(row.get(COL_DATE))
+        trade_date = normalize_trade_date(
+            get_row_value(row, [COL_DATE, "时间"], position=0)
+        )
         if not trade_date:
             continue
 
@@ -212,13 +224,13 @@ def build_hist_rows(symbol, symbol_meta, df):
             "symbol": symbol,
             "variety": symbol_meta["variety"],
             "trade_date": trade_date,
-            "open_price": row.get(COL_OPEN),
-            "high_price": row.get(COL_HIGH),
-            "low_price": row.get(COL_LOW),
-            "close_price": row.get(COL_CLOSE),
-            "volume": row.get(COL_VOLUME),
-            "open_interest": row.get(COL_OPEN_INTEREST),
-            "turnover": row.get(COL_TURNOVER),
+            "open_price": get_row_value(row, [COL_OPEN, "开盘"], position=1),
+            "high_price": get_row_value(row, [COL_HIGH, "最高"], position=2),
+            "low_price": get_row_value(row, [COL_LOW, "最低"], position=3),
+            "close_price": get_row_value(row, [COL_CLOSE, "收盘"], position=4),
+            "volume": get_row_value(row, [COL_VOLUME, "成交量"], position=7),
+            "open_interest": get_row_value(row, [COL_OPEN_INTEREST, "持仓量"], position=9),
+            "turnover": get_row_value(row, [COL_TURNOVER, "成交额"], position=8),
             "settle_price": None,
             "pre_settle_price": None,
             "data_source": "futures_hist_em",
