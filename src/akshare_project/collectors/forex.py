@@ -170,6 +170,15 @@ def build_forex_spot_daily_rows(spot_df, trade_date):
     return rows
 
 
+def select_latest_history_rows(rows, max_rows=2):
+    dated_rows = [row for row in rows if row.get('trade_date')]
+    if not dated_rows:
+        return []
+
+    dated_rows.sort(key=lambda item: item['trade_date'])
+    return dated_rows[-max_rows:] if len(dated_rows) >= max_rows else dated_rows
+
+
 def filter_rows_by_end_date(rows, end_date):
     end_date_text = end_date.strftime('%Y-%m-%d')
     return [row for row in rows if row['trade_date'] and row['trade_date'] <= end_date_text]
@@ -221,6 +230,66 @@ async def fetch_symbol_history_row_for_daily_refresh(symbol_row, target_trade_da
         print(error_message)
         log_error(symbol_code, target_trade_date, error_message)
         return None
+
+
+async def fetch_symbol_history_rows_for_daily_sync(symbol_code, semaphore):
+    symbol_code = normalize_symbol_code(symbol_code)
+    if not symbol_code:
+        return {
+            'symbol_code': '',
+            'symbol_name': None,
+            'basic_row': None,
+            'daily_rows': [],
+            'error': None,
+        }
+
+    try:
+        async with semaphore:
+            history_df = await asyncio.to_thread(get_forex_history, symbol_code)
+
+        if history_df is None or history_df.empty:
+            return {
+                'symbol_code': symbol_code,
+                'symbol_name': None,
+                'basic_row': None,
+                'daily_rows': [],
+                'error': None,
+            }
+
+        history_rows = build_forex_daily_rows(history_df, symbol_code, symbol_code)
+        latest_rows = select_latest_history_rows(history_rows, max_rows=2)
+        if not latest_rows:
+            return {
+                'symbol_code': symbol_code,
+                'symbol_name': None,
+                'basic_row': None,
+                'daily_rows': [],
+                'error': None,
+            }
+
+        latest_name = latest_rows[-1].get('symbol_name') or symbol_code
+        return {
+            'symbol_code': symbol_code,
+            'symbol_name': latest_name,
+            'basic_row': {
+                'symbol_code': symbol_code,
+                'symbol_name': latest_name,
+                'data_source': 'forex_hist_em',
+            },
+            'daily_rows': latest_rows,
+            'error': None,
+        }
+    except Exception as exc:
+        error_message = f'Error fetching daily history for {symbol_code}: {exc}'
+        print(error_message)
+        log_error(symbol_code, 'N/A', error_message)
+        return {
+            'symbol_code': symbol_code,
+            'symbol_name': None,
+            'basic_row': None,
+            'daily_rows': [],
+            'error': str(exc),
+        }
 
 
 def group_pending_history_refresh_rows(rows):
@@ -437,49 +506,43 @@ async def sync_usd_index_continuous(poll_seconds=USD_INDEX_POLL_SECONDS):
 
 
 async def sync_daily_from_spot(selected_symbols=None):
+    return await sync_daily_from_history(selected_symbols)
+
+
+async def sync_daily_from_history(selected_symbols=None):
     db_tools = DbTools()
     await db_tools.init_pool()
 
     try:
         effective_symbols = normalize_selected_symbols(selected_symbols, DAILY_SYNC_SYMBOLS)
-        spot_df = await asyncio.to_thread(get_forex_spot)
-        if spot_df is None or spot_df.empty:
-            print('No forex spot data fetched.')
-            return 0
-
-        basic_rows = build_forex_basic_rows(spot_df)
-        if effective_symbols:
-            selected_set = set(effective_symbols)
-            basic_rows = [row for row in basic_rows if row['symbol_code'] in selected_set]
-            spot_df = spot_df[spot_df[COL_CODE].map(normalize_symbol_code).isin(selected_set)]
-
-        if not basic_rows:
+        if not effective_symbols:
             print('No forex symbols matched the current selection.')
             return 0
 
-        today = datetime.now().date()
-        today_text = today.strftime('%Y-%m-%d')
-        yesterday_text = (today - timedelta(days=1)).strftime('%Y-%m-%d')
-        daily_rows = build_forex_spot_daily_rows(spot_df, today_text)
-
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        history_refresh_rows = await asyncio.gather(*[
-            fetch_symbol_history_row_for_daily_refresh(symbol_row, yesterday_text, today_text, semaphore)
-            for symbol_row in basic_rows
+        history_results = await asyncio.gather(*[
+            fetch_symbol_history_rows_for_daily_sync(symbol_code, semaphore)
+            for symbol_code in effective_symbols
         ])
-        history_refresh_rows = [row for row in history_refresh_rows if row]
 
-        merged_rows = daily_rows + history_refresh_rows
+        basic_rows = [result['basic_row'] for result in history_results if result.get('basic_row')]
+        merged_rows = []
+        for result in history_results:
+            merged_rows.extend(result.get('daily_rows') or [])
+
+        if not basic_rows or not merged_rows:
+            print('No forex history rows fetched for daily sync.')
+            return 0
+
         basic_upserted = await db_tools.upsert_forex_basic_info(basic_rows)
         daily_upserted = await db_tools.upsert_forex_daily_snapshots(merged_rows)
-        refreshed_dates = sorted({row['trade_date'] for row in history_refresh_rows if row.get('trade_date')})
+        refreshed_dates = sorted({row['trade_date'] for row in merged_rows if row.get('trade_date')})
         print(
             'forex daily finished, '
             f'forex_basic_info upserted: {basic_upserted}, '
             f'forex_daily_data upserted: {daily_upserted}, '
-            f'symbols: {",".join(sorted(selected_set)) if effective_symbols else "ALL"}, '
-            f'today_rows: {len(daily_rows)}, '
-            f'history_refresh_rows: {len(history_refresh_rows)}, '
+            f'symbols: {",".join(sorted(effective_symbols))}, '
+            f'history_rows: {len(merged_rows)}, '
             f'history_refresh_dates: {",".join(refreshed_dates) if refreshed_dates else "NONE"}'
         )
         return daily_upserted

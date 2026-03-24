@@ -2,6 +2,8 @@ import json
 import random
 import threading
 import time
+import builtins
+import logging
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.client import RemoteDisconnected
@@ -10,7 +12,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from akshare_project.core.logging_utils import echo_and_log, get_logger
+from akshare_project.core.logging_utils import get_logger
 from akshare_project.core.paths import ensure_runtime_layout
 from akshare_project.scheduler.config import load_scheduler_config
 from akshare_project.scheduler.registry import get_function_spec
@@ -18,10 +20,27 @@ from akshare_project.scheduler.serialization import serialize_result
 from akshare_project.scheduler.store import SchedulerStore
 
 LOGGER = get_logger("ak_scheduler")
-
-
+LOG_PREFIX = "[AK-SCHEDULER]"
 def log(message, level="info"):
-    echo_and_log(LOGGER, message)
+    normalized_level = str(level or "info").strip().lower()
+    level_name = normalized_level.upper()
+    levelno = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "success": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+    }.get(normalized_level, logging.INFO)
+    text = f"{LOG_PREFIX}[{level_name}] {message}"
+    if normalized_level == "error":
+        builtins.print(f"\033[31m{text}\033[0m")
+    elif normalized_level == "success":
+        builtins.print(f"\033[32m{text}\033[0m")
+    elif normalized_level == "warning":
+        builtins.print(f"\033[33m{text}\033[0m")
+    else:
+        builtins.print(text)
+    LOGGER.log(levelno, message)
 
 
 def compact_json(value, limit=240):
@@ -32,8 +51,6 @@ def compact_json(value, limit=240):
     if len(text) > limit:
         return text[: limit - 3] + "..."
     return text
-
-
 def summarize_job(job):
     if not job:
         return "job=<none>"
@@ -66,7 +83,7 @@ def load_policy(config, source_group):
     policy = dict((config.get("source_policies") or {}).get(source_group, {}))
     policy.setdefault("min_interval_seconds", 2.0)
     policy.setdefault("max_attempts", 4)
-    policy.setdefault("initial_backoff_seconds", 120)
+    policy.setdefault("initial_backoff_seconds", 2)
     policy.setdefault("backoff_cap_seconds", 900)
     policy.setdefault("jitter_seconds", 5)
     policy.setdefault("enable_circuit_breaker", False)
@@ -147,9 +164,11 @@ class SchedulerService:
             raise ValueError(f"source_group mismatch for {payload.get('function_name')}")
         payload["source_group"] = spec.source_group
         job = self.store.submit_job(payload)
+        queue_entry = "reused" if job.get("_dedupe_reused") else "new"
         log(
             "job submitted: "
             f"{summarize_job(job)} "
+            f"queue_entry={queue_entry} "
             f"request_key={payload.get('request_key')} "
             f"args={compact_json(payload.get('args') or [])} "
             f"kwargs={compact_json(payload.get('kwargs') or {})}"
@@ -160,13 +179,21 @@ class SchedulerService:
         job = self.store.get_job(job_id)
         if not job:
             return None
+        return self._decode_job_fields(job)
+
+    def get_jobs(self, job_ids):
+        jobs = self.store.get_jobs(job_ids)
+        return [self._decode_job_fields(job) for job in jobs]
+
+    def _decode_job_fields(self, job):
+        decoded = dict(job)
         for field in ("args_json", "kwargs_json"):
-            if job.get(field):
+            if decoded.get(field):
                 try:
-                    job[field] = json.loads(job[field])
+                    decoded[field] = json.loads(decoded[field])
                 except Exception:
                     pass
-        return job
+        return decoded
 
     def build_health_payload(self):
         queue_stats = self.store.get_queue_stats()
@@ -266,7 +293,6 @@ class SchedulerService:
 
             self.wait_for_rate_limit(source_group, policy)
             self.state.mark_dispatch(source_group)
-            log(f"{source_group} dispatching job: {summarize_job(job)}")
 
             try:
                 result = self.execute_job(job, policy)
@@ -275,7 +301,8 @@ class SchedulerService:
                 self.state.mark_success(source_group)
                 log(
                     f"{source_group} job success: {summarize_job(job)} "
-                    f"result_type={result_type}"
+                    f"result_type={result_type}",
+                    level="success",
                 )
             except Exception as exc:
                 error_category = classify_exception(exc)
@@ -321,6 +348,22 @@ class SchedulerRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/jobs/query":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                payload = json.loads(body or "{}")
+                ids = payload.get("ids") or []
+                jobs = SERVICE_INSTANCE.get_jobs(ids)
+                self._send_json({"jobs": jobs})
+            except Exception as exc:
+                log(
+                    f"http request failed: method=POST path={parsed.path} error={exc}",
+                    level="error",
+                )
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
         if parsed.path != "/jobs":
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
@@ -330,8 +373,17 @@ class SchedulerRequestHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(length).decode("utf-8") if length else "{}"
             payload = json.loads(body or "{}")
             job = SERVICE_INSTANCE.submit_job(payload)
-            self._send_json({"id": job["id"], "status": job["status"], "root_job_id": job.get("root_job_id") or job["id"]})
+            self._send_json({
+                "id": job["id"],
+                "status": job["status"],
+                "root_job_id": job.get("root_job_id") or job["id"],
+                "deduped": bool(job.get("_dedupe_reused")),
+            })
         except Exception as exc:
+            log(
+                f"http request failed: method=POST path={parsed.path} error={exc}",
+                level="error",
+            )
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def do_GET(self):
@@ -344,10 +396,18 @@ class SchedulerRequestHandler(BaseHTTPRequestHandler):
             try:
                 job_id = int(parsed.path.split("/")[-1])
             except ValueError:
+                log(
+                    f"http request failed: method=GET path={parsed.path} error=invalid job id",
+                    level="error",
+                )
                 self._send_json({"error": "invalid job id"}, status=HTTPStatus.BAD_REQUEST)
                 return
             job = SERVICE_INSTANCE.get_job(job_id)
             if not job:
+                log(
+                    f"http request failed: method=GET path={parsed.path} error=job not found",
+                    level="error",
+                )
                 self._send_json({"error": "job not found"}, status=HTTPStatus.NOT_FOUND)
                 return
             self._send_json(job)

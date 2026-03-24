@@ -2,8 +2,8 @@ CREATE TABLE IF NOT EXISTS etf_basic_info (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   etf_code VARCHAR(16) NOT NULL COMMENT 'ETF code, e.g. 510300',
   etf_name VARCHAR(128) NULL COMMENT 'ETF name',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_etf_code (etf_code)
 ) COMMENT='ETF basic info from AKShare fund_etf_spot_em';
 
@@ -49,8 +49,8 @@ CREATE TABLE IF NOT EXISTS etf_daily_data (
   spot_update_time DATETIME NULL COMMENT 'Spot payload update time',
   data_source VARCHAR(32) NOT NULL DEFAULT 'fund_etf_hist_em' COMMENT 'fund_etf_hist_em or fund_etf_spot_em or fund_etf_spot_ths',
   adjust_type VARCHAR(8) NULL COMMENT 'Adjustment type such as qfq',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_etf_trade_date (etf_code, trade_date),
   KEY idx_data_source_trade_date (data_source, trade_date),
   KEY idx_trade_date (trade_date)

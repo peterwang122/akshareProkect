@@ -5,7 +5,12 @@ from datetime import date, datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-from akshare_project.core.ak_scheduler_client import SchedulerContext
+from akshare_project.core.ak_scheduler_client import (
+    SchedulerContext,
+    decode_job_result,
+    get_job_snapshots,
+    submit_registered_job,
+)
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.progress import ProgressStore
 from akshare_project.core.retry import fetch_with_retry as shared_fetch_with_retry
@@ -170,6 +175,16 @@ def build_etf_backfill_task_payload(etf_code, etf_name, start_date, end_date):
     }
 
 
+def build_etf_hist_request_key(etf_code, start_date, end_date):
+    return (
+        f"fund_etf_hist_em:"
+        f"{normalize_etf_code(etf_code)}:"
+        f"{start_date.strftime('%Y%m%d')}:"
+        f"{end_date.strftime('%Y%m%d')}:"
+        f"{HIST_ADJUST}"
+    )
+
+
 def get_etf_spot_em(return_scheduler_meta=False):
     return fetch_with_retry(ak.fund_etf_spot_em, return_scheduler_meta=return_scheduler_meta)
 
@@ -205,7 +220,7 @@ def get_etf_spot(return_scheduler_meta=False):
     raise RuntimeError("failed to fetch ETF spot data: " + " | ".join(errors))
 
 
-def get_etf_history(etf_code, start_date, end_date, scheduler_context=None):
+def get_etf_history(etf_code, start_date, end_date, scheduler_context=None, request_key=None):
     return fetch_with_retry(
         ak.fund_etf_hist_em,
         symbol=etf_code,
@@ -214,6 +229,7 @@ def get_etf_history(etf_code, start_date, end_date, scheduler_context=None):
         end_date=end_date.strftime("%Y%m%d"),
         adjust=HIST_ADJUST,
         scheduler_context=scheduler_context,
+        request_key=request_key,
     )
 
 
@@ -446,6 +462,7 @@ async def process_history_symbol(
                 start_date,
                 end_date,
                 scheduler_context,
+                build_etf_hist_request_key(etf_code, start_date, end_date),
             )
 
         if history_df is None or history_df.empty:
@@ -550,7 +567,153 @@ async def sync_history(mode_label, selected_codes=None, record_failures=False):
 
 
 async def backfill_history(selected_codes=None):
-    return await sync_history("etf_backfill", selected_codes, record_failures=True)
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    progress_lock = asyncio.Lock()
+    progress_lines = []
+
+    try:
+        spot_source, _, basic_rows, missing_codes, spot_result = await load_selected_etfs(
+            selected_codes,
+            return_scheduler_meta=True,
+        )
+        if missing_codes:
+            print(f"etf_backfill ignored unknown ETF codes: {', '.join(missing_codes)}")
+        if not basic_rows:
+            print("No ETF symbols matched for etf_backfill.")
+            return 0
+
+        basic_upserted = await db_tools.upsert_etf_basic_info(basic_rows)
+        print(f"etf_backfill etf_basic_info upserted: {basic_upserted}, spot_source: {spot_source}")
+
+        end_date = datetime.now().date() - timedelta(days=1)
+        scheduler_context = None
+        if spot_result is not None:
+            scheduler_context = SchedulerContext(
+                parent_job_id=spot_result.job_id,
+                root_job_id=spot_result.root_job_id,
+                workflow_name="etf_backfill:spot_to_hist",
+            )
+
+        submitted_jobs = []
+        for symbol_row in basic_rows:
+            etf_code = symbol_row["etf_code"]
+            handle = await asyncio.to_thread(
+                submit_registered_job,
+                ak.fund_etf_hist_em,
+                scheduler_context=scheduler_context,
+                caller_name=LOGGER.name,
+                request_key=build_etf_hist_request_key(etf_code, BACKFILL_START_DATE, end_date),
+                symbol=etf_code,
+                period="daily",
+                start_date=BACKFILL_START_DATE.strftime("%Y%m%d"),
+                end_date=end_date.strftime("%Y%m%d"),
+                adjust=HIST_ADJUST,
+            )
+            submitted_jobs.append({
+                **symbol_row,
+                "job_id": handle.job_id,
+                "root_job_id": handle.root_job_id,
+                "initial_status": handle.status,
+            })
+
+        deduped_jobs = {job["job_id"]: job for job in submitted_jobs}
+        print(
+            "etf_backfill submitted all history jobs to scheduler, "
+            f"symbols={len(basic_rows)}, "
+            f"queued_jobs={len(deduped_jobs)}"
+        )
+
+        remaining_jobs = dict(deduped_jobs)
+        total_upserted = 0
+        last_reported_remaining = None
+
+        while remaining_jobs:
+            snapshots = await asyncio.to_thread(get_job_snapshots, list(remaining_jobs.keys()))
+            if not snapshots:
+                await asyncio.sleep(API_RETRY_SLEEP_SECONDS)
+                continue
+
+            completed_any = False
+            for snapshot in snapshots:
+                symbol_row = remaining_jobs.get(snapshot.job_id)
+                if symbol_row is None:
+                    continue
+
+                if snapshot.status not in {"SUCCESS", "FAILED", "CANCELLED"}:
+                    continue
+
+                completed_any = True
+                etf_code = symbol_row["etf_code"]
+                etf_name = symbol_row.get("etf_name") or ""
+
+                if snapshot.status == "SUCCESS":
+                    try:
+                        history_df = decode_job_result(snapshot)
+                        if history_df is None or history_df.empty:
+                            raise ValueError(f"empty history data for {etf_code}")
+
+                        history_rows = build_etf_hist_rows(etf_code, etf_name, history_df)
+                        if not history_rows:
+                            raise ValueError(f"no parsed history rows for {etf_code}")
+
+                        upserted = await db_tools.upsert_etf_daily_data(history_rows)
+                        await resolve_etf_backfill_success(
+                            db_tools,
+                            etf_code,
+                            etf_name,
+                            BACKFILL_START_DATE,
+                            end_date,
+                        )
+                        total_upserted += upserted
+                        async with progress_lock:
+                            progress_lines.append(
+                                f"etf_backfill,{etf_code},{BACKFILL_START_DATE},{end_date},{upserted}"
+                            )
+                            await asyncio.to_thread(save_progress_batch, [progress_lines[-1]])
+                        print(f"etf_backfill {etf_code}: upserted {upserted}")
+                    except Exception as exc:
+                        await record_etf_backfill_failure(
+                            db_tools,
+                            etf_code,
+                            etf_name,
+                            BACKFILL_START_DATE,
+                            end_date,
+                            str(exc),
+                        )
+                        print(f"etf_backfill {etf_code} failed after success result parse: {exc}")
+                        log_error(etf_code, str(end_date), str(exc))
+                else:
+                    error_message = snapshot.error_message or f"scheduler job {snapshot.status.lower()}"
+                    await record_etf_backfill_failure(
+                        db_tools,
+                        etf_code,
+                        etf_name,
+                        BACKFILL_START_DATE,
+                        end_date,
+                        error_message,
+                    )
+                    print(f"etf_backfill {etf_code} scheduler failed: {error_message}")
+                    log_error(etf_code, str(end_date), error_message)
+
+                remaining_jobs.pop(snapshot.job_id, None)
+
+            if remaining_jobs:
+                remaining_count = len(remaining_jobs)
+                if last_reported_remaining != remaining_count:
+                    print(f"etf_backfill waiting for scheduler jobs, remaining={remaining_count}")
+                    last_reported_remaining = remaining_count
+                await asyncio.sleep(API_RETRY_SLEEP_SECONDS if completed_any else max(2, API_RETRY_SLEEP_SECONDS))
+
+        print(
+            "etf_backfill finished, "
+            f"symbols={len(basic_rows)}, "
+            f"queued_jobs={len(deduped_jobs)}, "
+            f"upserted_rows={total_upserted}"
+        )
+        return total_upserted
+    finally:
+        await db_tools.close()
 
 
 async def weekly_repair(selected_codes=None):

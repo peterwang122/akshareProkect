@@ -37,6 +37,7 @@ class DbTools:
 
     def __init__(self):
         self.db_info = self.load_db_info()
+        self.session_time_zone = str(self.db_info.get('timezone', '+08:00')).strip() or '+08:00'
         self.pool = None
 
     def load_db_info(self):
@@ -248,6 +249,7 @@ class DbTools:
             autocommit=False,
             minsize=1,
             maxsize=10,
+            init_command=f"SET time_zone = '{self.session_time_zone}'",
         )
 
     async def close(self):

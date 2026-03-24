@@ -13,8 +13,8 @@ CREATE TABLE IF NOT EXISTS douyin_index_emotion_daily (
   raw_ocr_text TEXT NULL COMMENT 'OCR/页面提取原文',
   extraction_method VARCHAR(32) NOT NULL DEFAULT 'ocr' COMMENT '提取方式',
   extraction_status VARCHAR(16) NOT NULL DEFAULT 'SUCCESS' COMMENT 'SUCCESS/PARTIAL/FAILED',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_emotion_date (emotion_date),
   UNIQUE KEY uk_video_id (video_id),
   KEY idx_account_date (account_id, emotion_date)

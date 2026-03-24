@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS daily_task_failures (
   last_failed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Last failure time',
   last_retry_at DATETIME NULL COMMENT 'Last manual retry time',
   resolved_at DATETIME NULL COMMENT 'Resolved time',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_task_identity (task_name, task_stage, task_key),
   KEY idx_status_failed_at (status, last_failed_at),
   KEY idx_task_name_status (task_name, status)

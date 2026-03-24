@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS cffex_member_rankings (
   short_open_interest DECIMAL(20, 2) NULL COMMENT '持卖单量',
   short_change_value DECIMAL(20, 2) NULL COMMENT '持卖单增减',
   source_url VARCHAR(255) NOT NULL DEFAULT 'http://www.cffex.com.cn/ccpm/' COMMENT '数据来源',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_trade_contract_rank (trade_date, product_code, contract_code, rank_no),
   KEY idx_product_trade_date (product_code, trade_date),
   KEY idx_contract_trade_date (contract_code, trade_date)

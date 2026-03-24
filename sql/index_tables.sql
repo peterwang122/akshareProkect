@@ -5,8 +5,8 @@ CREATE TABLE IF NOT EXISTS index_basic_info (
   market VARCHAR(8) NULL COMMENT 'Market prefix, e.g. sh or sz',
   index_name VARCHAR(64) NOT NULL COMMENT 'Index name',
   data_source VARCHAR(32) NOT NULL DEFAULT 'akshare' COMMENT 'Data source',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_index_code (index_code),
   KEY idx_simple_code_market (simple_code, market),
   KEY idx_index_name (index_name)
@@ -27,8 +27,8 @@ CREATE TABLE IF NOT EXISTS index_daily_data (
   turnover_rate DECIMAL(8, 4) NULL COMMENT 'Turnover rate, percent',
   trade_date DATE NOT NULL COMMENT 'Trading date',
   data_source VARCHAR(32) NOT NULL DEFAULT 'akshare' COMMENT 'Data source',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_index_code_trade_date (index_code, trade_date),
   KEY idx_trade_date (trade_date),
   KEY idx_index_code (index_code)

@@ -32,14 +32,11 @@ async def dispatch_failed_task(failure):
     if task_name == 'etf_daily':
         return await etf.sync_daily()
     if task_name == 'option_daily':
-        if task_stage == 'task':
-            return await option.sync_daily(record_failures=True)
-        return await option.retry_failed_daily_task(payload)
+        if task_stage != 'task':
+            return 0
+        return await option.sync_daily(record_failures=False)
     if task_name == 'option_missing_date_backfill':
-        target_date = payload.get('target_date')
-        if not target_date:
-            raise ValueError('missing target_date for option_missing_date_backfill')
-        return await option.retry_missing_trade_date_failures_once(target_date)
+        return 0
     if task_name == 'stock_missing_date_backfill':
         target_date = payload.get('target_date')
         if not target_date:

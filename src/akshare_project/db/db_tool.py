@@ -277,6 +277,32 @@ class DbTools:
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'option_daily_sina'
         return sanitized
 
+    def _sanitize_option_rtj_daily_row(self, row):
+        sanitized = dict(row)
+        sanitized['index_type'] = str(row.get('index_type', '')).strip().upper()
+        sanitized['index_name'] = str(row.get('index_name', '')).strip() or None
+        sanitized['product_prefix'] = str(row.get('product_prefix', '')).strip().upper() or None
+        sanitized['contract_code'] = str(row.get('contract_code', '')).strip().upper()
+        sanitized['contract_month'] = str(row.get('contract_month', '')).strip() or None
+        sanitized['option_type'] = str(row.get('option_type', '')).strip().upper() or None
+        sanitized['strike_price'] = self._normalize_numeric('strike_price', row.get('strike_price'))
+        sanitized['trade_date'] = str(row.get('trade_date', '')).strip()
+        sanitized['open_price'] = self._normalize_numeric('open_price', row.get('open_price'))
+        sanitized['high_price'] = self._normalize_numeric('high_price', row.get('high_price'))
+        sanitized['low_price'] = self._normalize_numeric('low_price', row.get('low_price'))
+        sanitized['close_price'] = self._normalize_numeric('close_price', row.get('close_price'))
+        sanitized['settle_price'] = self._normalize_numeric('settle_price', row.get('settle_price'))
+        sanitized['pre_settle_price'] = self._normalize_numeric('pre_settle_price', row.get('pre_settle_price'))
+        sanitized['price_change_close'] = self._normalize_numeric('price_change_amount', row.get('price_change_close'))
+        sanitized['price_change_settle'] = self._normalize_numeric('price_change_amount', row.get('price_change_settle'))
+        sanitized['volume'] = self._normalize_numeric('volume', row.get('volume'))
+        sanitized['turnover'] = self._normalize_numeric('turnover', row.get('turnover'))
+        sanitized['open_interest'] = self._normalize_numeric('open_interest', row.get('open_interest'))
+        sanitized['open_interest_change'] = self._normalize_numeric('open_interest', row.get('open_interest_change'))
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'cffex_rtj'
+        sanitized['source_url'] = str(row.get('source_url', '')).strip() or 'http://www.cffex.com.cn/rtj/'
+        return sanitized
+
     def _sanitize_failed_task_row(self, row):
         payload = row.get('payload_json')
         if isinstance(payload, (dict, list)):
@@ -1161,6 +1187,85 @@ class DbTools:
                 await cursor.executemany(query_insert, rows_to_insert)
                 await conn.commit()
                 return len(rows_to_insert)
+
+    async def batch_option_rtj_daily_data(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_option_rtj_daily_row(row) for row in rows]
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['contract_code'] and row['trade_date']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[(row['contract_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_insert = """
+                INSERT IGNORE INTO option_cffex_rtj_daily_data (
+                    index_type,
+                    index_name,
+                    product_prefix,
+                    contract_code,
+                    contract_month,
+                    option_type,
+                    strike_price,
+                    trade_date,
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    settle_price,
+                    pre_settle_price,
+                    price_change_close,
+                    price_change_settle,
+                    volume,
+                    turnover,
+                    open_interest,
+                    open_interest_change,
+                    data_source,
+                    source_url
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                values = [
+                    (
+                        row['index_type'],
+                        row['index_name'],
+                        row['product_prefix'],
+                        row['contract_code'],
+                        row['contract_month'],
+                        row['option_type'],
+                        row['strike_price'],
+                        row['trade_date'],
+                        row['open_price'],
+                        row['high_price'],
+                        row['low_price'],
+                        row['close_price'],
+                        row['settle_price'],
+                        row['pre_settle_price'],
+                        row['price_change_close'],
+                        row['price_change_settle'],
+                        row['volume'],
+                        row['turnover'],
+                        row['open_interest'],
+                        row['open_interest_change'],
+                        row['data_source'],
+                        row['source_url'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_insert, values)
+                await conn.commit()
+                return cursor.rowcount
 
     async def upsert_forex_daily_snapshots(self, rows):
         if not rows:

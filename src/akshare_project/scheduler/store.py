@@ -1,4 +1,5 @@
 import json
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
@@ -46,72 +47,102 @@ class SchedulerStore:
         parent_job_id = payload.get("parent_job_id")
         root_job_id = payload.get("root_job_id")
         status = "PENDING"
-        now = datetime.now()
+        for attempt in range(1, 6):
+            now = datetime.now()
+            try:
+                with self.connection() as conn:
+                    with conn.cursor() as cursor:
+                        if parent_job_id:
+                            cursor.execute(
+                                "SELECT id, root_job_id, status FROM ak_request_jobs WHERE id = %s",
+                                (parent_job_id,),
+                            )
+                            parent = cursor.fetchone()
+                            if not parent:
+                                raise ValueError(f"parent_job_id not found: {parent_job_id}")
+                            if root_job_id is None:
+                                root_job_id = parent.get("root_job_id") or parent.get("id")
+                            if parent.get("status") != "SUCCESS":
+                                status = "WAITING_PARENT"
 
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                if parent_job_id:
-                    cursor.execute("SELECT id, root_job_id, status FROM ak_request_jobs WHERE id = %s", (parent_job_id,))
-                    parent = cursor.fetchone()
-                    if not parent:
-                        raise ValueError(f"parent_job_id not found: {parent_job_id}")
-                    if root_job_id is None:
-                        root_job_id = parent.get("root_job_id") or parent.get("id")
-                    if parent.get("status") != "SUCCESS":
-                        status = "WAITING_PARENT"
+                        query = """
+                        INSERT INTO ak_request_jobs (
+                            request_key,
+                            function_name,
+                            source_group,
+                            args_json,
+                            kwargs_json,
+                            status,
+                            next_run_at,
+                            parent_job_id,
+                            root_job_id,
+                            workflow_name,
+                            caller_name
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            updated_at = CURRENT_TIMESTAMP
+                        """
+                        cursor.execute(
+                            query,
+                            (
+                                request_key,
+                                payload["function_name"],
+                                payload["source_group"],
+                                json.dumps(payload.get("args") or [], ensure_ascii=False, default=str),
+                                json.dumps(payload.get("kwargs") or {}, ensure_ascii=False, default=str),
+                                status,
+                                now,
+                                parent_job_id,
+                                root_job_id,
+                                payload.get("workflow_name"),
+                                payload.get("caller_name"),
+                            ),
+                        )
+                        is_new_row = bool(cursor.lastrowid)
+                        if is_new_row:
+                            job_id = cursor.lastrowid
+                            cursor.execute(
+                                "UPDATE ak_request_jobs SET root_job_id = COALESCE(root_job_id, %s) WHERE id = %s",
+                                (root_job_id or job_id, job_id),
+                            )
+                        else:
+                            cursor.execute("SELECT id FROM ak_request_jobs WHERE request_key = %s", (request_key,))
+                            row = cursor.fetchone()
+                            job_id = row["id"]
 
-                query = """
-                INSERT INTO ak_request_jobs (
-                    request_key,
-                    function_name,
-                    source_group,
-                    args_json,
-                    kwargs_json,
-                    status,
-                    next_run_at,
-                    parent_job_id,
-                    root_job_id,
-                    workflow_name,
-                    caller_name
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    updated_at = CURRENT_TIMESTAMP
-                """
-                cursor.execute(
-                    query,
-                    (
-                        request_key,
-                        payload["function_name"],
-                        payload["source_group"],
-                        json.dumps(payload.get("args") or [], ensure_ascii=False, default=str),
-                        json.dumps(payload.get("kwargs") or {}, ensure_ascii=False, default=str),
-                        status,
-                        now,
-                        parent_job_id,
-                        root_job_id,
-                        payload.get("workflow_name"),
-                        payload.get("caller_name"),
-                    ),
-                )
-                if cursor.lastrowid:
-                    job_id = cursor.lastrowid
-                else:
-                    cursor.execute("SELECT id FROM ak_request_jobs WHERE request_key = %s", (request_key,))
-                    row = cursor.fetchone()
-                    job_id = row["id"]
-
-                cursor.execute(
-                    "UPDATE ak_request_jobs SET root_job_id = COALESCE(root_job_id, %s) WHERE id = %s",
-                    (root_job_id or job_id, job_id),
-                )
-                cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
-                return cursor.fetchone()
+                        cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
+                        row = cursor.fetchone()
+                        row["_dedupe_reused"] = not is_new_row
+                        return row
+            except pymysql.err.OperationalError as exc:
+                error_code = int(exc.args[0]) if exc.args else 0
+                if error_code not in {1205, 1213} or attempt >= 5:
+                    raise
+                time.sleep(0.05 * attempt)
 
     def get_job(self, job_id):
         with self.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
                 return cursor.fetchone()
+
+    def get_jobs(self, job_ids):
+        normalized_ids = [
+            int(job_id)
+            for job_id in (job_ids or [])
+            if str(job_id).strip()
+        ]
+        if not normalized_ids:
+            return []
+
+        placeholders = ",".join(["%s"] * len(normalized_ids))
+        with self.connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT * FROM ak_request_jobs WHERE id IN ({placeholders}) ORDER BY id ASC",
+                    normalized_ids,
+                )
+                return list(cursor.fetchall())
 
     def recover_stale_jobs(self, lease_seconds):
         now = datetime.now()
