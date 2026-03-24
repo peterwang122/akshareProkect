@@ -30,6 +30,26 @@ class DbTools:
         'price_change_rate': 99999999999999.99,
         'price_change_amount': 999999.99,
         'turnover_rate': 99999999999999.99,
+        'pre_close_price': 999999.99,
+        'iopv_realtime': 999999.99,
+        'discount_rate': 99999999999999.99,
+        'volume_ratio': 99999999999999.99,
+        'current_hand': 999999999999.99,
+        'bid1_price': 999999.99,
+        'ask1_price': 999999.99,
+        'outer_volume': 999999999999.99,
+        'inner_volume': 999999999999.99,
+        'latest_share': 999999999999.99,
+        'main_net_inflow': 99999999999999.99,
+        'main_net_inflow_ratio': 99999999999999.99,
+        'extra_large_net_inflow': 99999999999999.99,
+        'extra_large_net_inflow_ratio': 99999999999999.99,
+        'large_net_inflow': 99999999999999.99,
+        'large_net_inflow_ratio': 99999999999999.99,
+        'medium_net_inflow': 99999999999999.99,
+        'medium_net_inflow_ratio': 99999999999999.99,
+        'small_net_inflow': 99999999999999.99,
+        'small_net_inflow_ratio': 99999999999999.99,
         'pe_ttm': 9999999999.9999,
         'pb': 9999999999.9999,
         'total_market_value': 9999999999999999999999.99,
@@ -150,6 +170,39 @@ class DbTools:
         sanitized['low_price'] = self._normalize_numeric('low_price', row.get('low_price'))
         sanitized['amplitude'] = self._normalize_numeric('amplitude', row.get('amplitude'))
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'forex_hist_em'
+        return sanitized
+
+    def _sanitize_etf_daily_row(self, row):
+        sanitized = dict(row)
+        sanitized['etf_code'] = str(row.get('etf_code', '')).strip()
+        sanitized['etf_name'] = str(row.get('etf_name', '')).strip() or None
+        sanitized['trade_date'] = str(row.get('trade_date', '')).strip()
+        for field in [
+            'open_price', 'close_price', 'high_price', 'low_price', 'volume', 'turnover',
+            'amplitude', 'price_change_rate', 'price_change_amount', 'turnover_rate',
+            'pre_close_price', 'iopv_realtime', 'discount_rate', 'volume_ratio',
+            'current_hand', 'bid1_price', 'ask1_price', 'outer_volume', 'inner_volume',
+            'latest_share', 'circulating_market_value', 'total_market_value',
+            'main_net_inflow', 'main_net_inflow_ratio',
+            'extra_large_net_inflow', 'extra_large_net_inflow_ratio',
+            'large_net_inflow', 'large_net_inflow_ratio',
+            'medium_net_inflow', 'medium_net_inflow_ratio',
+            'small_net_inflow', 'small_net_inflow_ratio',
+        ]:
+            sanitized[field] = self._normalize_numeric(field, row.get(field))
+
+        spot_data_date = row.get('spot_data_date')
+        sanitized['spot_data_date'] = str(spot_data_date).split(' ')[0].strip() if spot_data_date else None
+
+        spot_update_time = row.get('spot_update_time')
+        if hasattr(spot_update_time, 'to_pydatetime'):
+            spot_update_time = spot_update_time.to_pydatetime()
+        if hasattr(spot_update_time, 'tzinfo') and getattr(spot_update_time, 'tzinfo', None) is not None:
+            spot_update_time = spot_update_time.replace(tzinfo=None)
+        sanitized['spot_update_time'] = spot_update_time or None
+
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'fund_etf_hist_em'
+        sanitized['adjust_type'] = str(row.get('adjust_type', '')).strip() or None
         return sanitized
 
     def _sanitize_futures_daily_row(self, row):
@@ -844,6 +897,42 @@ class DbTools:
                 await conn.commit()
                 return len(rows_to_upsert)
 
+    async def upsert_etf_basic_info(self, basic_rows):
+        if not basic_rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        deduped_rows = {}
+        for row in basic_rows:
+            etf_code = str(row.get('etf_code', '')).strip()
+            if not etf_code:
+                continue
+            deduped_rows[etf_code] = (
+                etf_code,
+                str(row.get('etf_name', '')).strip() or None,
+            )
+
+        rows_to_upsert = list(deduped_rows.values())
+        if not rows_to_upsert:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO etf_basic_info (
+                    etf_code,
+                    etf_name
+                ) VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE
+                    etf_name = VALUES(etf_name),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await cursor.executemany(query_upsert, rows_to_upsert)
+                await conn.commit()
+                return len(rows_to_upsert)
+
     async def batch_forex_daily_data(self, rows):
         if not rows:
             return 0
@@ -1126,6 +1215,158 @@ class DbTools:
                         row['low_price'],
                         row['amplitude'],
                         row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def upsert_etf_daily_data(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_etf_daily_row(row) for row in rows]
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['etf_code'] and row['trade_date']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[(row['etf_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO etf_daily_data (
+                    etf_code,
+                    etf_name,
+                    trade_date,
+                    open_price,
+                    close_price,
+                    high_price,
+                    low_price,
+                    volume,
+                    turnover,
+                    amplitude,
+                    price_change_rate,
+                    price_change_amount,
+                    turnover_rate,
+                    pre_close_price,
+                    iopv_realtime,
+                    discount_rate,
+                    volume_ratio,
+                    current_hand,
+                    bid1_price,
+                    ask1_price,
+                    outer_volume,
+                    inner_volume,
+                    latest_share,
+                    circulating_market_value,
+                    total_market_value,
+                    main_net_inflow,
+                    main_net_inflow_ratio,
+                    extra_large_net_inflow,
+                    extra_large_net_inflow_ratio,
+                    large_net_inflow,
+                    large_net_inflow_ratio,
+                    medium_net_inflow,
+                    medium_net_inflow_ratio,
+                    small_net_inflow,
+                    small_net_inflow_ratio,
+                    spot_data_date,
+                    spot_update_time,
+                    data_source,
+                    adjust_type
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    etf_name = VALUES(etf_name),
+                    open_price = VALUES(open_price),
+                    close_price = VALUES(close_price),
+                    high_price = VALUES(high_price),
+                    low_price = VALUES(low_price),
+                    volume = VALUES(volume),
+                    turnover = VALUES(turnover),
+                    amplitude = VALUES(amplitude),
+                    price_change_rate = VALUES(price_change_rate),
+                    price_change_amount = VALUES(price_change_amount),
+                    turnover_rate = VALUES(turnover_rate),
+                    pre_close_price = VALUES(pre_close_price),
+                    iopv_realtime = VALUES(iopv_realtime),
+                    discount_rate = VALUES(discount_rate),
+                    volume_ratio = VALUES(volume_ratio),
+                    current_hand = VALUES(current_hand),
+                    bid1_price = VALUES(bid1_price),
+                    ask1_price = VALUES(ask1_price),
+                    outer_volume = VALUES(outer_volume),
+                    inner_volume = VALUES(inner_volume),
+                    latest_share = VALUES(latest_share),
+                    circulating_market_value = VALUES(circulating_market_value),
+                    total_market_value = VALUES(total_market_value),
+                    main_net_inflow = VALUES(main_net_inflow),
+                    main_net_inflow_ratio = VALUES(main_net_inflow_ratio),
+                    extra_large_net_inflow = VALUES(extra_large_net_inflow),
+                    extra_large_net_inflow_ratio = VALUES(extra_large_net_inflow_ratio),
+                    large_net_inflow = VALUES(large_net_inflow),
+                    large_net_inflow_ratio = VALUES(large_net_inflow_ratio),
+                    medium_net_inflow = VALUES(medium_net_inflow),
+                    medium_net_inflow_ratio = VALUES(medium_net_inflow_ratio),
+                    small_net_inflow = VALUES(small_net_inflow),
+                    small_net_inflow_ratio = VALUES(small_net_inflow_ratio),
+                    spot_data_date = VALUES(spot_data_date),
+                    spot_update_time = VALUES(spot_update_time),
+                    data_source = VALUES(data_source),
+                    adjust_type = VALUES(adjust_type),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['etf_code'],
+                        row['etf_name'],
+                        row['trade_date'],
+                        row['open_price'],
+                        row['close_price'],
+                        row['high_price'],
+                        row['low_price'],
+                        row['volume'],
+                        row['turnover'],
+                        row['amplitude'],
+                        row['price_change_rate'],
+                        row['price_change_amount'],
+                        row['turnover_rate'],
+                        row['pre_close_price'],
+                        row['iopv_realtime'],
+                        row['discount_rate'],
+                        row['volume_ratio'],
+                        row['current_hand'],
+                        row['bid1_price'],
+                        row['ask1_price'],
+                        row['outer_volume'],
+                        row['inner_volume'],
+                        row['latest_share'],
+                        row['circulating_market_value'],
+                        row['total_market_value'],
+                        row['main_net_inflow'],
+                        row['main_net_inflow_ratio'],
+                        row['extra_large_net_inflow'],
+                        row['extra_large_net_inflow_ratio'],
+                        row['large_net_inflow'],
+                        row['large_net_inflow_ratio'],
+                        row['medium_net_inflow'],
+                        row['medium_net_inflow_ratio'],
+                        row['small_net_inflow'],
+                        row['small_net_inflow_ratio'],
+                        row['spot_data_date'],
+                        row['spot_update_time'],
+                        row['data_source'],
+                        row['adjust_type'],
                     )
                     for row in sanitized_rows
                 ]

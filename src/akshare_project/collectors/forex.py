@@ -16,6 +16,15 @@ API_RETRY_SLEEP_SECONDS = 3
 MAX_CONCURRENCY = 6
 USD_INDEX_SYMBOL_NAME = '\u7f8e\u5143\u6307\u6570'
 USD_INDEX_POLL_SECONDS = 1800
+DAILY_SYNC_SYMBOLS = [
+    'USDCNH',
+    'CNHJPY',
+    'CNHEUR',
+    'CNHHKD',
+    'USDHKD',
+    'USDJPY',
+    'USDEUR',
+]
 LOGGER = get_logger('forex')
 PROGRESS_STORE = ProgressStore('forex')
 
@@ -71,6 +80,12 @@ def get_usd_index_history():
 
 def normalize_symbol_code(value):
     return str(value or '').strip().upper()
+
+
+def normalize_selected_symbols(selected_symbols=None, default_symbols=None):
+    source_symbols = selected_symbols if selected_symbols else (default_symbols or [])
+    normalized = [normalize_symbol_code(item) for item in source_symbols if normalize_symbol_code(item)]
+    return list(dict.fromkeys(normalized))
 
 
 def normalize_trade_date(value):
@@ -425,14 +440,15 @@ async def sync_daily_from_spot(selected_symbols=None):
     await db_tools.init_pool()
 
     try:
+        effective_symbols = normalize_selected_symbols(selected_symbols, DAILY_SYNC_SYMBOLS)
         spot_df = await asyncio.to_thread(get_forex_spot)
         if spot_df is None or spot_df.empty:
             print('No forex spot data fetched.')
             return 0
 
         basic_rows = build_forex_basic_rows(spot_df)
-        if selected_symbols:
-            selected_set = {normalize_symbol_code(item) for item in selected_symbols if normalize_symbol_code(item)}
+        if effective_symbols:
+            selected_set = set(effective_symbols)
             basic_rows = [row for row in basic_rows if row['symbol_code'] in selected_set]
             spot_df = spot_df[spot_df[COL_CODE].map(normalize_symbol_code).isin(selected_set)]
 
@@ -460,6 +476,7 @@ async def sync_daily_from_spot(selected_symbols=None):
             'forex daily finished, '
             f'forex_basic_info upserted: {basic_upserted}, '
             f'forex_daily_data upserted: {daily_upserted}, '
+            f'symbols: {",".join(sorted(selected_set)) if effective_symbols else "ALL"}, '
             f'today_rows: {len(daily_rows)}, '
             f'history_refresh_rows: {len(history_refresh_rows)}, '
             f'history_refresh_dates: {",".join(refreshed_dates) if refreshed_dates else "NONE"}'

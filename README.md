@@ -26,6 +26,7 @@ akshareProkect/
 |   |-- cffex_tables.sql
 |   |-- douyin_emotion_tables.sql
 |   |-- forex_tables.sql
+|   |-- etf_tables.sql
 |   |-- futures_tables.sql
 |   |-- option_tables.sql
 |   |-- excel_emotion_tables.sql
@@ -163,6 +164,8 @@ playwright install chromium
   - `forex_daily_data`
 - 备注：
   - 日更会更新今天快照，并尝试刷新最近已收盘历史日
+  - `python run.py forex daily` 默认只更新：`USDCNH`、`CNHJPY`、`CNHEUR`、`CNHHKD`、`USDHKD`、`USDJPY`、`USDEUR`
+  - 美元指数日更仍由单独的 `usd_index_once` / `usd-daily` 链路负责
   - 可手动执行 `repair-history`，把仍停留在 `forex_spot_em` 口径的历史记录回刷成 `forex_hist_em`
 
 ### 6. 中金所期货
@@ -195,7 +198,27 @@ playwright install chromium
   - 通过 `start_date` 和 `end_date` 控制历史区间与日更区间
   - 接口缺失字段落库时写为 `NULL`，作为 `NA` 处理
 
-### 7. 中金所指数期权
+### 7. ETF
+
+- 用途：ETF 基础信息、历史前复权日线、当日实时快照、周末前复权回刷
+- 主要接口：
+  - `ak.fund_etf_spot_em`
+  - `ak.fund_etf_hist_em`
+- 固定参数：
+  - 历史起始日：`2005-02-23`
+  - 历史结束日：昨日
+  - `period="daily"`
+  - `adjust="qfq"`
+- 写入表：
+  - `etf_basic_info`
+  - `etf_daily_data`
+- 备注：
+  - `backfill` 先用 `fund_etf_spot_em` 取 ETF 代码，再逐只拉 `fund_etf_hist_em`
+  - `daily` 直接使用 `fund_etf_spot_em` 写入今日快照
+  - `weekly-repair` 会把全量 ETF 的前复权历史到昨日重新回刷，覆盖旧历史口径
+  - 历史和快照共用 `etf_daily_data`，通过 `data_source` 区分
+
+### 8. 中金所指数期权
 
 - 用途：上证50、沪深300、中证1000指数期权的合约链与日线行情
 - 主要接口：
@@ -219,7 +242,7 @@ playwright install chromium
   - `daily` 表存最终日线
   - 请求成功但全天无成交、无日线数据的期权按正常情况跳过，不记失败
 
-### 8. Excel 情绪导入
+### 9. Excel 情绪导入
 
 - 用途：将整理好的 Excel 情绪指标批量导入数据库
 - 数据来源：
@@ -236,6 +259,7 @@ playwright install chromium
 | CFFEX 排名 | `cffex_member_rankings` |
 | 抖音情绪 | `douyin_index_emotion_daily` |
 | 外汇 | `forex_basic_info`, `forex_daily_data` |
+| ETF | `etf_basic_info`, `etf_daily_data` |
 | 期货 | `futures_daily_data` |
 | 期权 | `option_cffex_spot_data`, `option_cffex_daily_data` |
 | Excel 情绪 | `excel_index_emotion_daily` |
@@ -289,6 +313,17 @@ python run.py forex usd-daily
 python run.py forex usd-once
 ```
 
+### ETF
+
+```bash
+python run.py etf backfill
+python run.py etf backfill 510300 159915
+python run.py etf daily
+python run.py etf daily 510300 159915
+python run.py etf weekly-repair
+python run.py etf weekly-repair 510300 159915
+```
+
 ### 中金所期货
 
 ```bash
@@ -331,14 +366,21 @@ python run.py runner retry-failures option_daily 20
 - `cffex_daily`
 - `forex_daily`
 - `usd_index_once`
+- `etf_daily`
 - `futures_daily`
 - `option_daily`
 
 `runner daily` 当前不包含：
 
 - 股票日更
+- ETF 周末前复权回刷
 - 抖音情绪采集
 - Excel 情绪导入
+
+其中外汇相关的日更范围为：
+
+- 美元指数：`usd_index_once`
+- 汇率品种：`USDCNH`、`CNHJPY`、`CNHEUR`、`CNHHKD`、`USDHKD`、`USDJPY`、`USDEUR`
 
 ## 日志、状态与运行产物
 
@@ -352,6 +394,7 @@ python run.py runner retry-failures option_daily 20
 - `index.log`
 - `cffex.log`
 - `forex.log`
+- `etf.log`
 - `futures.log`
 - `option.log`
 - `douyin_emotion.log`
@@ -369,6 +412,7 @@ python run.py runner retry-failures option_daily 20
 - `index.progress`
 - `cffex.progress`
 - `forex.progress`
+- `etf.progress`
 - `option.progress`
 - `douyin_emotion.progress`
 - `futures.progress`
@@ -390,6 +434,7 @@ python run.py runner retry-failures option_daily 20
 - [sql/cffex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/cffex_tables.sql)
 - [sql/douyin_emotion_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/douyin_emotion_tables.sql)
 - [sql/forex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/forex_tables.sql)
+- [sql/etf_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/etf_tables.sql)
 - [sql/futures_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/futures_tables.sql)
 - [sql/option_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/option_tables.sql)
 - [sql/excel_emotion_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/excel_emotion_tables.sql)

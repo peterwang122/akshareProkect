@@ -11,6 +11,7 @@ if str(SRC_ROOT) not in sys.path:
 from akshare_project.collectors import (  # noqa: E402
     cffex,
     douyin_emotion,
+    etf,
     excel_emotion,
     failed_tasks,
     forex,
@@ -33,7 +34,7 @@ async def dispatch():
     if len(sys.argv) < 3:
         raise ValueError(
             "usage: python run.py <domain> <command> [args]\n"
-            "domains: stock, index, cffex, douyin, forex, futures, option, runner, emotion-excel"
+            "domains: stock, index, cffex, douyin, forex, futures, etf, option, runner, emotion-excel"
         )
 
     domain = sys.argv[1].strip().lower()
@@ -63,6 +64,10 @@ async def dispatch():
     if domain == "futures":
         set_argv("futures", [command, *args])
         await futures.main()
+        return
+    if domain == "etf":
+        set_argv("etf", [command, *args])
+        await etf.main()
         return
     if domain == "option":
         set_argv("option", [command, *args])

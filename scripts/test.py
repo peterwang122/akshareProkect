@@ -90,7 +90,7 @@ if __name__ == "__main__":
     # index_data = ak.stock_zh_a_hist(symbol=index_code, period="daily", start_date=start_date, end_date=end_date, adjust="hfq")
     # print(index_data)
 
-    forex_spot_em_df = ak.futures_hist_table_em()
+    forex_spot_em_df = ak.fund_etf_spot_em()
     with pd.option_context(
         'display.max_rows', None,
         'display.max_columns', None,

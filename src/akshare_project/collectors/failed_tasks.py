@@ -1,7 +1,7 @@
 import asyncio
 import sys
 
-from akshare_project.collectors import cffex, forex, futures, index, option, stock
+from akshare_project.collectors import cffex, etf, forex, futures, index, option, stock
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.db.db_tool import DbTools
 
@@ -29,6 +29,8 @@ async def dispatch_failed_task(failure):
         return await forex.sync_usd_index_once()
     if task_name == 'futures_daily':
         return await futures.sync_today()
+    if task_name == 'etf_daily':
+        return await etf.sync_daily()
     if task_name == 'option_daily':
         if task_stage == 'task':
             return await option.sync_daily(record_failures=True)
