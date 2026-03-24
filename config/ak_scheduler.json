@@ -1,0 +1,48 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "poll_interval_seconds": 1.0,
+  "result_retention_hours": 24,
+  "lease_seconds": 300,
+  "client_poll_interval_seconds": 1.0,
+  "client_timeout_seconds": 7200,
+  "cancel_children_on_parent_failure": true,
+  "source_policies": {
+    "eastmoney": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 5,
+      "initial_backoff_seconds": 120,
+      "backoff_cap_seconds": 1800,
+      "jitter_seconds": 10,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 600,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "sina": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 120,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "ths": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 120,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    }
+  }
+}

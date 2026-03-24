@@ -1845,6 +1845,84 @@ class DbTools:
 
         return {str(row[0]).strip() for row in rows if row and row[0] is not None}
 
+    async def get_etf_codes_missing_hist_data(self, selected_codes=None, exclude_success_task_name=None):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_codes = [
+            str(etf_code).strip()
+            for etf_code in (selected_codes or [])
+            if str(etf_code).strip()
+        ]
+
+        query = """
+        SELECT
+            basic.etf_code,
+            basic.etf_name
+        FROM etf_basic_info basic
+        LEFT JOIN (
+            SELECT etf_code
+            FROM etf_daily_data
+            WHERE data_source = 'fund_etf_hist_em'
+            GROUP BY etf_code
+        ) hist
+            ON hist.etf_code = basic.etf_code
+        """
+        params = []
+
+        if exclude_success_task_name:
+            query += """
+        LEFT JOIN daily_task_failures success_marker
+            ON success_marker.task_name = %s
+           AND success_marker.task_stage = 'history'
+           AND success_marker.task_key = basic.etf_code
+           AND success_marker.result_status = 'SUCCESS'
+           AND success_marker.status = 'RESOLVED'
+            """
+            params.append(str(exclude_success_task_name).strip())
+
+        query += """
+        WHERE hist.etf_code IS NULL
+        """
+
+        if exclude_success_task_name:
+            query += " AND success_marker.id IS NULL"
+
+        if normalized_codes:
+            placeholders = ','.join(['%s'] * len(normalized_codes))
+            query += f" AND basic.etf_code IN ({placeholders})"
+            params.extend(normalized_codes)
+
+        query += " ORDER BY basic.etf_code"
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, params)
+                rows = await cursor.fetchall()
+
+        return [
+            {
+                'etf_code': str(row[0]).strip(),
+                'etf_name': str(row[1]).strip() if row[1] is not None else None,
+            }
+            for row in rows
+            if row and row[0] is not None
+        ]
+
+    async def get_pending_etf_backfill_failures(self, selected_codes=None):
+        failed_tasks = await self.get_pending_failed_tasks(task_name='etf_backfill_history')
+        normalized_codes = {
+            str(etf_code).strip()
+            for etf_code in (selected_codes or [])
+            if str(etf_code).strip()
+        }
+        if not normalized_codes:
+            return failed_tasks
+        return [
+            task for task in failed_tasks
+            if str(task.get('task_key', '')).strip() in normalized_codes
+        ]
+
     async def upsert_success_task(self, row):
         if not row:
             return 0

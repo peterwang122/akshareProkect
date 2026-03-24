@@ -7,6 +7,7 @@ from datetime import datetime
 
 import akshare as ak
 
+from akshare_project.core.ak_scheduler_client import SchedulerContext
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.progress import ProgressStore
 from akshare_project.core.retry import fetch_with_retry as shared_fetch_with_retry
@@ -88,13 +89,26 @@ def log_error(context, error_message):
     LOGGER.error('%s,%s', context, error_message)
 
 
-def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RETRY_SLEEP_SECONDS, **kwargs):
+def fetch_with_retry(
+    func,
+    *args,
+    retries=API_RETRY_COUNT,
+    sleep_seconds=API_RETRY_SLEEP_SECONDS,
+    scheduler_context=None,
+    return_scheduler_meta=False,
+    request_key=None,
+    **kwargs,
+):
     return shared_fetch_with_retry(
         func,
         *args,
         retries=retries,
         sleep_seconds=sleep_seconds,
         logger=LOGGER,
+        scheduler_context=scheduler_context,
+        return_scheduler_meta=return_scheduler_meta,
+        caller_name=LOGGER.name,
+        request_key=request_key,
         **kwargs,
     )
 
@@ -210,17 +224,35 @@ def build_daily_rows(option_meta, daily_df, daily_source, latest_only=False):
     return rows
 
 
-def fetch_contract_symbols(config):
-    contract_mapping = fetch_with_retry(config['list_func'])
-    return flatten_contract_symbols(contract_mapping)
+def fetch_contract_symbols(config, scheduler_context=None, return_scheduler_meta=False):
+    result = fetch_with_retry(
+        config['list_func'],
+        scheduler_context=scheduler_context,
+        return_scheduler_meta=return_scheduler_meta,
+    )
+    contract_mapping = result.value if return_scheduler_meta else result
+    flattened = flatten_contract_symbols(contract_mapping)
+    if return_scheduler_meta:
+        return flattened, result
+    return flattened
 
 
-def fetch_spot_df(config, contract_symbol):
-    return fetch_with_retry(config['spot_func'], symbol=contract_symbol)
+def fetch_spot_df(config, contract_symbol, scheduler_context=None, return_scheduler_meta=False):
+    return fetch_with_retry(
+        config['spot_func'],
+        symbol=contract_symbol,
+        scheduler_context=scheduler_context,
+        return_scheduler_meta=return_scheduler_meta,
+    )
 
 
-def fetch_daily_df(config, option_symbol):
-    return fetch_with_retry(config['daily_func'], symbol=option_symbol)
+def fetch_daily_df(config, option_symbol, scheduler_context=None, return_scheduler_meta=False):
+    return fetch_with_retry(
+        config['daily_func'],
+        symbol=option_symbol,
+        scheduler_context=scheduler_context,
+        return_scheduler_meta=return_scheduler_meta,
+    )
 
 
 def get_option_mode(latest_only):
@@ -333,8 +365,23 @@ async def mark_option_missing_success(db_tools, target_date, option_meta):
     })
 
 
-async def collect_contract_option_meta(db_tools, index_type, config, contract_symbol, latest_only=False, record_failures=False):
-    spot_df = await asyncio.to_thread(fetch_spot_df, config, contract_symbol)
+async def collect_contract_option_meta(
+    db_tools,
+    index_type,
+    config,
+    contract_symbol,
+    latest_only=False,
+    record_failures=False,
+    scheduler_context=None,
+):
+    spot_result = await asyncio.to_thread(
+        fetch_spot_df,
+        config,
+        contract_symbol,
+        scheduler_context,
+        True,
+    )
+    spot_df = spot_result.value
     if spot_df is None or spot_df.empty:
         if record_failures:
             await resolve_option_failure(
@@ -357,7 +404,12 @@ async def collect_contract_option_meta(db_tools, index_type, config, contract_sy
             index_type,
             contract_symbol=contract_symbol,
         )
-    return extract_option_meta(spot_rows)
+    option_meta = extract_option_meta(spot_rows)
+    for meta in option_meta.values():
+        meta['_scheduler_parent_job_id'] = spot_result.job_id
+        meta['_scheduler_root_job_id'] = spot_result.root_job_id
+        meta['_scheduler_workflow_name'] = f"option:{index_type}:{contract_symbol}"
+    return option_meta
 
 
 async def collect_spot_and_meta(db_tools, latest_only=False, record_failures=False):
@@ -365,7 +417,7 @@ async def collect_spot_and_meta(db_tools, latest_only=False, record_failures=Fal
 
     for index_type, config in OPTION_CONFIG.items():
         try:
-            contract_symbols = await asyncio.to_thread(fetch_contract_symbols, config)
+            contract_symbols, list_result = await asyncio.to_thread(fetch_contract_symbols, config, None, True)
             if record_failures:
                 await resolve_option_failure(db_tools, OPTION_STAGE_LIST, latest_only, index_type)
         except Exception as exc:
@@ -375,6 +427,12 @@ async def collect_spot_and_meta(db_tools, latest_only=False, record_failures=Fal
             if record_failures:
                 await record_option_failure(db_tools, OPTION_STAGE_LIST, latest_only, index_type, str(exc))
             continue
+
+        list_scheduler_context = SchedulerContext(
+            parent_job_id=list_result.job_id,
+            root_job_id=list_result.root_job_id,
+            workflow_name=f'option:{index_type}:list',
+        )
 
         for contract_symbol in contract_symbols:
             try:
@@ -386,6 +444,7 @@ async def collect_spot_and_meta(db_tools, latest_only=False, record_failures=Fal
                         contract_symbol,
                         latest_only=latest_only,
                         record_failures=record_failures,
+                        scheduler_context=list_scheduler_context,
                     )
                 )
             except Exception as exc:
@@ -411,8 +470,20 @@ async def process_option_symbol(db_tools, config, option_meta, latest_only, proc
         return 0
 
     try:
+        scheduler_context = None
+        if option_meta.get('_scheduler_parent_job_id'):
+            scheduler_context = SchedulerContext(
+                parent_job_id=option_meta.get('_scheduler_parent_job_id'),
+                root_job_id=option_meta.get('_scheduler_root_job_id'),
+                workflow_name=option_meta.get('_scheduler_workflow_name') or f"option:{option_meta['index_type']}",
+            )
         async with semaphore:
-            daily_df = await asyncio.to_thread(fetch_daily_df, config, option_symbol)
+            daily_df = await asyncio.to_thread(
+                fetch_daily_df,
+                config,
+                option_symbol,
+                scheduler_context,
+            )
 
         if daily_df is None or daily_df.empty:
             if not latest_only:
@@ -548,8 +619,13 @@ async def retry_failed_daily_task(payload):
     try:
         if stage == OPTION_STAGE_LIST:
             config = OPTION_CONFIG[index_type]
-            contract_symbols = await asyncio.to_thread(fetch_contract_symbols, config)
+            contract_symbols, list_result = await asyncio.to_thread(fetch_contract_symbols, config, None, True)
             await resolve_option_failure(db_tools, OPTION_STAGE_LIST, latest_only, index_type)
+            list_scheduler_context = SchedulerContext(
+                parent_job_id=list_result.job_id,
+                root_job_id=list_result.root_job_id,
+                workflow_name=f'option:{index_type}:list',
+            )
 
             total_inserted = 0
             for contract_symbol in contract_symbols:
@@ -561,6 +637,7 @@ async def retry_failed_daily_task(payload):
                         contract_symbol,
                         latest_only=latest_only,
                         record_failures=True,
+                        scheduler_context=list_scheduler_context,
                     )
                 except Exception as exc:
                     error_message = f'{index_type}:{contract_symbol}:{exc}'

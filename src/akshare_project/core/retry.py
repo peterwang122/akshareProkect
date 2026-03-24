@@ -2,7 +2,9 @@ import random
 import time
 from typing import Callable
 
+from .ak_scheduler_client import call_registered_function
 from .logging_utils import echo_and_log
+from akshare_project.scheduler.registry import resolve_callable_spec
 
 
 def default_error_classifier(exc) -> str:
@@ -19,8 +21,24 @@ def fetch_with_retry(
     sleep_cap_seconds: float | None = None,
     jitter_max_seconds: float = 0.0,
     backoff: str = "fixed",
+    scheduler_context=None,
+    caller_name: str | None = None,
+    request_key: str | None = None,
+    return_scheduler_meta: bool = False,
     **kwargs,
 ):
+    scheduler_spec = resolve_callable_spec(func)
+    if scheduler_spec is not None:
+        result = call_registered_function(
+            func,
+            *args,
+            scheduler_context=scheduler_context,
+            caller_name=caller_name,
+            request_key=request_key,
+            **kwargs,
+        )
+        return result if return_scheduler_meta else result.value
+
     last_error = None
     classifier = classify_error or default_error_classifier
 

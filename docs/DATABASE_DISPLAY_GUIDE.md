@@ -4,99 +4,96 @@
 
 - 每类数据对应哪张表
 - 关键字段是什么
-- 表之间怎么关联
-- 前端适合如何展示
+- 前端应该按什么维度展示
+- 哪些表是业务展示表，哪些表更偏内部调度/运维
 
 ## 总览
 
 | 模块 | 表名 | 主展示维度 |
 |---|---|---|
-| 股票基础信息 | `stock_basic_info` | 股票代码、股票名称 |
-| 股票历史行情 | `stock_data` | `stock_code + date` |
-| 指数基础信息 | `index_basic_info` | 指数代码、指数名称 |
+| 股票基础信息 | `stock_basic_info` | `stock_code` |
+| 股票行情 | `stock_data` | `stock_code + date` |
+| 指数基础信息 | `index_basic_info` | `index_code` |
 | 指数日线 | `index_daily_data` | `index_code + trade_date` |
 | CFFEX 会员排名 | `cffex_member_rankings` | `product_code + contract_code + trade_date + rank_no` |
 | 抖音情绪 | `douyin_index_emotion_daily` | `emotion_date` |
-| 外汇基础信息 | `forex_basic_info` | 汇率代码、名称 |
+| 外汇基础信息 | `forex_basic_info` | `symbol_code` |
 | 外汇日线 | `forex_daily_data` | `symbol_code + trade_date` |
-| ETF 基础信息 | `etf_basic_info` | ETF 代码、ETF 名称 |
-| ETF 日线 | `etf_daily_data` | `etf_code + trade_date` |
-| 中金所期货日线 | `futures_daily_data` | `symbol + trade_date` |
+| ETF 基础信息 | `etf_basic_info` | `etf_code` |
+| ETF 日线/快照 | `etf_daily_data` | `etf_code + trade_date` |
+| 中金所期货日线 | `futures_daily_data` | `symbol + trade_date + data_source` |
 | 中金所期权链 | `option_cffex_spot_data` | `index_type + contract_symbol + strike_price` |
 | 中金所期权日线 | `option_cffex_daily_data` | `option_symbol + trade_date` |
 | Excel 情绪 | `excel_index_emotion_daily` | `emotion_date + index_name` |
-| 失败任务 | `daily_task_failures` | 任务重试与状态追踪 |
+| 失败任务 | `daily_task_failures` | `task_name + task_stage + task_key` |
+| AK 请求调度 | `ak_request_jobs` | `id / request_key` |
 
 ## 1. 股票
 
-### 1.1 `stock_basic_info`
+### `stock_basic_info`
 
 用途：
 
-- 股票下拉框
 - 股票搜索
 - 代码名称映射
+- 下拉列表
 
-关键字段：
+核心字段：
 
-| 字段 | 含义 |
-|---|---|
-| `stock_code` | 股票代码，唯一 |
-| `stock_name` | 股票名称 |
-| `created_at` | 创建时间 |
-| `updated_at` | 更新时间 |
+- `stock_code`
+- `stock_name`
+- `created_at`
+- `updated_at`
 
-### 1.2 `stock_data`
+### `stock_data`
 
 用途：
 
-- K 线图
-- 行情表格
-- 估值指标展示
+- 股票 K 线图
+- 股票日行情表格
+- 股票估值面板
 
-关键字段：
+核心字段：
 
-| 字段 | 含义 |
-|---|---|
-| `stock_code` | 股票代码 |
-| `date` | 交易日期 |
-| `open_price` | 开盘价 |
-| `close_price` | 收盘价 |
-| `high_price` | 最高价 |
-| `low_price` | 最低价 |
-| `volume` | 成交量 |
-| `turnover` | 成交额 |
-| `amplitude` | 振幅 |
-| `price_change_rate` | 涨跌幅 |
-| `price_change_amount` | 涨跌额 |
-| `turnover_rate` | 换手率 |
-| `pe_ttm` | 市盈率-动态 |
-| `pb` | 市净率 |
-| `total_market_value` | 总市值 |
-| `circulating_market_value` | 流通市值 |
-| `created_at` | 创建时间 |
-| `updated_at` | 更新时间 |
+- `stock_code`
+- `date`
+- `open_price`
+- `close_price`
+- `high_price`
+- `low_price`
+- `volume`
+- `turnover`
+- `amplitude`
+- `price_change_rate`
+- `price_change_amount`
+- `turnover_rate`
+- `pe_ttm`
+- `pb`
+- `total_market_value`
+- `circulating_market_value`
+- `created_at`
+- `updated_at`
 
 推荐展示：
 
-- 股票详情页
-- 日线 K 线页
-- 股票估值面板
+- 个股详情页
+- K 线图
+- 估值趋势
 
 ## 2. 指数
 
-### 2.1 `index_basic_info`
+### `index_basic_info`
 
-关键字段：
+核心字段：
 
 - `index_code`
 - `simple_code`
 - `market`
 - `index_name`
 
-### 2.2 `index_daily_data`
+### `index_daily_data`
 
-关键字段：
+核心字段：
 
 - `index_code`
 - `trade_date`
@@ -109,31 +106,29 @@
 - `amplitude`
 - `price_change_rate`
 - `price_change_amount`
+- `turnover_rate`
+- `data_source`
 
 推荐展示：
 
 - 指数列表页
-- 指数详情 K 线页
-- 指数涨跌排行榜
+- 指数详情页
+- 指数涨跌榜
 
 ## 3. CFFEX 会员排名
 
-表名：
+### `cffex_member_rankings`
 
-- `cffex_member_rankings`
+核心字段：
 
-关键字段：
-
-| 字段 | 含义 |
-|---|---|
-| `product_code` | 品种代码，如 `IF`、`IH` |
-| `product_name` | 品种名称 |
-| `contract_code` | 合约代码，如 `IF1109` |
-| `trade_date` | 交易日期 |
-| `rank_no` | 排名 |
-| `volume_*` | 成交量排名信息 |
-| `long_*` | 持买单量排名信息 |
-| `short_*` | 持卖单量排名信息 |
+- `product_code`
+- `product_name`
+- `contract_code`
+- `trade_date`
+- `rank_no`
+- `volume_*`
+- `long_*`
+- `short_*`
 
 推荐展示：
 
@@ -141,13 +136,11 @@
 - 合约详情页
 - 当日会员排名榜
 
-## 4. 抖音情绪指标
+## 4. 情绪指标
 
-表名：
+### `douyin_index_emotion_daily`
 
-- `douyin_index_emotion_daily`
-
-关键字段：
+核心字段：
 
 - `emotion_date`
 - `hs300_emotion`
@@ -157,27 +150,45 @@
 - `video_id`
 - `video_url`
 - `video_title`
-- `raw_ocr_text`
 - `extraction_status`
 
 推荐展示：
 
-- 情绪指标总览卡片
-- 情绪日线趋势图
-- 原始视频回溯链接
+- 情绪总览卡片
+- 四大指数情绪趋势图
+
+### `excel_index_emotion_daily`
+
+核心字段：
+
+- `emotion_date`
+- `index_name`
+- `emotion_value`
+- `source_file`
+- `data_source`
+
+推荐展示：
+
+- 稳定日频情绪图
+- 日期维度对比表
+
+说明：
+
+- `excel_index_emotion_daily` 更适合稳定展示
+- `douyin_index_emotion_daily` 更适合展示原始视频来源和自动提取结果
 
 ## 5. 外汇
 
-### 5.1 `forex_basic_info`
+### `forex_basic_info`
 
-关键字段：
+核心字段：
 
 - `symbol_code`
 - `symbol_name`
 
-### 5.2 `forex_daily_data`
+### `forex_daily_data`
 
-关键字段：
+核心字段：
 
 - `symbol_code`
 - `symbol_name`
@@ -188,45 +199,33 @@
 - `low_price`
 - `amplitude`
 - `data_source`
-
-`data_source` 常见值：
-
-- `forex_hist_em`
-- `forex_spot_em`
-- `index_global_hist_em`
+- `created_at`
+- `updated_at`
 
 推荐展示：
 
-- 汇率日线图
-- 美元指数趋势图
-- 汇率列表页
+- 汇率详情页
+- 美元指数与汇率联动图
 
 ## 6. ETF
 
-### 6.1 `etf_basic_info`
+### `etf_basic_info`
 
-关键字段：
+核心字段：
 
 - `etf_code`
 - `etf_name`
 - `created_at`
 - `updated_at`
 
-### 6.2 `etf_daily_data`
+### `etf_daily_data`
 
-数据来源：
+用途：
 
-- `fund_etf_spot_em`
-- `fund_etf_hist_em`
+- ETF 历史前复权日线
+- ETF 当日实时快照
 
-说明：
-
-- 历史前复权日线和当日实时快照共用同一张 `etf_daily_data`
-- 需要通过 `data_source` 区分历史口径和当日快照口径
-- 历史数据固定使用 `adjust_type = 'qfq'`
-- 周末回刷会覆盖昨日及更早历史行，修正分红导致的前复权变化
-
-关键字段：
+核心字段：
 
 - `etf_code`
 - `etf_name`
@@ -243,68 +242,22 @@
 - `turnover_rate`
 - `data_source`
 - `adjust_type`
-- `pre_close_price`
-- `iopv_realtime`
-- `discount_rate`
-- `volume_ratio`
-- `current_hand`
-- `bid1_price`
-- `ask1_price`
-- `outer_volume`
-- `inner_volume`
-- `latest_share`
-- `circulating_market_value`
-- `total_market_value`
 - `spot_data_date`
 - `spot_update_time`
+- `created_at`
+- `updated_at`
 
-`data_source` 常见值：
+展示建议：
 
-- `fund_etf_hist_em`
-- `fund_etf_spot_em`
-
-前端展示建议：
-
-- 如果做历史 K 线，优先筛选 `data_source = 'fund_etf_hist_em'`
-- 如果做今日行情列表，可优先筛选 `data_source = 'fund_etf_spot_em'` 且 `trade_date = 今日`
-- 基础列表和搜索建议先查 `etf_basic_info`
-
-推荐展示：
-
-- ETF 列表页
-- ETF 历史 K 线页
-- ETF 当日行情面板
+- 通过 `data_source` 区分历史和快照
+- `fund_etf_hist_em` + `adjust_type='qfq'` 适合历史图
+- `fund_etf_spot_em` / `fund_etf_spot_ths` 适合当日快照
 
 ## 7. 中金所期货
 
-表名：
+### `futures_daily_data`
 
-- `futures_daily_data`
-
-数据来源：
-
-- `ak.get_futures_daily`
-- `ak.futures_hist_em`
-
-说明：
-
-- 两条来源都会写入同一张 `futures_daily_data` 表
-- 需要通过 `data_source` 区分数据来源后再展示
-- `get_futures_daily` 主要是中金所常规期货日线
-- `futures_hist_em` 主要是 8 个连续合约日线
-
-`futures_hist_em` 当前固定采集的连续合约：
-
-- `ICM`：中证500股指主连
-- `ICM0`：中证500股指当月连续
-- `IFM`：沪深主连
-- `IFM0`：沪深当月连续
-- `IHM`：上证主连
-- `IHM0`：上证当月连续
-- `IMM`：中证1000股指主连
-- `IMM0`：中证1000股指当月连续
-
-关键字段：
+核心字段：
 
 - `market`
 - `symbol`
@@ -321,34 +274,21 @@
 - `pre_settle_price`
 - `data_source`
 
-`data_source` 常见值：
+展示建议：
 
-- `get_futures_daily`
-- `futures_hist_em`
-
-前端展示建议：
-
-- 如果做普通期货合约页，可优先展示 `data_source = 'get_futures_daily'`
-- 如果做主连 / 当月连续专题页，可筛选 `data_source = 'futures_hist_em'`
-- 同一 `symbol + trade_date` 是唯一键，列表页按 `symbol` 分组最直接
-
-推荐展示：
-
-- 期货合约日线图
-- 成交量 / 持仓量图
-- 合约列表页
+- `data_source='get_futures_daily'` 作为普通期货日线
+- `data_source='futures_hist_em'` 作为主连/当月连续专题页
 
 ## 8. 中金所期权
 
-### 8.1 `option_cffex_spot_data`
+### `option_cffex_spot_data`
 
 用途：
 
-- 期权链展示
-- 行权价分布
-- 认购 / 认沽对照
+- 合约链
+- 行权价表格
 
-关键字段：
+核心字段：
 
 - `index_type`
 - `index_name`
@@ -357,19 +297,22 @@
 - `strike_price`
 - `call_option_symbol`
 - `put_option_symbol`
-- `call_latest_price`
-- `put_latest_price`
+- `call_*`
+- `put_*`
+- `data_source`
 
-### 8.2 `option_cffex_daily_data`
+### `option_cffex_daily_data`
 
 用途：
 
-- 单个期权合约日线
-- 期权历史成交走势
+- 期权日线
+- 指定期权历史走势
 
-关键字段：
+核心字段：
 
 - `index_type`
+- `index_name`
+- `product_code`
 - `contract_symbol`
 - `option_symbol`
 - `option_type`
@@ -380,49 +323,19 @@
 - `low_price`
 - `close_price`
 - `volume`
-
-推荐展示：
-
-- 期权链页面
-- 单个期权合约详情页
-
-## 9. Excel 情绪指标
-
-表名：
-
-- `excel_index_emotion_daily`
-
-关键字段：
-
-- `emotion_date`
-- `index_name`
-- `emotion_value`
-- `source_file`
 - `data_source`
 
-推荐展示：
+## 9. 失败任务
 
-- 情绪折线图
-- 指数情绪对比图
+### `daily_task_failures`
 
-和抖音情绪表的关系：
+用途：
 
-- `excel_index_emotion_daily` 更适合做稳定展示和人工维护数据源
-- `douyin_index_emotion_daily` 更适合做自动抓取来源和追溯
+- 日更失败重试
+- 指定日期缺失修复
+- ETF 历史补扫失败追踪
 
-## 10. 失败任务表
-
-表名：
-
-- `daily_task_failures`
-
-主要用途：
-
-- 保存日更或修复任务失败记录
-- 记录任务最近一次结果是 `FAILED` 还是 `SUCCESS`
-- 给手动补采脚本提供重试来源
-
-关键字段：
+核心字段：
 
 - `task_name`
 - `task_stage`
@@ -436,48 +349,69 @@
 - `last_failed_at`
 - `resolved_at`
 
-## 常见前端查询建议
+说明：
+
+- 这是业务补采和失败恢复表
+- 不是前端业务展示主表，但可以做运维后台页面
+
+## 10. AK 请求调度
+
+### `ak_request_jobs`
+
+用途：
+
+- 记录所有 AKShare 请求
+- 承载独立调度服务的持久化队列
+- 追踪请求级别的重试、父子依赖和结果状态
+
+核心字段：
+
+- `id`
+- `request_key`
+- `function_name`
+- `source_group`
+- `status`
+- `attempt_count`
+- `next_run_at`
+- `lease_until`
+- `parent_job_id`
+- `root_job_id`
+- `workflow_name`
+- `caller_name`
+- `error_category`
+- `error_message`
+- `result_type`
+- `result_json`
+- `created_at`
+- `started_at`
+- `finished_at`
+- `updated_at`
+
+展示建议：
+
+- 这张表更适合做内部运维页面
+- 不建议直接给普通业务前端展示
+- 可以按 `source_group`、`status`、`function_name` 做调度监控
+
+## 常见查询建议
 
 ### 股票详情页
 
-- 先查 `stock_basic_info`
-- 再按 `stock_code` 查 `stock_data`
+- 从 `stock_basic_info` 拿名称
+- 从 `stock_data` 按 `stock_code` + 日期范围查 K 线
 
-### 指数详情页
+### ETF 详情页
 
-- 先查 `index_basic_info`
-- 再按 `index_code` 查 `index_daily_data`
+- 从 `etf_basic_info` 拿名称
+- 历史图优先查 `etf_daily_data` 中 `data_source='fund_etf_hist_em'`
+- 今日快照优先查当日最新一条 spot 数据
 
-### 期权链页面
+### 期权页面
 
-- 先查 `option_cffex_spot_data`
-- 点击具体期权后再查 `option_cffex_daily_data`
+- 合约链来自 `option_cffex_spot_data`
+- 日线来自 `option_cffex_daily_data`
 
-### 情绪页面
+### 运维后台
 
-- 稳定展示优先查 `excel_index_emotion_daily`
-- 自动抓取回溯可补查 `douyin_index_emotion_daily`
-
-### 汇率页面
-
-- 汇率列表查 `forex_basic_info`
-- 历史走势查 `forex_daily_data`
-
-### ETF 页面
-
-- ETF 列表查 `etf_basic_info`
-- 历史走势查 `etf_daily_data`
-- 如果需要区分历史和快照，按 `data_source` 过滤
-
-## SQL 文件位置
-
-- [stock_spot_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/stock_spot_tables.sql)
-- [index_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/index_tables.sql)
-- [cffex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/cffex_tables.sql)
-- [douyin_emotion_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/douyin_emotion_tables.sql)
-- [forex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/forex_tables.sql)
-- [etf_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/etf_tables.sql)
-- [futures_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/futures_tables.sql)
-- [option_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/option_tables.sql)
-- [excel_emotion_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/excel_emotion_tables.sql)
-- [failed_task_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/failed_task_tables.sql)
+- 失败恢复看 `daily_task_failures`
+- AK 请求调度看 `ak_request_jobs`

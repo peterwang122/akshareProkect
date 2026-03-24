@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS etf_daily_data (
   small_net_inflow_ratio DECIMAL(18, 6) NULL COMMENT 'Small net inflow ratio',
   spot_data_date DATE NULL COMMENT 'Spot payload trade date',
   spot_update_time DATETIME NULL COMMENT 'Spot payload update time',
-  data_source VARCHAR(32) NOT NULL DEFAULT 'fund_etf_hist_em' COMMENT 'fund_etf_hist_em or fund_etf_spot_em',
+  data_source VARCHAR(32) NOT NULL DEFAULT 'fund_etf_hist_em' COMMENT 'fund_etf_hist_em or fund_etf_spot_em or fund_etf_spot_ths',
   adjust_type VARCHAR(8) NULL COMMENT 'Adjustment type such as qfq',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

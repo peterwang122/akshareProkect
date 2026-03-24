@@ -62,6 +62,7 @@ def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RET
         retries=retries,
         sleep_seconds=sleep_seconds,
         logger=LOGGER,
+        caller_name=LOGGER.name,
         **kwargs,
     )
 

@@ -11,6 +11,7 @@ import akshare as ak
 import pandas as pd
 import requests
 
+from akshare_project.core.ak_scheduler_client import SchedulerContext
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.paths import get_input_path
 from akshare_project.core.progress import ProgressStore
@@ -89,7 +90,16 @@ def classify_fetch_error(exc):
     return 'unexpected'
 
 
-def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RETRY_SLEEP_SECONDS, **kwargs):
+def fetch_with_retry(
+    func,
+    *args,
+    retries=API_RETRY_COUNT,
+    sleep_seconds=API_RETRY_SLEEP_SECONDS,
+    scheduler_context=None,
+    return_scheduler_meta=False,
+    request_key=None,
+    **kwargs,
+):
     return shared_fetch_with_retry(
         func,
         *args,
@@ -100,6 +110,10 @@ def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RET
         sleep_cap_seconds=RETRY_SLEEP_CAP_SECONDS,
         jitter_max_seconds=REQUEST_JITTER_MAX_SECONDS,
         backoff='exponential',
+        scheduler_context=scheduler_context,
+        return_scheduler_meta=return_scheduler_meta,
+        caller_name=LOGGER.name,
+        request_key=request_key,
         **kwargs,
     )
 
@@ -108,25 +122,42 @@ def throttle_stock_request():
     time.sleep(random.uniform(0.2, REQUEST_JITTER_MAX_SECONDS))
 
 
-def get_stock_history_start_date(stock_code):
+def get_stock_history_start_date(stock_code, return_scheduler_meta=False):
     throttle_stock_request()
     try:
-        info_df = fetch_with_retry(ak.stock_individual_info_em, symbol=stock_code)
+        info_result = fetch_with_retry(
+            ak.stock_individual_info_em,
+            symbol=stock_code,
+            return_scheduler_meta=return_scheduler_meta,
+        )
+        info_df = info_result.value if return_scheduler_meta else info_result
         listing_date_series = info_df.loc[info_df['item'] == LISTING_DATE_ITEM, 'value']
         if listing_date_series.empty:
             raise ValueError(f'listing date not found for {stock_code}')
-        return str(listing_date_series.values[0])
+        listing_date = str(listing_date_series.values[0])
+        if return_scheduler_meta:
+            return listing_date, info_result
+        return listing_date
     except Exception as exc:
         error_category = classify_fetch_error(exc)
         print(
             f'stock_individual_info_em fallback for {stock_code} '
             f'[{error_category}]: {exc}; using {DEFAULT_STOCK_HISTORY_START_DATE}'
         )
+        if return_scheduler_meta:
+            return DEFAULT_STOCK_HISTORY_START_DATE, None
         return DEFAULT_STOCK_HISTORY_START_DATE
 
 
 def get_stock_history(stock_code, end_date):
-    listing_date = get_stock_history_start_date(stock_code)
+    listing_date, info_result = get_stock_history_start_date(stock_code, return_scheduler_meta=True)
+    scheduler_context = None
+    if info_result is not None:
+        scheduler_context = SchedulerContext(
+            parent_job_id=info_result.job_id,
+            root_job_id=info_result.root_job_id,
+            workflow_name=f'stock:{stock_code}:history',
+        )
 
     return fetch_with_retry(
         ak.stock_zh_a_hist,
@@ -135,6 +166,7 @@ def get_stock_history(stock_code, end_date):
         start_date=listing_date,
         end_date=end_date,
         adjust='hfq',
+        scheduler_context=scheduler_context,
     )
 
 
