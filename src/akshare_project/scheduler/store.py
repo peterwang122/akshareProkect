@@ -17,6 +17,7 @@ def load_db_info():
 class SchedulerStore:
     def __init__(self):
         self.db_info = load_db_info()
+        self.session_time_zone = str(self.db_info.get("timezone", "+08:00")).strip() or "+08:00"
 
     @contextmanager
     def connection(self):
@@ -29,6 +30,7 @@ class SchedulerStore:
             charset=self.db_info.get("charset", "utf8mb4"),
             cursorclass=DictCursor,
             autocommit=False,
+            init_command=f"SET time_zone = '{self.session_time_zone}'",
         )
         try:
             yield conn
@@ -44,6 +46,7 @@ class SchedulerStore:
         parent_job_id = payload.get("parent_job_id")
         root_job_id = payload.get("root_job_id")
         status = "PENDING"
+        now = datetime.now()
 
         with self.connection() as conn:
             with conn.cursor() as cursor:
@@ -70,7 +73,7 @@ class SchedulerStore:
                     root_job_id,
                     workflow_name,
                     caller_name
-                ) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     updated_at = CURRENT_TIMESTAMP
                 """
@@ -83,6 +86,7 @@ class SchedulerStore:
                         json.dumps(payload.get("args") or [], ensure_ascii=False, default=str),
                         json.dumps(payload.get("kwargs") or {}, ensure_ascii=False, default=str),
                         status,
+                        now,
                         parent_job_id,
                         root_job_id,
                         payload.get("workflow_name"),
@@ -110,6 +114,7 @@ class SchedulerStore:
                 return cursor.fetchone()
 
     def recover_stale_jobs(self, lease_seconds):
+        now = datetime.now()
         with self.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -122,12 +127,15 @@ class SchedulerStore:
                         updated_at = CURRENT_TIMESTAMP
                     WHERE status = 'RUNNING'
                       AND lease_until IS NOT NULL
-                      AND lease_until < CURRENT_TIMESTAMP
+                      AND lease_until < %s
                     """
+                    ,
+                    (now,),
                 )
                 return cursor.rowcount
 
     def cleanup_old_results(self, retention_hours):
+        threshold = datetime.now() - timedelta(hours=float(retention_hours))
         with self.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -135,14 +143,15 @@ class SchedulerStore:
                     DELETE FROM ak_request_jobs
                     WHERE status IN ('SUCCESS', 'FAILED', 'CANCELLED')
                       AND finished_at IS NOT NULL
-                      AND finished_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL %s HOUR)
+                      AND finished_at < %s
                     """,
-                    (int(retention_hours),),
+                    (threshold,),
                 )
                 return cursor.rowcount
 
     def reconcile_waiting_children(self, cancel_on_parent_failure=True):
         changed = 0
+        now = datetime.now()
         with self.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -150,11 +159,12 @@ class SchedulerStore:
                     UPDATE ak_request_jobs child
                     INNER JOIN ak_request_jobs parent ON parent.id = child.parent_job_id
                     SET child.status = 'PENDING',
-                        child.next_run_at = CURRENT_TIMESTAMP,
+                        child.next_run_at = %s,
                         child.updated_at = CURRENT_TIMESTAMP
                     WHERE child.status = 'WAITING_PARENT'
                       AND parent.status = 'SUCCESS'
-                    """
+                    """,
+                    (now,),
                 )
                 changed += cursor.rowcount
 
@@ -166,16 +176,18 @@ class SchedulerStore:
                         SET child.status = 'CANCELLED',
                             child.error_category = 'parent_failed',
                             child.error_message = CONCAT('parent job failed: ', parent.id),
-                            child.finished_at = CURRENT_TIMESTAMP,
+                            child.finished_at = %s,
                             child.updated_at = CURRENT_TIMESTAMP
                         WHERE child.status = 'WAITING_PARENT'
                           AND parent.status IN ('FAILED', 'CANCELLED')
-                        """
+                        """,
+                        (now,),
                     )
                     changed += cursor.rowcount
         return changed
 
     def lease_next_job(self, source_group, lease_seconds):
+        now = datetime.now()
         lease_until = datetime.now() + timedelta(seconds=int(lease_seconds))
         with self.connection() as conn:
             with conn.cursor() as cursor:
@@ -185,12 +197,12 @@ class SchedulerStore:
                     FROM ak_request_jobs
                     WHERE source_group = %s
                       AND status = 'PENDING'
-                      AND next_run_at <= CURRENT_TIMESTAMP
+                      AND next_run_at <= %s
                     ORDER BY next_run_at ASC, id ASC
                     LIMIT 1
                     FOR UPDATE
                     """,
-                    (source_group,),
+                    (source_group, now),
                 )
                 row = cursor.fetchone()
                 if not row:
@@ -201,17 +213,18 @@ class SchedulerStore:
                     UPDATE ak_request_jobs
                     SET status = 'RUNNING',
                         attempt_count = attempt_count + 1,
-                        started_at = CURRENT_TIMESTAMP,
+                        started_at = %s,
                         lease_until = %s,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                     """,
-                    (lease_until, row["id"]),
+                    (now, lease_until, row["id"]),
                 )
                 cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (row["id"],))
                 return cursor.fetchone()
 
     def mark_success(self, job_id, result_type, result_json):
+        now = datetime.now()
         with self.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -223,11 +236,11 @@ class SchedulerStore:
                         result_type = %s,
                         result_json = %s,
                         lease_until = NULL,
-                        finished_at = CURRENT_TIMESTAMP,
+                        finished_at = %s,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                     """,
-                    (result_type, result_json, job_id),
+                    (result_type, result_json, now, job_id),
                 )
                 return cursor.rowcount
 
@@ -250,6 +263,7 @@ class SchedulerStore:
                 return cursor.rowcount
 
     def mark_failed(self, job_id, error_category, error_message):
+        now = datetime.now()
         with self.connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -259,11 +273,11 @@ class SchedulerStore:
                         error_category = %s,
                         error_message = %s,
                         lease_until = NULL,
-                        finished_at = CURRENT_TIMESTAMP,
+                        finished_at = %s,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                     """,
-                    (error_category, error_message, job_id),
+                    (error_category, error_message, now, job_id),
                 )
                 return cursor.rowcount
 

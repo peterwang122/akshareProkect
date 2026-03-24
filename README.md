@@ -106,9 +106,15 @@ playwright install chromium
   "user": "root",
   "passwd": "your_password",
   "database": "your_database",
-  "charset": "utf8mb4"
+  "charset": "utf8mb4",
+  "timezone": "+08:00"
 }
 ```
+
+说明：
+
+- 当前代码即使不写 `timezone`，也会默认按 `+08:00` 建立数据库会话
+- 如果你后面要切换到别的时区，也可以在 `db_info.json` 里显式配置 `timezone`
 
 输入文件目录：
 

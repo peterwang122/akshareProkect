@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from akshare_project.core.logging_utils import get_logger
+from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.paths import ensure_runtime_layout
 from akshare_project.scheduler.config import load_scheduler_config
 from akshare_project.scheduler.registry import get_function_spec
@@ -21,7 +21,33 @@ LOGGER = get_logger("ak_scheduler")
 
 
 def log(message, level="info"):
-    getattr(LOGGER, level if hasattr(LOGGER, level) else "info")(message)
+    echo_and_log(LOGGER, message)
+
+
+def compact_json(value, limit=240):
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    except Exception:
+        text = str(value)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def summarize_job(job):
+    if not job:
+        return "job=<none>"
+    return (
+        f"id={job.get('id')} "
+        f"function={job.get('function_name')} "
+        f"source={job.get('source_group')} "
+        f"status={job.get('status')} "
+        f"attempt={job.get('attempt_count')} "
+        f"parent={job.get('parent_job_id')} "
+        f"root={job.get('root_job_id')} "
+        f"workflow={job.get('workflow_name') or '-'} "
+        f"caller={job.get('caller_name') or '-'}"
+    )
 
 
 def classify_exception(exc):
@@ -120,7 +146,15 @@ class SchedulerService:
         if payload.get("source_group") and payload.get("source_group") != spec.source_group:
             raise ValueError(f"source_group mismatch for {payload.get('function_name')}")
         payload["source_group"] = spec.source_group
-        return self.store.submit_job(payload)
+        job = self.store.submit_job(payload)
+        log(
+            "job submitted: "
+            f"{summarize_job(job)} "
+            f"request_key={payload.get('request_key')} "
+            f"args={compact_json(payload.get('args') or [])} "
+            f"kwargs={compact_json(payload.get('kwargs') or {})}"
+        )
+        return job
 
     def get_job(self, job_id):
         job = self.store.get_job(job_id)
@@ -232,13 +266,17 @@ class SchedulerService:
 
             self.wait_for_rate_limit(source_group, policy)
             self.state.mark_dispatch(source_group)
+            log(f"{source_group} dispatching job: {summarize_job(job)}")
 
             try:
                 result = self.execute_job(job, policy)
                 result_type, result_json = serialize_result(result)
                 self.store.mark_success(job["id"], result_type, result_json)
                 self.state.mark_success(source_group)
-                log(f"{source_group} job success: id={job['id']} function={job['function_name']}")
+                log(
+                    f"{source_group} job success: {summarize_job(job)} "
+                    f"result_type={result_type}"
+                )
             except Exception as exc:
                 error_category = classify_exception(exc)
                 error_message = str(exc)
@@ -256,14 +294,14 @@ class SchedulerService:
                     next_run_at = datetime.now() + timedelta(seconds=wait_seconds)
                     self.store.mark_retry(job["id"], error_category, error_message, next_run_at)
                     log(
-                        f"{source_group} job retry scheduled: id={job['id']} function={job['function_name']} "
-                        f"category={error_category} wait={wait_seconds:.1f}s",
+                        f"{source_group} job retry scheduled: {summarize_job(job)} "
+                        f"category={error_category} wait={wait_seconds:.1f}s error={error_message}",
                         level="warning",
                     )
                 else:
                     self.store.mark_failed(job["id"], error_category, error_message)
                     log(
-                        f"{source_group} job failed: id={job['id']} function={job['function_name']} "
+                        f"{source_group} job failed: {summarize_job(job)} "
                         f"category={error_category} error={error_message}",
                         level="error",
                     )
