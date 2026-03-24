@@ -209,7 +209,19 @@
 
 展示建议：
 - `data_source='get_futures_daily'` 作为普通期货日线
-- `data_source='futures_hist_em'` 作为主连/当月连续专题页
+- `data_source='get_futures_daily_derived'` 作为默认主连/当月连续专题页
+- `data_source='futures_hist_em'` 作为旧连续数据参考
+- 项目默认 `futures backfill` / `futures daily` 现在生成的是 `get_futures_daily` 与 `get_futures_daily_derived`
+
+连续合约派生规则：
+- 只对 `IF / IC / IH / IM` 派生连续数据
+- 主连：
+  - `IFM / ICM / IHM / IMM`
+  - 取同日同品种成交量最大的具体合约
+- 月连：
+  - `IFM0 / ICM0 / IHM0 / IMM0`
+  - 取同日同品种最近到期的具体合约
+  - 比较依据是完整 `YYMM`，可正确处理跨年
 
 ## 中金所期权
 

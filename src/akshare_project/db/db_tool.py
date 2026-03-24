@@ -1613,25 +1613,17 @@ class DbTools:
             await self.init_pool()
 
         sanitized_rows = [self._sanitize_futures_daily_row(row) for row in rows]
-        sanitized_rows = [
-            row for row in sanitized_rows
-            if row['symbol'] and row['trade_date'] and row['market']
-        ]
+        deduped_rows = {}
+        for row in sanitized_rows:
+            if not (row['symbol'] and row['trade_date'] and row['market']):
+                continue
+            deduped_rows[(row['symbol'], row['trade_date'], row['data_source'])] = row
+        sanitized_rows = list(deduped_rows.values())
         if not sanitized_rows:
             return 0
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                symbol = sanitized_rows[0]['symbol']
-                trade_dates = [row['trade_date'] for row in sanitized_rows]
-                placeholders = ','.join(['%s'] * len(trade_dates))
-                query_check = (
-                    f"SELECT trade_date FROM futures_daily_data WHERE symbol = %s "
-                    f"AND trade_date IN ({placeholders})"
-                )
-                await cursor.execute(query_check, [symbol, *trade_dates])
-                existing_dates = {str(row[0]) for row in await cursor.fetchall()}
-
                 rows_to_insert = [
                     (
                         row['market'],
@@ -1650,14 +1642,13 @@ class DbTools:
                         row['data_source'],
                     )
                     for row in sanitized_rows
-                    if row['trade_date'] not in existing_dates
                 ]
 
                 if not rows_to_insert:
                     return 0
 
                 query_insert = """
-                INSERT INTO futures_daily_data (
+                INSERT IGNORE INTO futures_daily_data (
                     market,
                     symbol,
                     variety,
@@ -1676,7 +1667,7 @@ class DbTools:
                 """
                 await cursor.executemany(query_insert, rows_to_insert)
                 await conn.commit()
-                return len(rows_to_insert)
+                return cursor.rowcount
 
     async def batch_excel_emotion_data(self, rows):
         if not rows:

@@ -13,10 +13,10 @@ CREATE TABLE IF NOT EXISTS futures_daily_data (
   turnover DECIMAL(24, 2) NULL COMMENT 'Turnover',
   settle_price DECIMAL(18, 6) NULL COMMENT 'Settlement price',
   pre_settle_price DECIMAL(18, 6) NULL COMMENT 'Previous settlement price',
-  data_source VARCHAR(32) NOT NULL DEFAULT 'futures_hist_em' COMMENT 'Data source: get_futures_daily or futures_hist_em',
+  data_source VARCHAR(32) NOT NULL DEFAULT 'futures_hist_em' COMMENT 'Data source: get_futures_daily, futures_hist_em, or get_futures_daily_derived',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uk_symbol_trade_date (symbol, trade_date),
+  UNIQUE KEY uk_symbol_trade_date_source (symbol, trade_date, data_source),
   KEY idx_market_trade_date (market, trade_date),
   KEY idx_variety_trade_date (variety, trade_date)
-) COMMENT='CFFEX futures daily market data from AKShare get_futures_daily and futures_hist_em';
+) COMMENT='CFFEX futures daily market data from AKShare get_futures_daily, derived continuous rows, and futures_hist_em';

@@ -38,6 +38,12 @@ CONTINUOUS_SYMBOLS = {
     "IMM": {"name": "\u4e2d\u8bc11000\u80a1\u6307\u4e3b\u8fde", "variety": "IM"},
     "IMM0": {"name": "\u4e2d\u8bc11000\u80a1\u6307\u5f53\u6708\u8fde\u7eed", "variety": "IM"},
 }
+DERIVED_CONTINUOUS_SYMBOLS = {
+    "IF": {"main": "IFM", "month": "IFM0"},
+    "IC": {"main": "ICM", "month": "ICM0"},
+    "IH": {"main": "IHM", "month": "IHM0"},
+    "IM": {"main": "IMM", "month": "IMM0"},
+}
 
 
 def print(*args, **kwargs):
@@ -85,6 +91,21 @@ def normalize_trade_date(value):
 
 def normalize_symbol(symbol):
     return str(symbol or "").strip().upper()
+
+
+def parse_contract_year_month(symbol, variety):
+    normalized_symbol = normalize_symbol(symbol)
+    normalized_variety = normalize_symbol(variety)
+    match = re.fullmatch(rf"{re.escape(normalized_variety)}(\d{{4}})", normalized_symbol)
+    if not match:
+        return None
+
+    yy_mm = match.group(1)
+    year = 2000 + int(yy_mm[:2])
+    month = int(yy_mm[2:])
+    if month < 1 or month > 12:
+        return None
+    return year, month, yy_mm
 
 
 def parse_date_arg(value, default_date):
@@ -184,11 +205,65 @@ def build_market_rows(df):
     return rows
 
 
-def group_rows_by_symbol(rows):
-    grouped = {}
-    for row in rows:
-        grouped.setdefault(row["symbol"], []).append(row)
-    return grouped
+def build_main_contract_sort_key(row):
+    contract_year_month = parse_contract_year_month(row.get("symbol"), row.get("variety"))
+    year = contract_year_month[0] if contract_year_month else 9999
+    month = contract_year_month[1] if contract_year_month else 99
+    volume = row.get("volume")
+    open_interest = row.get("open_interest")
+    return (
+        -(float(volume) if volume is not None else -1.0),
+        -(float(open_interest) if open_interest is not None else -1.0),
+        year,
+        month,
+        row.get("symbol") or "",
+    )
+
+
+def build_month_contract_sort_key(row):
+    contract_year_month = parse_contract_year_month(row.get("symbol"), row.get("variety"))
+    year = contract_year_month[0] if contract_year_month else 9999
+    month = contract_year_month[1] if contract_year_month else 99
+    return (
+        year,
+        month,
+        row.get("symbol") or "",
+    )
+
+
+def build_derived_row(source_row, derived_symbol):
+    return {
+        **source_row,
+        "symbol": derived_symbol,
+        "data_source": "get_futures_daily_derived",
+    }
+
+
+def build_derived_rows(market_rows):
+    grouped_rows = {}
+    for row in market_rows:
+        variety = normalize_symbol(row.get("variety"))
+        if variety not in DERIVED_CONTINUOUS_SYMBOLS:
+            continue
+        if not parse_contract_year_month(row.get("symbol"), variety):
+            continue
+        trade_date = normalize_trade_date(row.get("trade_date"))
+        if not trade_date:
+            continue
+        grouped_rows.setdefault((trade_date, variety), []).append(row)
+
+    derived_rows = []
+    for (_, variety), rows in grouped_rows.items():
+        if not rows:
+            continue
+
+        symbols = DERIVED_CONTINUOUS_SYMBOLS[variety]
+        main_row = sorted(rows, key=build_main_contract_sort_key)[0]
+        month_row = sorted(rows, key=build_month_contract_sort_key)[0]
+        derived_rows.append(build_derived_row(main_row, symbols["main"]))
+        derived_rows.append(build_derived_row(month_row, symbols["month"]))
+
+    return derived_rows
 
 
 def get_hist_daily_range(symbol, start_date, end_date):
@@ -247,15 +322,17 @@ async def ingest_market_range(db_tools, start_date, end_date):
             log_progress("market", start_date, end_date, 0)
             return 0
 
-        rows = build_market_rows(df)
-        grouped_rows = group_rows_by_symbol(rows)
-
-        inserted_total = 0
-        for symbol_rows in grouped_rows.values():
-            inserted_total += await db_tools.batch_futures_daily_data(symbol_rows)
+        market_rows = build_market_rows(df)
+        derived_rows = build_derived_rows(market_rows)
+        inserted_market = await db_tools.batch_futures_daily_data(market_rows)
+        inserted_derived = await db_tools.batch_futures_daily_data(derived_rows)
+        inserted_total = inserted_market + inserted_derived
 
         log_progress("market", start_date, end_date, inserted_total)
-        print(f"get_futures_daily {start_date} -> {end_date}: inserted {inserted_total}")
+        print(
+            f"get_futures_daily {start_date} -> {end_date}: "
+            f"market_inserted={inserted_market}, derived_inserted={inserted_derived}, total_inserted={inserted_total}"
+        )
         return inserted_total
     except Exception as exc:
         error_message = str(exc)
@@ -359,34 +436,33 @@ async def sync_hist_today(start_date=None, end_date=None, symbols=None):
 
 
 async def backfill_history(start_date=None, end_date=None, symbols=None):
+    _ = symbols
     actual_start = start_date or BACKFILL_START_DATE
     actual_end = end_date or datetime.now().date()
-    market_inserted = await backfill_market_history(actual_start, actual_end)
-    hist_inserted = await backfill_hist_history(actual_start, actual_end, symbols=symbols)
-    total_inserted = market_inserted + hist_inserted
+    total_inserted = await backfill_market_history(actual_start, actual_end)
     print(
-        "futures combined backfill finished, "
-        f"market_rows={market_inserted}, "
-        f"hist_rows={hist_inserted}, "
+        "futures backfill finished, "
         f"inserted_rows={total_inserted}"
     )
     return total_inserted
 
 
 async def sync_today(start_date=None, end_date=None, symbols=None):
+    _ = symbols
     today = datetime.now().date()
     actual_start = start_date or today
     actual_end = end_date or actual_start
-    market_inserted = await sync_market_today(actual_start, actual_end)
-    hist_inserted = await sync_hist_today(actual_start, actual_end, symbols=symbols)
-    total_inserted = market_inserted + hist_inserted
+    total_inserted = await sync_market_today(actual_start, actual_end)
     print(
-        "futures combined daily finished, "
-        f"market_rows={market_inserted}, "
-        f"hist_rows={hist_inserted}, "
+        "futures daily finished, "
         f"inserted_rows={total_inserted}"
     )
     return total_inserted
+
+
+async def sync_trade_date(trade_date):
+    actual_trade_date = parse_date_arg(trade_date, datetime.now().date())
+    return await sync_today(start_date=actual_trade_date, end_date=actual_trade_date)
 
 
 async def main():
@@ -403,6 +479,12 @@ async def main():
         today = datetime.now().date()
         start_date, end_date, symbol_args = parse_range_and_symbols(args, today, today)
         await sync_today(start_date=start_date, end_date=end_date, symbols=symbol_args)
+        return
+
+    if mode == "trade-date":
+        if not args:
+            raise ValueError("usage: python run.py futures trade-date YYYY-MM-DD")
+        await sync_trade_date(args[0])
         return
 
     if mode == "market-backfill":
@@ -430,6 +512,7 @@ async def main():
     raise ValueError(
         "usage: python run.py futures backfill [start_date] [end_date] [HIST_SYMBOL ...]\n"
         "   or: python run.py futures daily [trade_date|start_date end_date] [HIST_SYMBOL ...]\n"
+        "   or: python run.py futures trade-date YYYY-MM-DD\n"
         "   or: python run.py futures market-backfill [start_date] [end_date]\n"
         "   or: python run.py futures market-daily [trade_date|start_date end_date]\n"
         "   or: python run.py futures hist-backfill [start_date] [end_date] [HIST_SYMBOL ...]\n"

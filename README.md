@@ -145,18 +145,38 @@ python run.py etf repair-backfill
 ### 中金所期货
 - 接口：
   - `ak.get_futures_daily`
-  - `ak.futures_hist_em`
+  - `ak.futures_hist_em`（兼容保留，不再作为默认主流程）
 - 写入表：
   - `futures_daily_data`
+- 默认规则：
+  - 先写入 `get_futures_daily` 返回的具体合约日线
+  - 再从 `IF / IC / IH / IM` 具体合约中派生主连和月连
+  - 主连来源：`data_source='get_futures_daily_derived'`
+  - 月连规则：最近到期合约，按完整 `YYMM` 处理跨年
 - 命令：
 ```bash
 python run.py futures backfill
 python run.py futures daily
+python run.py futures trade-date 2026-03-25
 python run.py futures market-backfill
 python run.py futures market-daily
 python run.py futures hist-backfill
 python run.py futures hist-daily
 ```
+
+说明：
+- `backfill` / `daily` 默认只跑 `get_futures_daily` 具体合约和派生连续数据
+- `trade-date` 用来显式抓取某一个指定交易日的数据
+- `hist-backfill` / `hist-daily` 仅保留为兼容入口，不再属于默认主流程
+
+连续合约派生符号：
+- `IF -> IFM / IFM0`
+- `IC -> ICM / ICM0`
+- `IH -> IHM / IHM0`
+- `IM -> IMM / IMM0`
+
+如果数据库里已经存在 `futures_daily_data`，上线前请先执行：
+- [sql/fix_futures_unique_key.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/fix_futures_unique_key.sql)
 
 ### 中金所期权
 - 当前主链路已切换为中金所日统计页面，不再使用 AKShare 的 `option_cffex_*_sina`
@@ -238,6 +258,7 @@ python run.py runner retry-failures option_daily
 - [sql/cffex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/cffex_tables.sql)
 - [sql/forex_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/forex_tables.sql)
 - [sql/futures_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/futures_tables.sql)
+- [sql/fix_futures_unique_key.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/fix_futures_unique_key.sql)
 - [sql/etf_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/etf_tables.sql)
 - [sql/option_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/option_tables.sql)
 - [sql/option_rtj_tables.sql](/C:/Users/Administrator/PycharmProjects/akshareProkect/sql/option_rtj_tables.sql)

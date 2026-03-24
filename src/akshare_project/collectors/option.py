@@ -343,6 +343,58 @@ async def switch_to_option_mode(page):
     await page.wait_for_timeout(300)
 
 
+async def switch_to_option_mode_v2(page):
+    changed = await page.evaluate(
+        """
+        () => {
+          const radios = Array.from(
+            document.querySelectorAll('input[type="radio"][name="radio"], input[type="radio"]')
+          );
+          if (radios.length < 2) {
+            return false;
+          }
+
+          const optionRadio = radios.find((radio, index) => {
+            const value = (radio.value || '').trim();
+            return value === '期权' || index === 1;
+          });
+          if (!optionRadio) {
+            return false;
+          }
+
+          for (const radio of radios) {
+            radio.checked = false;
+            radio.removeAttribute('checked');
+          }
+
+          optionRadio.checked = true;
+          optionRadio.setAttribute('checked', 'checked');
+          if (typeof changeProduct === 'function') {
+            changeProduct();
+          } else {
+            optionRadio.click();
+            optionRadio.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          return true;
+        }
+        """
+    )
+    if not changed:
+        raise ValueError("failed to switch rtj page to option mode")
+    await page.wait_for_function(
+        """
+        () => {
+          const select = document.querySelector('#selectSec');
+          if (!select) return false;
+          const optionTexts = Array.from(select.options).map(option => (option.text || '').trim());
+          return optionTexts.includes('IO') || optionTexts.includes('MO') || optionTexts.includes('HO');
+        }
+        """,
+        timeout=PAGE_TIMEOUT_MS,
+    )
+    await page.wait_for_timeout(300)
+
+
 async def select_all_contracts(page):
     changed = await page.evaluate(
         """
@@ -433,7 +485,7 @@ async def click_query(page):
 
 async def query_single_trade_day(page, target_date):
     await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-    await switch_to_option_mode(page)
+    await switch_to_option_mode_v2(page)
     await select_all_contracts(page)
     await fill_trade_date(page, target_date)
     await click_query(page)
@@ -443,7 +495,7 @@ async def query_single_trade_day(page, target_date):
             """
             () => {
               const text = (document.body.innerText || '');
-              return document.querySelectorAll('table').length > 0
+              return /(?:IO|MO|HO)\d{4}-[CP]-\d+/i.test(text)
                 || text.includes('没有您所查询的数据')
                 || text.includes('没有查询到相关数据')
                 || text.includes('暂无数据');
