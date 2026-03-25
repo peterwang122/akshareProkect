@@ -128,12 +128,11 @@ python run.py forex usd-once
 
 ### ETF
 - 接口：
-  - `ak.fund_etf_spot_em`
-  - `ak.fund_etf_spot_ths`
-  - `ak.fund_etf_hist_em`
+  - `ak.fund_etf_category_sina`
+  - `ak.fund_etf_hist_sina`
 - 写入表：
-  - `etf_basic_info`
-  - `etf_daily_data`
+  - `etf_basic_info_sina`
+  - `etf_daily_data_sina`
 - 命令：
 ```bash
 python run.py etf backfill
@@ -141,6 +140,11 @@ python run.py etf daily
 python run.py etf weekly-repair
 python run.py etf repair-backfill
 ```
+
+说明：
+- `daily` 使用 `fund_etf_category_sina("ETF基金")` 写入当日快照
+- `backfill` / `weekly-repair` / `repair-backfill` 使用 `fund_etf_hist_sina` 拉全量历史后，本地过滤到 `2005-02-23 ~ 昨日`
+- ETF 新链路只写新浪新表，旧表 `etf_basic_info` / `etf_daily_data` 保留但不再更新
 
 ### 中金所期货
 - 接口：
@@ -193,6 +197,9 @@ python run.py futures hist-daily
 - 命令：
 ```bash
 python run.py option backfill
+python run.py option repair-backfill
+python run.py option repair-backfill 2026-03-24
+python run.py option repair-backfill 2026-01-01 2026-03-24
 python run.py option daily
 ```
 
@@ -206,6 +213,7 @@ python run.py option daily
   - `HO` -> `SZ50`
 
 期权历史回补默认从 `2019-12-23` 开始，到昨日结束；日更默认查询当天。
+`repair-backfill` 会先搜索数据库，找出 `option_cffex_rtj_daily_data` 中缺失、但 `futures_daily_data(get_futures_daily)` 已存在的交易日，再逐日重新抓取。
 
 ### Excel 情绪指标
 - 来源：`pandas.read_excel`
@@ -238,6 +246,20 @@ python run.py runner daily
 - 抖音情绪
 - Excel 情绪导入
 - ETF 周末前复权回刷
+
+本机每天 17:00 自动启动日更：
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_daily_collection_task.ps1
+```
+
+注册后，Windows 计划任务会在每天 17:00 执行：
+- [scripts/run_daily_collection.ps1](/C:/Users/Administrator/PycharmProjects/akshareProkect/scripts/run_daily_collection.ps1)
+
+这个脚本会先检查 AK scheduler 是否可用；若未启动，会先拉起：
+- [ak_scheduler_service.py](/C:/Users/Administrator/PycharmProjects/akshareProkect/ak_scheduler_service.py)
+
+然后再执行：
+- `python run.py runner daily`
 
 ## 失败任务
 

@@ -18,8 +18,8 @@
 | Excel 情绪 | `excel_index_emotion_daily` | `emotion_date + index_name` |
 | 外汇基础信息 | `forex_basic_info` | `symbol_code` |
 | 外汇日线 | `forex_daily_data` | `symbol_code + trade_date` |
-| ETF 基础信息 | `etf_basic_info` | `etf_code` |
-| ETF 日线/快照 | `etf_daily_data` | `etf_code + trade_date` |
+| ETF 基础信息 | `etf_basic_info_sina` | `etf_code` |
+| ETF 日线/快照 | `etf_daily_data_sina` | `etf_code + trade_date` |
 | 中金所期货 | `futures_daily_data` | `symbol + trade_date + data_source` |
 | 旧 AK 期权链 | `option_cffex_spot_data` / `option_cffex_daily_data` | 旧历史用途 |
 | 新网页期权日统计 | `option_cffex_rtj_daily_data` | `contract_code + trade_date` |
@@ -190,6 +190,45 @@
 
 ## 中金所期货
 
+当前正式 ETF 新链路：
+
+### `etf_basic_info_sina`
+- 用途：ETF 搜索、代码名称映射、保存新浪完整代码
+- 关键字段：
+  - `etf_code`
+  - `etf_name`
+  - `sina_symbol`
+  - `created_at`
+  - `updated_at`
+
+### `etf_daily_data_sina`
+- 用途：ETF 历史日线和当日快照
+- 关键字段：
+  - `etf_code`
+  - `etf_name`
+  - `sina_symbol`
+  - `trade_date`
+  - `open_price`
+  - `close_price`
+  - `high_price`
+  - `low_price`
+  - `volume`
+  - `turnover`
+  - `amplitude`
+  - `price_change_rate`
+  - `price_change_amount`
+  - `turnover_rate`
+  - `pre_close_price`
+  - `data_source`
+  - `created_at`
+  - `updated_at`
+
+展示建议：
+- `fund_etf_hist_sina` 适合历史图表
+- `fund_etf_category_sina` 适合当日快照
+- 新链路统一读取 `etf_basic_info_sina` / `etf_daily_data_sina`
+- 旧表 `etf_basic_info` / `etf_daily_data` 保留旧数据，但不再更新
+
 ### `futures_daily_data`
 - 关键字段：
   - `market`
@@ -272,6 +311,7 @@
 展示建议：
 - 前端新的期权页面统一读取 `option_cffex_rtj_daily_data`
 - 不再从旧 AK 期权表取新数据
+- 如果历史回补时少数日期失败，可以用 `python run.py option repair-backfill` 按数据库缺失交易日重新抓取
 
 ## Excel / 调度 / 运维表
 

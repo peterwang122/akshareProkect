@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -70,6 +71,17 @@ def _raise_service_response_error(response: requests.Response) -> None:
         detail = payload.get("error") or payload
     except Exception:
         detail = response.text
+
+    detail_text = str(detail)
+    unsupported_match = re.search(r"unsupported function_name:\s*([A-Za-z0-9_]+)", detail_text)
+    if unsupported_match:
+        function_name = unsupported_match.group(1).strip()
+        if get_function_spec(function_name) is not None:
+            raise RuntimeError(
+                "AK scheduler service is running an outdated function registry. "
+                f"It does not recognize '{function_name}'. "
+                "Please restart it with: python ak_scheduler_service.py serve"
+            )
     raise RuntimeError(
         f"AK scheduler service request failed: HTTP {response.status_code}; {detail}"
     )

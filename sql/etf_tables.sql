@@ -55,3 +55,42 @@ CREATE TABLE IF NOT EXISTS etf_daily_data (
   KEY idx_data_source_trade_date (data_source, trade_date),
   KEY idx_trade_date (trade_date)
 ) COMMENT='ETF daily data from AKShare fund_etf_spot_em and fund_etf_hist_em';
+
+
+CREATE TABLE IF NOT EXISTS etf_basic_info_sina (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  etf_code VARCHAR(16) NOT NULL COMMENT 'ETF code, e.g. 510300',
+  etf_name VARCHAR(128) NULL COMMENT 'ETF name',
+  sina_symbol VARCHAR(16) NOT NULL COMMENT 'Sina symbol, e.g. sh510300',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_etf_code_sina (etf_code),
+  UNIQUE KEY uk_sina_symbol (sina_symbol)
+) COMMENT='ETF basic info from AKShare fund_etf_category_sina';
+
+
+CREATE TABLE IF NOT EXISTS etf_daily_data_sina (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  etf_code VARCHAR(16) NOT NULL COMMENT 'ETF code',
+  etf_name VARCHAR(128) NULL COMMENT 'ETF name',
+  sina_symbol VARCHAR(16) NOT NULL COMMENT 'Sina symbol',
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  open_price DECIMAL(18, 6) NULL COMMENT 'Open price',
+  close_price DECIMAL(18, 6) NULL COMMENT 'Close/latest price',
+  high_price DECIMAL(18, 6) NULL COMMENT 'High price',
+  low_price DECIMAL(18, 6) NULL COMMENT 'Low price',
+  volume DECIMAL(24, 2) NULL COMMENT 'Volume',
+  turnover DECIMAL(28, 2) NULL COMMENT 'Turnover',
+  amplitude DECIMAL(18, 6) NULL COMMENT 'Amplitude',
+  price_change_rate DECIMAL(18, 6) NULL COMMENT 'Change rate',
+  price_change_amount DECIMAL(18, 6) NULL COMMENT 'Change amount',
+  turnover_rate DECIMAL(18, 6) NULL COMMENT 'Turnover rate',
+  pre_close_price DECIMAL(18, 6) NULL COMMENT 'Previous close price',
+  data_source VARCHAR(32) NOT NULL DEFAULT 'fund_etf_hist_sina' COMMENT 'fund_etf_category_sina or fund_etf_hist_sina',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_etf_trade_date_sina (etf_code, trade_date),
+  KEY idx_sina_symbol_trade_date (sina_symbol, trade_date),
+  KEY idx_data_source_trade_date_sina (data_source, trade_date),
+  KEY idx_trade_date_sina (trade_date)
+) COMMENT='ETF daily data from AKShare fund_etf_category_sina and fund_etf_hist_sina';

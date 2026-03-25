@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sys
 from datetime import date, datetime, timedelta
 
@@ -20,68 +21,29 @@ API_RETRY_COUNT = 5
 API_RETRY_SLEEP_SECONDS = 3
 MAX_CONCURRENCY = 8
 BACKFILL_START_DATE = date(2005, 2, 23)
-HIST_ADJUST = "qfq"
 ETF_BACKFILL_TASK_NAME = "etf_backfill_history"
+ETF_CATEGORY_SYMBOL = "ETF基金"
 LOGGER = get_logger("etf")
 PROGRESS_STORE = ProgressStore("etf")
 
-COL_CODE = "\u4ee3\u7801"
-COL_NAME = "\u540d\u79f0"
-COL_LATEST = "\u6700\u65b0\u4ef7"
-COL_IOPV = "IOPV\u5b9e\u65f6\u4f30\u503c"
-COL_DISCOUNT_RATE = "\u57fa\u91d1\u6298\u4ef7\u7387"
-COL_CHANGE_AMOUNT = "\u6da8\u8dcc\u989d"
-COL_CHANGE_RATE = "\u6da8\u8dcc\u5e45"
-COL_VOLUME = "\u6210\u4ea4\u91cf"
-COL_TURNOVER = "\u6210\u4ea4\u989d"
-COL_OPEN = "\u5f00\u76d8\u4ef7"
-COL_HIGH = "\u6700\u9ad8\u4ef7"
-COL_LOW = "\u6700\u4f4e\u4ef7"
-COL_PRE_CLOSE = "\u6628\u6536"
-COL_AMPLITUDE = "\u632f\u5e45"
-COL_TURNOVER_RATE = "\u6362\u624b\u7387"
-COL_VOLUME_RATIO = "\u91cf\u6bd4"
-COL_CURRENT_HAND = "\u73b0\u624b"
-COL_BID1 = "\u4e70\u4e00"
-COL_ASK1 = "\u5356\u4e00"
-COL_OUTER = "\u5916\u76d8"
-COL_INNER = "\u5185\u76d8"
-COL_MAIN_NET_INFLOW = "\u4e3b\u529b\u51c0\u6d41\u5165-\u51c0\u989d"
-COL_MAIN_NET_INFLOW_RATIO = "\u4e3b\u529b\u51c0\u6d41\u5165-\u51c0\u5360\u6bd4"
-COL_EXTRA_LARGE_NET_INFLOW = "\u8d85\u5927\u5355\u51c0\u6d41\u5165-\u51c0\u989d"
-COL_EXTRA_LARGE_NET_INFLOW_RATIO = "\u8d85\u5927\u5355\u51c0\u6d41\u5165-\u51c0\u5360\u6bd4"
-COL_LARGE_NET_INFLOW = "\u5927\u5355\u51c0\u6d41\u5165-\u51c0\u989d"
-COL_LARGE_NET_INFLOW_RATIO = "\u5927\u5355\u51c0\u6d41\u5165-\u51c0\u5360\u6bd4"
-COL_MEDIUM_NET_INFLOW = "\u4e2d\u5355\u51c0\u6d41\u5165-\u51c0\u989d"
-COL_MEDIUM_NET_INFLOW_RATIO = "\u4e2d\u5355\u51c0\u6d41\u5165-\u51c0\u5360\u6bd4"
-COL_SMALL_NET_INFLOW = "\u5c0f\u5355\u51c0\u6d41\u5165-\u51c0\u989d"
-COL_SMALL_NET_INFLOW_RATIO = "\u5c0f\u5355\u51c0\u6d41\u5165-\u51c0\u5360\u6bd4"
-COL_LATEST_SHARE = "\u6700\u65b0\u4efd\u989d"
-COL_CIRCULATING_MARKET_VALUE = "\u6d41\u901a\u5e02\u503c"
-COL_TOTAL_MARKET_VALUE = "\u603b\u5e02\u503c"
-COL_SPOT_DATA_DATE = "\u6570\u636e\u65e5\u671f"
-COL_SPOT_UPDATE_TIME = "\u66f4\u65b0\u65f6\u95f4"
-COL_THS_CODE = "\u57fa\u91d1\u4ee3\u7801"
-COL_THS_NAME = "\u57fa\u91d1\u540d\u79f0"
-COL_THS_CURRENT_NAV = "\u5f53\u524d-\u5355\u4f4d\u51c0\u503c"
-COL_THS_PREV_NAV = "\u524d\u4e00\u65e5-\u5355\u4f4d\u51c0\u503c"
-COL_THS_GROWTH_VALUE = "\u589e\u957f\u503c"
-COL_THS_GROWTH_RATE = "\u589e\u957f\u7387"
-COL_THS_LATEST_TRADE_DATE = "\u6700\u65b0-\u4ea4\u6613\u65e5"
-COL_THS_LATEST_NAV = "\u6700\u65b0-\u5355\u4f4d\u51c0\u503c"
-COL_THS_QUERY_DATE = "\u67e5\u8be2\u65e5\u671f"
+COL_SINA_SYMBOL = "代码"
+COL_NAME = "名称"
+COL_LATEST = "最新价"
+COL_CHANGE_AMOUNT = "涨跌额"
+COL_CHANGE_RATE = "涨跌幅"
+COL_PRE_CLOSE = "昨收"
+COL_OPEN = "今开"
+COL_HIGH = "最高"
+COL_LOW = "最低"
+COL_VOLUME = "成交量"
+COL_TURNOVER = "成交额"
 
-COL_HIST_DATE = "\u65e5\u671f"
-COL_HIST_OPEN = "\u5f00\u76d8"
-COL_HIST_CLOSE = "\u6536\u76d8"
-COL_HIST_HIGH = "\u6700\u9ad8"
-COL_HIST_LOW = "\u6700\u4f4e"
-COL_HIST_VOLUME = "\u6210\u4ea4\u91cf"
-COL_HIST_TURNOVER = "\u6210\u4ea4\u989d"
-COL_HIST_AMPLITUDE = "\u632f\u5e45"
-COL_HIST_CHANGE_RATE = "\u6da8\u8dcc\u5e45"
-COL_HIST_CHANGE_AMOUNT = "\u6da8\u8dcc\u989d"
-COL_HIST_TURNOVER_RATE = "\u6362\u624b\u7387"
+COL_HIST_DATE = "date"
+COL_HIST_OPEN = "open"
+COL_HIST_CLOSE = "close"
+COL_HIST_HIGH = "high"
+COL_HIST_LOW = "low"
+COL_HIST_VOLUME = "volume"
 
 
 def print(*args, **kwargs):
@@ -120,25 +82,11 @@ def fetch_with_retry(
     )
 
 
-def normalize_etf_code(value):
-    return str(value or "").strip()
-
-
-def get_spot_code(row, spot_source):
-    if spot_source == "fund_etf_spot_ths":
-        return normalize_etf_code(row.get(COL_THS_CODE))
-    return normalize_etf_code(row.get(COL_CODE))
-
-
-def get_spot_name(row, spot_source):
-    if spot_source == "fund_etf_spot_ths":
-        return str(row.get(COL_THS_NAME, "")).strip() or None
-    return str(row.get(COL_NAME, "")).strip() or None
-
-
 def normalize_trade_date(value):
     if value is None or pd.isna(value):
         return ""
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
     if hasattr(value, "date"):
         try:
             return value.date().strftime("%Y-%m-%d")
@@ -155,287 +103,237 @@ def normalize_trade_date(value):
     return text
 
 
-def normalize_datetime_value(value):
-    if value is None or pd.isna(value):
-        return None
-    if hasattr(value, "to_pydatetime"):
-        value = value.to_pydatetime()
-    if hasattr(value, "tzinfo") and getattr(value, "tzinfo", None) is not None:
-        value = value.replace(tzinfo=None)
-    return value
+def normalize_sina_symbol(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    matched = re.search(r"(sh|sz)\d{6}$", text)
+    if matched:
+        return matched.group(0)
+    code_match = re.search(r"(\d{6})$", text)
+    if not code_match:
+        return ""
+    code = code_match.group(1)
+    prefix = "sh" if code.startswith(("5", "6")) else "sz"
+    return f"{prefix}{code}"
 
 
-def build_etf_backfill_task_payload(etf_code, etf_name, start_date, end_date):
+def normalize_etf_code(value):
+    text = str(value or "").strip().lower()
+    matched = re.search(r"(\d{6})$", text)
+    return matched.group(1) if matched else ""
+
+
+def build_etf_backfill_task_payload(etf_code, etf_name, sina_symbol, start_date, end_date):
     return {
         "etf_code": normalize_etf_code(etf_code),
         "etf_name": str(etf_name or "").strip() or None,
+        "sina_symbol": normalize_sina_symbol(sina_symbol),
         "start_date": str(start_date),
         "end_date": str(end_date),
-        "adjust_type": HIST_ADJUST,
     }
 
 
-def build_etf_hist_request_key(etf_code, start_date, end_date):
-    return (
-        f"fund_etf_hist_em:"
-        f"{normalize_etf_code(etf_code)}:"
-        f"{start_date.strftime('%Y%m%d')}:"
-        f"{end_date.strftime('%Y%m%d')}:"
-        f"{HIST_ADJUST}"
-    )
+def build_etf_hist_request_key(sina_symbol):
+    return f"fund_etf_hist_sina:{normalize_sina_symbol(sina_symbol)}"
 
 
-def get_etf_spot_em(return_scheduler_meta=False):
-    return fetch_with_retry(ak.fund_etf_spot_em, return_scheduler_meta=return_scheduler_meta)
-
-
-def get_etf_spot_ths(return_scheduler_meta=False):
-    return fetch_with_retry(ak.fund_etf_spot_ths, date="", return_scheduler_meta=return_scheduler_meta)
-
-
-def get_etf_spot(return_scheduler_meta=False):
-    errors = []
-
-    for source_name, loader in (
-        ("fund_etf_spot_em", get_etf_spot_em),
-        ("fund_etf_spot_ths", get_etf_spot_ths),
-    ):
-        try:
-            spot_result = loader(return_scheduler_meta=return_scheduler_meta)
-            spot_df = spot_result.value if return_scheduler_meta else spot_result
-            if spot_df is None or spot_df.empty:
-                raise ValueError(f"{source_name} returned empty dataframe")
-            if source_name == "fund_etf_spot_ths":
-                print("ETF spot source fallback activated: using fund_etf_spot_ths")
-            if return_scheduler_meta:
-                return spot_df, source_name, spot_result
-            return spot_df, source_name
-        except Exception as exc:
-            errors.append(f"{source_name}: {exc}")
-            if source_name == "fund_etf_spot_em":
-                print(f"fund_etf_spot_em unavailable, falling back to fund_etf_spot_ths: {exc}")
-                continue
-            break
-
-    raise RuntimeError("failed to fetch ETF spot data: " + " | ".join(errors))
-
-
-def get_etf_history(etf_code, start_date, end_date, scheduler_context=None, request_key=None):
+def get_etf_category_sina(return_scheduler_meta=False):
     return fetch_with_retry(
-        ak.fund_etf_hist_em,
-        symbol=etf_code,
-        period="daily",
-        start_date=start_date.strftime("%Y%m%d"),
-        end_date=end_date.strftime("%Y%m%d"),
-        adjust=HIST_ADJUST,
-        scheduler_context=scheduler_context,
-        request_key=request_key,
+        ak.fund_etf_category_sina,
+        symbol=ETF_CATEGORY_SYMBOL,
+        return_scheduler_meta=return_scheduler_meta,
+        request_key=f"fund_etf_category_sina:{ETF_CATEGORY_SYMBOL}",
     )
 
 
-def build_etf_basic_rows(spot_df, spot_source):
-    rows = []
-    seen_codes = set()
-    for _, row in spot_df.iterrows():
-        etf_code = get_spot_code(row, spot_source)
-        if not etf_code or etf_code in seen_codes:
+def get_etf_history_sina(sina_symbol, scheduler_context=None, request_key=None):
+    return fetch_with_retry(
+        ak.fund_etf_hist_sina,
+        symbol=normalize_sina_symbol(sina_symbol),
+        scheduler_context=scheduler_context,
+        request_key=request_key or build_etf_hist_request_key(sina_symbol),
+    )
+
+
+def build_category_records(category_df):
+    records = []
+    deduped = {}
+    for _, row in category_df.iterrows():
+        sina_symbol = normalize_sina_symbol(row.get(COL_SINA_SYMBOL))
+        etf_code = normalize_etf_code(sina_symbol or row.get(COL_SINA_SYMBOL))
+        if not etf_code or not sina_symbol:
             continue
-        seen_codes.add(etf_code)
-        rows.append({
+        deduped[etf_code] = {
             "etf_code": etf_code,
-            "etf_name": get_spot_name(row, spot_source),
-        })
-    return rows
-
-
-def filter_spot_df_by_codes(spot_df, spot_source, selected_codes=None):
-    normalized_codes = [normalize_etf_code(code) for code in (selected_codes or []) if normalize_etf_code(code)]
-    if not normalized_codes:
-        return spot_df, []
-
-    selected_set = set(normalized_codes)
-    filtered_df = spot_df[spot_df.apply(lambda row: get_spot_code(row, spot_source) in selected_set, axis=1)]
-    available_codes = {get_spot_code(row, spot_source) for _, row in filtered_df.iterrows()}
-    missing_codes = [code for code in normalized_codes if code not in available_codes]
-    return filtered_df, missing_codes
-
-
-def build_etf_spot_daily_rows(spot_df, spot_source):
-    rows = []
-    today_text = datetime.now().strftime("%Y-%m-%d")
-
-    for _, row in spot_df.iterrows():
-        etf_code = get_spot_code(row, spot_source)
-        if not etf_code:
-            continue
-
-        if spot_source == "fund_etf_spot_ths":
-            trade_date = (
-                normalize_trade_date(row.get(COL_THS_QUERY_DATE))
-                or normalize_trade_date(row.get(COL_THS_LATEST_TRADE_DATE))
-                or today_text
-            )
-            close_price = row.get(COL_THS_CURRENT_NAV)
-            if close_price is None or pd.isna(close_price):
-                close_price = row.get(COL_THS_LATEST_NAV)
-
-            rows.append({
-                "etf_code": etf_code,
-                "etf_name": get_spot_name(row, spot_source),
-                "trade_date": trade_date,
-                "open_price": None,
-                "close_price": close_price,
-                "high_price": None,
-                "low_price": None,
-                "volume": None,
-                "turnover": None,
-                "amplitude": None,
-                "price_change_rate": row.get(COL_THS_GROWTH_RATE),
-                "price_change_amount": row.get(COL_THS_GROWTH_VALUE),
-                "turnover_rate": None,
-                "pre_close_price": row.get(COL_THS_PREV_NAV),
-                "iopv_realtime": None,
-                "discount_rate": None,
-                "volume_ratio": None,
-                "current_hand": None,
-                "bid1_price": None,
-                "ask1_price": None,
-                "outer_volume": None,
-                "inner_volume": None,
-                "latest_share": None,
-                "circulating_market_value": None,
-                "total_market_value": None,
-                "main_net_inflow": None,
-                "main_net_inflow_ratio": None,
-                "extra_large_net_inflow": None,
-                "extra_large_net_inflow_ratio": None,
-                "large_net_inflow": None,
-                "large_net_inflow_ratio": None,
-                "medium_net_inflow": None,
-                "medium_net_inflow_ratio": None,
-                "small_net_inflow": None,
-                "small_net_inflow_ratio": None,
-                "spot_data_date": trade_date,
-                "spot_update_time": None,
-                "data_source": "fund_etf_spot_ths",
-                "adjust_type": None,
-            })
-            continue
-
-        trade_date = normalize_trade_date(row.get(COL_SPOT_DATA_DATE)) or today_text
-        rows.append({
-            "etf_code": etf_code,
-            "etf_name": get_spot_name(row, spot_source),
-            "trade_date": trade_date,
+            "etf_name": str(row.get(COL_NAME, "")).strip() or None,
+            "sina_symbol": sina_symbol,
             "open_price": row.get(COL_OPEN),
             "close_price": row.get(COL_LATEST),
             "high_price": row.get(COL_HIGH),
             "low_price": row.get(COL_LOW),
             "volume": row.get(COL_VOLUME),
             "turnover": row.get(COL_TURNOVER),
-            "amplitude": row.get(COL_AMPLITUDE),
-            "price_change_rate": row.get(COL_CHANGE_RATE),
-            "price_change_amount": row.get(COL_CHANGE_AMOUNT),
-            "turnover_rate": row.get(COL_TURNOVER_RATE),
             "pre_close_price": row.get(COL_PRE_CLOSE),
-            "iopv_realtime": row.get(COL_IOPV),
-            "discount_rate": row.get(COL_DISCOUNT_RATE),
-            "volume_ratio": row.get(COL_VOLUME_RATIO),
-            "current_hand": row.get(COL_CURRENT_HAND),
-            "bid1_price": row.get(COL_BID1),
-            "ask1_price": row.get(COL_ASK1),
-            "outer_volume": row.get(COL_OUTER),
-            "inner_volume": row.get(COL_INNER),
-            "latest_share": row.get(COL_LATEST_SHARE),
-            "circulating_market_value": row.get(COL_CIRCULATING_MARKET_VALUE),
-            "total_market_value": row.get(COL_TOTAL_MARKET_VALUE),
-            "main_net_inflow": row.get(COL_MAIN_NET_INFLOW),
-            "main_net_inflow_ratio": row.get(COL_MAIN_NET_INFLOW_RATIO),
-            "extra_large_net_inflow": row.get(COL_EXTRA_LARGE_NET_INFLOW),
-            "extra_large_net_inflow_ratio": row.get(COL_EXTRA_LARGE_NET_INFLOW_RATIO),
-            "large_net_inflow": row.get(COL_LARGE_NET_INFLOW),
-            "large_net_inflow_ratio": row.get(COL_LARGE_NET_INFLOW_RATIO),
-            "medium_net_inflow": row.get(COL_MEDIUM_NET_INFLOW),
-            "medium_net_inflow_ratio": row.get(COL_MEDIUM_NET_INFLOW_RATIO),
-            "small_net_inflow": row.get(COL_SMALL_NET_INFLOW),
-            "small_net_inflow_ratio": row.get(COL_SMALL_NET_INFLOW_RATIO),
-            "spot_data_date": trade_date,
-            "spot_update_time": normalize_datetime_value(row.get(COL_SPOT_UPDATE_TIME)),
-            "data_source": "fund_etf_spot_em",
-            "adjust_type": None,
-        })
+            "price_change_amount": row.get(COL_CHANGE_AMOUNT),
+            "price_change_rate": row.get(COL_CHANGE_RATE),
+        }
+    records.extend(deduped.values())
+    return records
 
+
+def filter_category_records(category_records, selected_codes=None):
+    normalized_codes = [
+        normalize_etf_code(code)
+        for code in (selected_codes or [])
+        if normalize_etf_code(code)
+    ]
+    if not normalized_codes:
+        return category_records, []
+
+    selected_set = set(normalized_codes)
+    filtered = [record for record in category_records if record["etf_code"] in selected_set]
+    available_codes = {record["etf_code"] for record in filtered}
+    missing_codes = [code for code in normalized_codes if code not in available_codes]
+    return filtered, missing_codes
+
+
+def build_etf_basic_rows(category_records):
+    return [
+        {
+            "etf_code": record["etf_code"],
+            "etf_name": record.get("etf_name"),
+            "sina_symbol": record.get("sina_symbol"),
+        }
+        for record in category_records
+        if record.get("etf_code") and record.get("sina_symbol")
+    ]
+
+
+def build_etf_daily_rows(category_records):
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    rows = []
+    for record in category_records:
+        rows.append({
+            "etf_code": record["etf_code"],
+            "etf_name": record.get("etf_name"),
+            "sina_symbol": record.get("sina_symbol"),
+            "trade_date": trade_date,
+            "open_price": record.get("open_price"),
+            "close_price": record.get("close_price"),
+            "high_price": record.get("high_price"),
+            "low_price": record.get("low_price"),
+            "volume": record.get("volume"),
+            "turnover": record.get("turnover"),
+            "amplitude": None,
+            "price_change_rate": record.get("price_change_rate"),
+            "price_change_amount": record.get("price_change_amount"),
+            "turnover_rate": None,
+            "pre_close_price": record.get("pre_close_price"),
+            "data_source": "fund_etf_category_sina",
+        })
     return rows
 
 
-def build_etf_hist_rows(etf_code, etf_name, history_df):
+def build_etf_hist_rows(symbol_row, history_df, start_date, end_date):
+    if history_df is None or history_df.empty:
+        return []
+
     rows = []
-    for _, row in history_df.iterrows():
-        trade_date = normalize_trade_date(row.get(COL_HIST_DATE))
-        if not trade_date:
+    temp_df = history_df.copy()
+    if COL_HIST_DATE not in temp_df.columns:
+        return []
+    temp_df = temp_df.sort_values(by=COL_HIST_DATE, ascending=True)
+    previous_close = None
+
+    for _, row in temp_df.iterrows():
+        trade_date_text = normalize_trade_date(row.get(COL_HIST_DATE))
+        if not trade_date_text:
             continue
 
-        rows.append({
-            "etf_code": etf_code,
-            "etf_name": etf_name,
-            "trade_date": trade_date,
-            "open_price": row.get(COL_HIST_OPEN),
-            "close_price": row.get(COL_HIST_CLOSE),
-            "high_price": row.get(COL_HIST_HIGH),
-            "low_price": row.get(COL_HIST_LOW),
-            "volume": row.get(COL_HIST_VOLUME),
-            "turnover": row.get(COL_HIST_TURNOVER),
-            "amplitude": row.get(COL_HIST_AMPLITUDE),
-            "price_change_rate": row.get(COL_HIST_CHANGE_RATE),
-            "price_change_amount": row.get(COL_HIST_CHANGE_AMOUNT),
-            "turnover_rate": row.get(COL_HIST_TURNOVER_RATE),
-            "pre_close_price": None,
-            "iopv_realtime": None,
-            "discount_rate": None,
-            "volume_ratio": None,
-            "current_hand": None,
-            "bid1_price": None,
-            "ask1_price": None,
-            "outer_volume": None,
-            "inner_volume": None,
-            "latest_share": None,
-            "circulating_market_value": None,
-            "total_market_value": None,
-            "main_net_inflow": None,
-            "main_net_inflow_ratio": None,
-            "extra_large_net_inflow": None,
-            "extra_large_net_inflow_ratio": None,
-            "large_net_inflow": None,
-            "large_net_inflow_ratio": None,
-            "medium_net_inflow": None,
-            "medium_net_inflow_ratio": None,
-            "small_net_inflow": None,
-            "small_net_inflow_ratio": None,
-            "spot_data_date": None,
-            "spot_update_time": None,
-            "data_source": "fund_etf_hist_em",
-            "adjust_type": HIST_ADJUST,
-        })
+        trade_date_obj = datetime.strptime(trade_date_text, "%Y-%m-%d").date()
+        current_close = row.get(COL_HIST_CLOSE)
+
+        if start_date <= trade_date_obj <= end_date:
+            price_change_amount = None
+            price_change_rate = None
+            amplitude = None
+            if previous_close not in (None, 0) and not pd.isna(previous_close):
+                try:
+                    price_change_amount = float(current_close) - float(previous_close)
+                    price_change_rate = price_change_amount / float(previous_close) * 100
+                    high_price = row.get(COL_HIST_HIGH)
+                    low_price = row.get(COL_HIST_LOW)
+                    if high_price is not None and low_price is not None:
+                        amplitude = (float(high_price) - float(low_price)) / float(previous_close) * 100
+                except (TypeError, ValueError, ZeroDivisionError):
+                    price_change_amount = None
+                    price_change_rate = None
+                    amplitude = None
+
+            rows.append({
+                "etf_code": symbol_row["etf_code"],
+                "etf_name": symbol_row.get("etf_name"),
+                "sina_symbol": symbol_row.get("sina_symbol"),
+                "trade_date": trade_date_text,
+                "open_price": row.get(COL_HIST_OPEN),
+                "close_price": current_close,
+                "high_price": row.get(COL_HIST_HIGH),
+                "low_price": row.get(COL_HIST_LOW),
+                "volume": row.get(COL_HIST_VOLUME),
+                "turnover": None,
+                "amplitude": amplitude,
+                "price_change_rate": price_change_rate,
+                "price_change_amount": price_change_amount,
+                "turnover_rate": None,
+                "pre_close_price": previous_close,
+                "data_source": "fund_etf_hist_sina",
+            })
+
+        if current_close is not None and not pd.isna(current_close):
+            previous_close = current_close
+
     return rows
 
 
-async def record_etf_backfill_failure(db_tools, etf_code, etf_name, start_date, end_date, error_message):
+async def record_etf_backfill_failure(db_tools, etf_code, etf_name, sina_symbol, start_date, end_date, error_message):
     await db_tools.upsert_failed_task({
         "task_name": ETF_BACKFILL_TASK_NAME,
         "task_stage": "history",
         "task_key": normalize_etf_code(etf_code),
-        "payload_json": build_etf_backfill_task_payload(etf_code, etf_name, start_date, end_date),
+        "payload_json": build_etf_backfill_task_payload(etf_code, etf_name, sina_symbol, start_date, end_date),
         "error_message": str(error_message or "").strip() or None,
     })
 
 
-async def resolve_etf_backfill_success(db_tools, etf_code, etf_name, start_date, end_date):
+async def resolve_etf_backfill_success(db_tools, etf_code, etf_name, sina_symbol, start_date, end_date):
     await db_tools.upsert_success_task({
         "task_name": ETF_BACKFILL_TASK_NAME,
         "task_stage": "history",
         "task_key": normalize_etf_code(etf_code),
-        "payload_json": build_etf_backfill_task_payload(etf_code, etf_name, start_date, end_date),
+        "payload_json": build_etf_backfill_task_payload(etf_code, etf_name, sina_symbol, start_date, end_date),
     })
+
+
+async def load_selected_etfs(selected_codes=None, return_scheduler_meta=False):
+    if return_scheduler_meta:
+        category_result = await asyncio.to_thread(get_etf_category_sina, True)
+        category_df = category_result.value
+    else:
+        category_df = await asyncio.to_thread(get_etf_category_sina)
+        category_result = None
+
+    if category_df is None or category_df.empty:
+        print("No ETF category data fetched from Sina.")
+        if return_scheduler_meta:
+            return [], [], None
+        return [], []
+
+    category_records = build_category_records(category_df)
+    filtered_records, missing_codes = filter_category_records(category_records, selected_codes)
+    if return_scheduler_meta:
+        return filtered_records, missing_codes, category_result
+    return filtered_records, missing_codes
 
 
 async def process_history_symbol(
@@ -453,60 +351,53 @@ async def process_history_symbol(
 ):
     etf_code = symbol_row["etf_code"]
     etf_name = symbol_row.get("etf_name") or ""
+    sina_symbol = symbol_row.get("sina_symbol") or ""
 
     try:
         async with semaphore:
+            if not sina_symbol:
+                raise ValueError(f"missing sina_symbol for {etf_code}")
             history_df = await asyncio.to_thread(
-                get_etf_history,
-                etf_code,
-                start_date,
-                end_date,
+                get_etf_history_sina,
+                sina_symbol,
                 scheduler_context,
-                build_etf_hist_request_key(etf_code, start_date, end_date),
+                build_etf_hist_request_key(sina_symbol),
             )
 
         if history_df is None or history_df.empty:
             raise ValueError(f"empty history data for {etf_code}")
 
-        history_rows = build_etf_hist_rows(etf_code, etf_name, history_df)
+        history_rows = build_etf_hist_rows(symbol_row, history_df, start_date, end_date)
         if not history_rows:
             raise ValueError(f"no parsed history rows for {etf_code}")
+
         upserted = await db_tools.upsert_etf_daily_data(history_rows)
         if record_failures:
-            await resolve_etf_backfill_success(db_tools, etf_code, etf_name, start_date, end_date)
+            await resolve_etf_backfill_success(db_tools, etf_code, etf_name, sina_symbol, start_date, end_date)
+
         async with progress_lock:
             progress_lines.append(f"{mode_label},{etf_code},{start_date},{end_date},{upserted}")
             await asyncio.to_thread(save_progress_batch, [progress_lines[-1]])
+
         print(f"{mode_label} {etf_code}: upserted {upserted}")
         return upserted
     except Exception as exc:
         if record_failures:
-            await record_etf_backfill_failure(db_tools, etf_code, etf_name, start_date, end_date, str(exc))
+            await record_etf_backfill_failure(
+                db_tools,
+                etf_code,
+                etf_name,
+                sina_symbol,
+                start_date,
+                end_date,
+                str(exc),
+            )
         error_message = f"{mode_label} {etf_code} failed: {exc}"
         print(error_message)
         log_error(etf_code, str(end_date), error_message)
         if swallow_exceptions:
             return 0
         raise
-
-
-async def load_selected_etfs(selected_codes=None, return_scheduler_meta=False):
-    if return_scheduler_meta:
-        spot_df, spot_source, spot_result = await asyncio.to_thread(get_etf_spot, True)
-    else:
-        spot_df, spot_source = await asyncio.to_thread(get_etf_spot)
-        spot_result = None
-    if spot_df is None or spot_df.empty:
-        print("No ETF spot data fetched.")
-        if return_scheduler_meta:
-            return None, None, [], [], None
-        return None, None, [], []
-
-    filtered_df, missing_codes = filter_spot_df_by_codes(spot_df, spot_source, selected_codes)
-    basic_rows = build_etf_basic_rows(filtered_df, spot_source)
-    if return_scheduler_meta:
-        return spot_source, filtered_df, basic_rows, missing_codes, spot_result
-    return spot_source, filtered_df, basic_rows, missing_codes
 
 
 async def sync_history(mode_label, selected_codes=None, record_failures=False):
@@ -517,27 +408,29 @@ async def sync_history(mode_label, selected_codes=None, record_failures=False):
     progress_lines = []
 
     try:
-        spot_source, _, basic_rows, missing_codes, spot_result = await load_selected_etfs(
+        category_records, missing_codes, category_result = await load_selected_etfs(
             selected_codes,
             return_scheduler_meta=True,
         )
         if missing_codes:
             print(f"{mode_label} ignored unknown ETF codes: {', '.join(missing_codes)}")
-        if not basic_rows:
+        if not category_records:
             print(f"No ETF symbols matched for {mode_label}.")
             return 0
 
+        basic_rows = build_etf_basic_rows(category_records)
         basic_upserted = await db_tools.upsert_etf_basic_info(basic_rows)
-        print(f"{mode_label} etf_basic_info upserted: {basic_upserted}, spot_source: {spot_source}")
+        print(f"{mode_label} etf_basic_info_sina upserted: {basic_upserted}")
 
         end_date = datetime.now().date() - timedelta(days=1)
         scheduler_context = None
-        if spot_result is not None:
+        if category_result is not None:
             scheduler_context = SchedulerContext(
-                parent_job_id=spot_result.job_id,
-                root_job_id=spot_result.root_job_id,
-                workflow_name=f"{mode_label}:spot_to_hist",
+                parent_job_id=category_result.job_id,
+                root_job_id=category_result.root_job_id,
+                workflow_name=f"{mode_label}:category_to_hist",
             )
+
         tasks = [
             process_history_symbol(
                 symbol_row,
@@ -569,46 +462,41 @@ async def sync_history(mode_label, selected_codes=None, record_failures=False):
 async def backfill_history(selected_codes=None):
     db_tools = DbTools()
     await db_tools.init_pool()
-    progress_lock = asyncio.Lock()
-    progress_lines = []
 
     try:
-        spot_source, _, basic_rows, missing_codes, spot_result = await load_selected_etfs(
+        category_records, missing_codes, category_result = await load_selected_etfs(
             selected_codes,
             return_scheduler_meta=True,
         )
         if missing_codes:
             print(f"etf_backfill ignored unknown ETF codes: {', '.join(missing_codes)}")
-        if not basic_rows:
+        if not category_records:
             print("No ETF symbols matched for etf_backfill.")
             return 0
 
+        basic_rows = build_etf_basic_rows(category_records)
         basic_upserted = await db_tools.upsert_etf_basic_info(basic_rows)
-        print(f"etf_backfill etf_basic_info upserted: {basic_upserted}, spot_source: {spot_source}")
+        print(f"etf_backfill etf_basic_info_sina upserted: {basic_upserted}")
 
         end_date = datetime.now().date() - timedelta(days=1)
         scheduler_context = None
-        if spot_result is not None:
+        if category_result is not None:
             scheduler_context = SchedulerContext(
-                parent_job_id=spot_result.job_id,
-                root_job_id=spot_result.root_job_id,
-                workflow_name="etf_backfill:spot_to_hist",
+                parent_job_id=category_result.job_id,
+                root_job_id=category_result.root_job_id,
+                workflow_name="etf_backfill:category_to_hist",
             )
 
         submitted_jobs = []
         for symbol_row in basic_rows:
-            etf_code = symbol_row["etf_code"]
+            sina_symbol = symbol_row["sina_symbol"]
             handle = await asyncio.to_thread(
                 submit_registered_job,
-                ak.fund_etf_hist_em,
+                ak.fund_etf_hist_sina,
                 scheduler_context=scheduler_context,
                 caller_name=LOGGER.name,
-                request_key=build_etf_hist_request_key(etf_code, BACKFILL_START_DATE, end_date),
-                symbol=etf_code,
-                period="daily",
-                start_date=BACKFILL_START_DATE.strftime("%Y%m%d"),
-                end_date=end_date.strftime("%Y%m%d"),
-                adjust=HIST_ADJUST,
+                request_key=build_etf_hist_request_key(sina_symbol),
+                symbol=sina_symbol,
             )
             submitted_jobs.append({
                 **symbol_row,
@@ -646,6 +534,7 @@ async def backfill_history(selected_codes=None):
                 completed_any = True
                 etf_code = symbol_row["etf_code"]
                 etf_name = symbol_row.get("etf_name") or ""
+                sina_symbol = symbol_row.get("sina_symbol") or ""
 
                 if snapshot.status == "SUCCESS":
                     try:
@@ -653,7 +542,7 @@ async def backfill_history(selected_codes=None):
                         if history_df is None or history_df.empty:
                             raise ValueError(f"empty history data for {etf_code}")
 
-                        history_rows = build_etf_hist_rows(etf_code, etf_name, history_df)
+                        history_rows = build_etf_hist_rows(symbol_row, history_df, BACKFILL_START_DATE, end_date)
                         if not history_rows:
                             raise ValueError(f"no parsed history rows for {etf_code}")
 
@@ -662,21 +551,22 @@ async def backfill_history(selected_codes=None):
                             db_tools,
                             etf_code,
                             etf_name,
+                            sina_symbol,
                             BACKFILL_START_DATE,
                             end_date,
                         )
                         total_upserted += upserted
-                        async with progress_lock:
-                            progress_lines.append(
-                                f"etf_backfill,{etf_code},{BACKFILL_START_DATE},{end_date},{upserted}"
-                            )
-                            await asyncio.to_thread(save_progress_batch, [progress_lines[-1]])
+                        await asyncio.to_thread(
+                            save_progress_batch,
+                            [f"etf_backfill,{etf_code},{BACKFILL_START_DATE},{end_date},{upserted}"],
+                        )
                         print(f"etf_backfill {etf_code}: upserted {upserted}")
                     except Exception as exc:
                         await record_etf_backfill_failure(
                             db_tools,
                             etf_code,
                             etf_name,
+                            sina_symbol,
                             BACKFILL_START_DATE,
                             end_date,
                             str(exc),
@@ -689,6 +579,7 @@ async def backfill_history(selected_codes=None):
                         db_tools,
                         etf_code,
                         etf_name,
+                        sina_symbol,
                         BACKFILL_START_DATE,
                         end_date,
                         error_message,
@@ -733,6 +624,7 @@ async def collect_etf_backfill_targets(db_tools, selected_codes=None):
         target_map[etf_code] = {
             "etf_code": etf_code,
             "etf_name": str(payload.get("etf_name") or "").strip() or None,
+            "sina_symbol": normalize_sina_symbol(payload.get("sina_symbol")),
             "failure_id": failure.get("id"),
         }
 
@@ -744,10 +636,12 @@ async def collect_etf_backfill_targets(db_tools, selected_codes=None):
         target_map[etf_code] = {
             "etf_code": etf_code,
             "etf_name": current.get("etf_name") or item.get("etf_name"),
+            "sina_symbol": current.get("sina_symbol") or normalize_sina_symbol(item.get("sina_symbol")),
             "failure_id": current.get("failure_id"),
         }
 
-    return pending_failures, missing_hist, list(target_map.values())
+    valid_targets = [target for target in target_map.values() if target.get("sina_symbol")]
+    return pending_failures, missing_hist, valid_targets
 
 
 async def process_repair_backfill_target(
@@ -859,22 +753,23 @@ async def sync_daily(selected_codes=None):
     await db_tools.init_pool()
 
     try:
-        spot_source, filtered_df, basic_rows, missing_codes = await load_selected_etfs(selected_codes)
+        category_records, missing_codes = await load_selected_etfs(selected_codes)
         if missing_codes:
             print(f"etf_daily ignored unknown ETF codes: {', '.join(missing_codes)}")
-        if filtered_df is None or filtered_df.empty or not basic_rows:
+        if not category_records:
             print("No ETF symbols matched for daily sync.")
             return 0
 
-        daily_rows = build_etf_spot_daily_rows(filtered_df, spot_source)
+        basic_rows = build_etf_basic_rows(category_records)
+        daily_rows = build_etf_daily_rows(category_records)
         basic_upserted = await db_tools.upsert_etf_basic_info(basic_rows)
         daily_upserted = await db_tools.upsert_etf_daily_data(daily_rows)
         trade_dates = sorted({row["trade_date"] for row in daily_rows if row.get("trade_date")})
         print(
             "etf daily finished, "
-            f"etf_basic_info upserted: {basic_upserted}, "
-            f"etf_daily_data upserted: {daily_upserted}, "
-            f"spot_source: {spot_source}, "
+            f"etf_basic_info_sina upserted: {basic_upserted}, "
+            f"etf_daily_data_sina upserted: {daily_upserted}, "
+            f"data_source: fund_etf_category_sina, "
             f"trade_dates: {','.join(trade_dates) if trade_dates else 'NONE'}"
         )
         return daily_upserted

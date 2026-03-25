@@ -216,6 +216,34 @@ SET @stmt = (
   SELECT IF(
     EXISTS (
       SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'etf_basic_info_sina' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE etf_basic_info_sina
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'etf_daily_data_sina' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE etf_daily_data_sina
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
       WHERE table_schema = DATABASE() AND table_name = 'daily_task_failures' AND column_name = 'created_at'
     ),
     "ALTER TABLE daily_task_failures

@@ -177,6 +177,7 @@ class DbTools:
         sanitized = dict(row)
         sanitized['etf_code'] = str(row.get('etf_code', '')).strip()
         sanitized['etf_name'] = str(row.get('etf_name', '')).strip() or None
+        sanitized['sina_symbol'] = str(row.get('sina_symbol', '')).strip().lower() or None
         sanitized['trade_date'] = str(row.get('trade_date', '')).strip()
         for field in [
             'open_price', 'close_price', 'high_price', 'low_price', 'volume', 'turnover',
@@ -940,6 +941,7 @@ class DbTools:
             deduped_rows[etf_code] = (
                 etf_code,
                 str(row.get('etf_name', '')).strip() or None,
+                str(row.get('sina_symbol', '')).strip().lower() or None,
             )
 
         rows_to_upsert = list(deduped_rows.values())
@@ -949,12 +951,14 @@ class DbTools:
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 query_upsert = """
-                INSERT INTO etf_basic_info (
+                INSERT INTO etf_basic_info_sina (
                     etf_code,
-                    etf_name
-                ) VALUES (%s, %s)
+                    etf_name,
+                    sina_symbol
+                ) VALUES (%s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     etf_name = VALUES(etf_name),
+                    sina_symbol = VALUES(sina_symbol),
                     updated_at = CURRENT_TIMESTAMP
                 """
                 await cursor.executemany(query_upsert, rows_to_upsert)
@@ -1352,9 +1356,10 @@ class DbTools:
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 query_upsert = """
-                INSERT INTO etf_daily_data (
+                INSERT INTO etf_daily_data_sina (
                     etf_code,
                     etf_name,
+                    sina_symbol,
                     trade_date,
                     open_price,
                     close_price,
@@ -1367,34 +1372,11 @@ class DbTools:
                     price_change_amount,
                     turnover_rate,
                     pre_close_price,
-                    iopv_realtime,
-                    discount_rate,
-                    volume_ratio,
-                    current_hand,
-                    bid1_price,
-                    ask1_price,
-                    outer_volume,
-                    inner_volume,
-                    latest_share,
-                    circulating_market_value,
-                    total_market_value,
-                    main_net_inflow,
-                    main_net_inflow_ratio,
-                    extra_large_net_inflow,
-                    extra_large_net_inflow_ratio,
-                    large_net_inflow,
-                    large_net_inflow_ratio,
-                    medium_net_inflow,
-                    medium_net_inflow_ratio,
-                    small_net_inflow,
-                    small_net_inflow_ratio,
-                    spot_data_date,
-                    spot_update_time,
-                    data_source,
-                    adjust_type
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    data_source
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     etf_name = VALUES(etf_name),
+                    sina_symbol = VALUES(sina_symbol),
                     open_price = VALUES(open_price),
                     close_price = VALUES(close_price),
                     high_price = VALUES(high_price),
@@ -1406,37 +1388,14 @@ class DbTools:
                     price_change_amount = VALUES(price_change_amount),
                     turnover_rate = VALUES(turnover_rate),
                     pre_close_price = VALUES(pre_close_price),
-                    iopv_realtime = VALUES(iopv_realtime),
-                    discount_rate = VALUES(discount_rate),
-                    volume_ratio = VALUES(volume_ratio),
-                    current_hand = VALUES(current_hand),
-                    bid1_price = VALUES(bid1_price),
-                    ask1_price = VALUES(ask1_price),
-                    outer_volume = VALUES(outer_volume),
-                    inner_volume = VALUES(inner_volume),
-                    latest_share = VALUES(latest_share),
-                    circulating_market_value = VALUES(circulating_market_value),
-                    total_market_value = VALUES(total_market_value),
-                    main_net_inflow = VALUES(main_net_inflow),
-                    main_net_inflow_ratio = VALUES(main_net_inflow_ratio),
-                    extra_large_net_inflow = VALUES(extra_large_net_inflow),
-                    extra_large_net_inflow_ratio = VALUES(extra_large_net_inflow_ratio),
-                    large_net_inflow = VALUES(large_net_inflow),
-                    large_net_inflow_ratio = VALUES(large_net_inflow_ratio),
-                    medium_net_inflow = VALUES(medium_net_inflow),
-                    medium_net_inflow_ratio = VALUES(medium_net_inflow_ratio),
-                    small_net_inflow = VALUES(small_net_inflow),
-                    small_net_inflow_ratio = VALUES(small_net_inflow_ratio),
-                    spot_data_date = VALUES(spot_data_date),
-                    spot_update_time = VALUES(spot_update_time),
                     data_source = VALUES(data_source),
-                    adjust_type = VALUES(adjust_type),
                     updated_at = CURRENT_TIMESTAMP
                 """
                 values = [
                     (
                         row['etf_code'],
                         row['etf_name'],
+                        row['sina_symbol'],
                         row['trade_date'],
                         row['open_price'],
                         row['close_price'],
@@ -1449,31 +1408,7 @@ class DbTools:
                         row['price_change_amount'],
                         row['turnover_rate'],
                         row['pre_close_price'],
-                        row['iopv_realtime'],
-                        row['discount_rate'],
-                        row['volume_ratio'],
-                        row['current_hand'],
-                        row['bid1_price'],
-                        row['ask1_price'],
-                        row['outer_volume'],
-                        row['inner_volume'],
-                        row['latest_share'],
-                        row['circulating_market_value'],
-                        row['total_market_value'],
-                        row['main_net_inflow'],
-                        row['main_net_inflow_ratio'],
-                        row['extra_large_net_inflow'],
-                        row['extra_large_net_inflow_ratio'],
-                        row['large_net_inflow'],
-                        row['large_net_inflow_ratio'],
-                        row['medium_net_inflow'],
-                        row['medium_net_inflow_ratio'],
-                        row['small_net_inflow'],
-                        row['small_net_inflow_ratio'],
-                        row['spot_data_date'],
-                        row['spot_update_time'],
                         row['data_source'],
-                        row['adjust_type'],
                     )
                     for row in sanitized_rows
                 ]
@@ -1943,6 +1878,36 @@ class DbTools:
 
         return {str(row[0]).strip() for row in rows if row and row[0] is not None}
 
+    async def get_option_rtj_missing_trade_dates(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT ref.trade_date
+        FROM (
+            SELECT DISTINCT trade_date
+            FROM futures_daily_data
+            WHERE market = 'CFFEX'
+              AND data_source = 'get_futures_daily'
+              AND trade_date BETWEEN %s AND %s
+        ) ref
+        LEFT JOIN (
+            SELECT DISTINCT trade_date
+            FROM option_cffex_rtj_daily_data
+            WHERE trade_date BETWEEN %s AND %s
+        ) opt
+          ON opt.trade_date = ref.trade_date
+        WHERE opt.trade_date IS NULL
+        ORDER BY ref.trade_date ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, [start_date, end_date, start_date, end_date])
+                rows = await cursor.fetchall()
+
+        return [str(row[0]) for row in rows if row and row[0] is not None]
+
     async def get_etf_codes_missing_hist_data(self, selected_codes=None, exclude_success_task_name=None):
         if self.pool is None:
             await self.init_pool()
@@ -1956,12 +1921,13 @@ class DbTools:
         query = """
         SELECT
             basic.etf_code,
-            basic.etf_name
-        FROM etf_basic_info basic
+            basic.etf_name,
+            basic.sina_symbol
+        FROM etf_basic_info_sina basic
         LEFT JOIN (
             SELECT etf_code
-            FROM etf_daily_data
-            WHERE data_source = 'fund_etf_hist_em'
+            FROM etf_daily_data_sina
+            WHERE data_source = 'fund_etf_hist_sina'
             GROUP BY etf_code
         ) hist
             ON hist.etf_code = basic.etf_code
@@ -2002,6 +1968,7 @@ class DbTools:
             {
                 'etf_code': str(row[0]).strip(),
                 'etf_name': str(row[1]).strip() if row[1] is not None else None,
+                'sina_symbol': str(row[2]).strip().lower() if row[2] is not None else None,
             }
             for row in rows
             if row and row[0] is not None

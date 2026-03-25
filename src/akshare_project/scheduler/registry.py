@@ -16,6 +16,8 @@ FUNCTION_SPECS = {
     "stock_zh_a_spot_em": SchedulerFunctionSpec("stock_zh_a_spot_em", "eastmoney", ak.stock_zh_a_spot_em),
     "fund_etf_spot_em": SchedulerFunctionSpec("fund_etf_spot_em", "eastmoney", ak.fund_etf_spot_em),
     "fund_etf_hist_em": SchedulerFunctionSpec("fund_etf_hist_em", "eastmoney", ak.fund_etf_hist_em),
+    "fund_etf_category_sina": SchedulerFunctionSpec("fund_etf_category_sina", "sina", ak.fund_etf_category_sina),
+    "fund_etf_hist_sina": SchedulerFunctionSpec("fund_etf_hist_sina", "sina", ak.fund_etf_hist_sina),
     "stock_zh_index_daily_em": SchedulerFunctionSpec("stock_zh_index_daily_em", "eastmoney", ak.stock_zh_index_daily_em),
     "index_global_hist_em": SchedulerFunctionSpec("index_global_hist_em", "eastmoney", ak.index_global_hist_em),
     "forex_spot_em": SchedulerFunctionSpec("forex_spot_em", "eastmoney", ak.forex_spot_em),

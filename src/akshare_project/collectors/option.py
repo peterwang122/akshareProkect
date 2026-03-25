@@ -91,6 +91,19 @@ def normalize_trade_date(value):
     return datetime.strptime(str(value).strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
 
 
+def parse_date_arg(value, default_date):
+    if value is None:
+        return default_date
+
+    text = str(value).strip()
+    for pattern in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            continue
+    raise ValueError(f"invalid date: {value}")
+
+
 def iter_weekdays(start_date, end_date):
     current = start_date
     while current <= end_date:
@@ -580,6 +593,55 @@ async def backfill_history(headless=True, end_date=None):
     return total_rows
 
 
+async def repair_backfill(headless=True, start_date=None, end_date=None):
+    processed = load_progress()
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    start_trade_date = parse_date_arg(start_date, BACKFILL_START_DATE)
+    end_trade_date = parse_date_arg(end_date, datetime.now().date() - timedelta(days=1))
+    if start_trade_date > end_trade_date:
+        raise ValueError("start_date cannot be greater than end_date")
+
+    try:
+        missing_dates = await db_tools.get_option_rtj_missing_trade_dates(
+            start_trade_date.strftime("%Y-%m-%d"),
+            end_trade_date.strftime("%Y-%m-%d"),
+        )
+        if not missing_dates:
+            print(
+                "option repair-backfill finished, "
+                f"missing_dates=0, inserted_rows=0, start_date={start_trade_date}, end_date={end_trade_date}"
+            )
+            return 0
+
+        total_rows = 0
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=headless)
+            page = await browser.new_page()
+            try:
+                for trade_date in missing_dates:
+                    total_rows += await process_trade_day(
+                        page,
+                        db_tools,
+                        trade_date,
+                        processed=processed,
+                        save_state=True,
+                        swallow_exceptions=True,
+                    )
+            finally:
+                await browser.close()
+
+        print(
+            "option repair-backfill finished, "
+            f"missing_dates={len(missing_dates)}, inserted_rows={total_rows}, "
+            f"start_date={start_trade_date}, end_date={end_trade_date}"
+        )
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
 async def sync_daily(record_failures=False, headless=True, target_date=None):
     _ = record_failures
     trade_date = normalize_trade_date(target_date or normalize_date(datetime.now().date()))
@@ -614,13 +676,23 @@ async def main():
         print(f"option backfill finished, inserted rows: {total_rows}")
         return
 
+    if command == "repair-backfill":
+        if len(sys.argv) == 2:
+            total_rows = await repair_backfill(headless=True)
+        elif len(sys.argv) == 3:
+            total_rows = await repair_backfill(headless=True, start_date=sys.argv[2].strip(), end_date=sys.argv[2].strip())
+        else:
+            total_rows = await repair_backfill(headless=True, start_date=sys.argv[2].strip(), end_date=sys.argv[3].strip())
+        print(f"option repair-backfill finished, inserted rows: {total_rows}")
+        return
+
     if command == "daily":
         target_date = sys.argv[2].strip() if len(sys.argv) > 2 else None
         total_rows = await sync_daily(record_failures=False, headless=True, target_date=target_date)
         print(f"option daily finished, inserted rows: {total_rows}")
         return
 
-    raise ValueError("supported commands: backfill [end_date], daily [target_date]")
+    raise ValueError("supported commands: backfill [end_date], repair-backfill [date|start_date end_date], daily [target_date]")
 
 
 if __name__ == "__main__":
