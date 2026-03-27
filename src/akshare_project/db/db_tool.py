@@ -94,6 +94,84 @@ class DbTools:
         sanitized['date'] = str(update.get('date', ''))
         return sanitized
 
+    def _serialize_json_field(self, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _sanitize_stock_info_all_row(self, row):
+        sanitized = dict(row)
+        sanitized['stock_code'] = str(row.get('stock_code', '')).strip()
+        sanitized['prefixed_code'] = str(row.get('prefixed_code', '')).strip().lower()
+        sanitized['exchange'] = str(row.get('exchange', '')).strip().upper() or None
+        sanitized['market_prefix'] = str(row.get('market_prefix', '')).strip().lower() or None
+        sanitized['board'] = str(row.get('board', '')).strip() or None
+        sanitized['security_type'] = str(row.get('security_type', '')).strip().upper() or None
+        sanitized['stock_name'] = str(row.get('stock_name', '')).strip() or None
+        sanitized['security_full_name'] = str(row.get('security_full_name', '')).strip() or None
+        sanitized['company_abbr'] = str(row.get('company_abbr', '')).strip() or None
+        sanitized['company_full_name'] = str(row.get('company_full_name', '')).strip() or None
+        list_date = row.get('list_date')
+        sanitized['list_date'] = str(list_date).split(' ')[0].strip() if list_date else None
+        sanitized['industry'] = str(row.get('industry', '')).strip() or None
+        sanitized['region'] = str(row.get('region', '')).strip() or None
+        sanitized['total_share_capital'] = self._normalize_numeric('total_share_capital', row.get('total_share_capital'))
+        sanitized['circulating_share_capital'] = self._normalize_numeric(
+            'circulating_share_capital',
+            row.get('circulating_share_capital'),
+        )
+        sanitized['source_variants_json'] = self._serialize_json_field(row.get('source_variants_json'))
+        sanitized['raw_records_json'] = self._serialize_json_field(row.get('raw_records_json'))
+        return sanitized
+
+    def _sanitize_stock_daily_data_row(self, row):
+        sanitized = dict(row)
+        sanitized['stock_code'] = str(row.get('stock_code', '')).strip()
+        sanitized['prefixed_code'] = str(row.get('prefixed_code', '')).strip().lower()
+        sanitized['stock_name'] = str(row.get('stock_name', '')).strip() or None
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        for field in [
+            'open_price', 'close_price', 'high_price', 'low_price', 'latest_price',
+            'pre_close_price', 'buy_price', 'sell_price', 'price_change_amount',
+            'price_change_rate', 'volume', 'turnover_amount'
+        ]:
+            sanitized[field] = self._normalize_numeric(field, row.get(field))
+
+        snapshot_time = row.get('snapshot_time')
+        if hasattr(snapshot_time, 'to_pydatetime'):
+            snapshot_time = snapshot_time.to_pydatetime()
+        if hasattr(snapshot_time, 'tzinfo') and getattr(snapshot_time, 'tzinfo', None) is not None:
+            snapshot_time = snapshot_time.replace(tzinfo=None)
+        sanitized['snapshot_time'] = snapshot_time or None
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'stock_zh_a_spot'
+        return sanitized
+
+    def _sanitize_stock_qfq_daily_row(self, row):
+        sanitized = dict(row)
+        sanitized['stock_code'] = str(row.get('stock_code', '')).strip()
+        sanitized['prefixed_code'] = str(row.get('prefixed_code', '')).strip().lower()
+        sanitized['stock_name'] = str(row.get('stock_name', '')).strip() or None
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['open_price'] = self._normalize_numeric('open_price', row.get('open_price'))
+        sanitized['close_price'] = self._normalize_numeric('close_price', row.get('close_price'))
+        sanitized['high_price'] = self._normalize_numeric('high_price', row.get('high_price'))
+        sanitized['low_price'] = self._normalize_numeric('low_price', row.get('low_price'))
+        sanitized['volume'] = self._normalize_numeric('volume', row.get('volume'))
+        sanitized['turnover_amount'] = self._normalize_numeric('turnover_amount', row.get('turnover_amount'))
+        sanitized['outstanding_share'] = self._normalize_numeric('outstanding_share', row.get('outstanding_share'))
+        sanitized['turnover_rate'] = self._normalize_numeric('turnover_rate', row.get('turnover_rate'))
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'stock_zh_a_daily_qfq'
+        request_start_date = row.get('request_start_date')
+        request_end_date = row.get('request_end_date')
+        sanitized['request_start_date'] = str(request_start_date).split(' ')[0].strip() if request_start_date else None
+        sanitized['request_end_date'] = str(request_end_date).split(' ')[0].strip() if request_end_date else None
+        sanitized['refresh_batch_id'] = str(row.get('refresh_batch_id', '')).strip() or None
+        return sanitized
+
     def _sanitize_index_daily_update(self, update):
         sanitized = dict(update)
         for field in [
@@ -339,6 +417,312 @@ class DbTools:
         self.pool.close()
         await self.pool.wait_closed()
         self.pool = None
+
+    async def upsert_stock_info_all(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_stock_info_all_row(row) for row in rows]
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['stock_code'] and row['prefixed_code']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped = {}
+        for row in sanitized_rows:
+            deduped[row['prefixed_code']] = row
+        sanitized_rows = list(deduped.values())
+
+        values = [
+            (
+                row['stock_code'],
+                row['prefixed_code'],
+                row['exchange'],
+                row['market_prefix'],
+                row['board'],
+                row['security_type'],
+                row['stock_name'],
+                row['security_full_name'],
+                row['company_abbr'],
+                row['company_full_name'],
+                row['list_date'],
+                row['industry'],
+                row['region'],
+                row['total_share_capital'],
+                row['circulating_share_capital'],
+                row['source_variants_json'],
+                row['raw_records_json'],
+            )
+            for row in sanitized_rows
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                INSERT INTO stock_info_all (
+                    stock_code,
+                    prefixed_code,
+                    exchange,
+                    market_prefix,
+                    board,
+                    security_type,
+                    stock_name,
+                    security_full_name,
+                    company_abbr,
+                    company_full_name,
+                    list_date,
+                    industry,
+                    region,
+                    total_share_capital,
+                    circulating_share_capital,
+                    source_variants_json,
+                    raw_records_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    stock_code = VALUES(stock_code),
+                    exchange = VALUES(exchange),
+                    market_prefix = VALUES(market_prefix),
+                    board = VALUES(board),
+                    security_type = VALUES(security_type),
+                    stock_name = VALUES(stock_name),
+                    security_full_name = VALUES(security_full_name),
+                    company_abbr = VALUES(company_abbr),
+                    company_full_name = VALUES(company_full_name),
+                    list_date = VALUES(list_date),
+                    industry = VALUES(industry),
+                    region = VALUES(region),
+                    total_share_capital = VALUES(total_share_capital),
+                    circulating_share_capital = VALUES(circulating_share_capital),
+                    source_variants_json = VALUES(source_variants_json),
+                    raw_records_json = VALUES(raw_records_json),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def get_stock_info_rows_by_codes(self, stock_codes):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_codes = [
+            str(stock_code).strip()
+            for stock_code in (stock_codes or [])
+            if str(stock_code).strip()
+        ]
+        if not normalized_codes:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_codes))
+        query = (
+            f"SELECT stock_code, prefixed_code, exchange, market_prefix, board, security_type, "
+            f"stock_name, security_full_name, company_abbr, company_full_name, list_date, "
+            f"industry, region, total_share_capital, circulating_share_capital "
+            f"FROM stock_info_all WHERE stock_code IN ({placeholders}) ORDER BY stock_code ASC"
+        )
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, normalized_codes)
+                return list(await cursor.fetchall())
+
+    async def upsert_stock_daily_data(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_stock_daily_data_row(row) for row in rows]
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['stock_code'] and row['prefixed_code'] and row['trade_date']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped = {}
+        for row in sanitized_rows:
+            deduped[(row['prefixed_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped.values())
+
+        values = [
+            (
+                row['stock_code'],
+                row['prefixed_code'],
+                row['stock_name'],
+                row['trade_date'],
+                row['open_price'],
+                row['close_price'],
+                row['high_price'],
+                row['low_price'],
+                row['latest_price'],
+                row['pre_close_price'],
+                row['buy_price'],
+                row['sell_price'],
+                row['price_change_amount'],
+                row['price_change_rate'],
+                row['volume'],
+                row['turnover_amount'],
+                row['data_source'],
+                row['snapshot_time'],
+            )
+            for row in sanitized_rows
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                INSERT INTO stock_daily_data (
+                    stock_code,
+                    prefixed_code,
+                    stock_name,
+                    trade_date,
+                    open_price,
+                    close_price,
+                    high_price,
+                    low_price,
+                    latest_price,
+                    pre_close_price,
+                    buy_price,
+                    sell_price,
+                    price_change_amount,
+                    price_change_rate,
+                    volume,
+                    turnover_amount,
+                    data_source,
+                    snapshot_time
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    stock_code = VALUES(stock_code),
+                    stock_name = VALUES(stock_name),
+                    open_price = VALUES(open_price),
+                    close_price = VALUES(close_price),
+                    high_price = VALUES(high_price),
+                    low_price = VALUES(low_price),
+                    latest_price = VALUES(latest_price),
+                    pre_close_price = VALUES(pre_close_price),
+                    buy_price = VALUES(buy_price),
+                    sell_price = VALUES(sell_price),
+                    price_change_amount = VALUES(price_change_amount),
+                    price_change_rate = VALUES(price_change_rate),
+                    volume = VALUES(volume),
+                    turnover_amount = VALUES(turnover_amount),
+                    data_source = VALUES(data_source),
+                    snapshot_time = VALUES(snapshot_time),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def get_stock_qfq_request_window(self, prefixed_code):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_prefixed_code = str(prefixed_code or '').strip().lower()
+        if not normalized_prefixed_code:
+            return None
+
+        query = """
+        SELECT prefixed_code, request_start_date, request_end_date, refresh_batch_id
+        FROM stock_qfq_daily_data
+        WHERE prefixed_code = %s
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, (normalized_prefixed_code,))
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'prefixed_code': row.get('prefixed_code'),
+                    'request_start_date': str(row.get('request_start_date')).split(' ')[0] if row.get('request_start_date') else None,
+                    'request_end_date': str(row.get('request_end_date')).split(' ')[0] if row.get('request_end_date') else None,
+                    'refresh_batch_id': row.get('refresh_batch_id'),
+                }
+
+    async def replace_stock_qfq_daily_data(self, prefixed_code, rows):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_prefixed_code = str(prefixed_code or '').strip().lower()
+        sanitized_rows = [self._sanitize_stock_qfq_daily_row(row) for row in rows]
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['stock_code'] and row['prefixed_code'] == normalized_prefixed_code and row['trade_date']
+        ]
+        if not normalized_prefixed_code:
+            return 0, 0
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM stock_qfq_daily_data WHERE prefixed_code = %s",
+                    (normalized_prefixed_code,),
+                )
+                deleted_rows = int((await cursor.fetchone())[0] or 0)
+                await cursor.execute(
+                    "DELETE FROM stock_qfq_daily_data WHERE prefixed_code = %s",
+                    (normalized_prefixed_code,),
+                )
+
+                written_rows = 0
+                if sanitized_rows:
+                    values = [
+                        (
+                            row['stock_code'],
+                            row['prefixed_code'],
+                            row['stock_name'],
+                            row['trade_date'],
+                            row['open_price'],
+                            row['close_price'],
+                            row['high_price'],
+                            row['low_price'],
+                            row['volume'],
+                            row['turnover_amount'],
+                            row['outstanding_share'],
+                            row['turnover_rate'],
+                            row['data_source'],
+                            row['request_start_date'],
+                            row['request_end_date'],
+                            row['refresh_batch_id'],
+                        )
+                        for row in sanitized_rows
+                    ]
+                    query = """
+                    INSERT INTO stock_qfq_daily_data (
+                        stock_code,
+                        prefixed_code,
+                        stock_name,
+                        trade_date,
+                        open_price,
+                        close_price,
+                        high_price,
+                        low_price,
+                        volume,
+                        turnover_amount,
+                        outstanding_share,
+                        turnover_rate,
+                        data_source,
+                        request_start_date,
+                        request_end_date,
+                        refresh_batch_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    await cursor.executemany(query, values)
+                    written_rows = len(values)
+
+                await conn.commit()
+                return deleted_rows, written_rows
 
     async def batch_stock_info(self, updates):
         if not updates:

@@ -1,93 +1,31 @@
 import asyncio
 import json
-import os
-import random
+import re
 import sys
-import time
-from http.client import RemoteDisconnected
-from datetime import datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta
 
 import akshare as ak
 import pandas as pd
-import requests
 
 from akshare_project.core.ak_scheduler_client import SchedulerContext
 from akshare_project.core.logging_utils import echo_and_log, get_logger
-from akshare_project.core.paths import get_input_path
-from akshare_project.core.progress import ProgressStore
 from akshare_project.core.retry import fetch_with_retry as shared_fetch_with_retry
 from akshare_project.db.db_tool import DbTools
 
 API_RETRY_COUNT = 5
 API_RETRY_SLEEP_SECONDS = 3
-MAX_CONCURRENCY = 8
-STOCK_HISTORY_MAX_CONCURRENCY = 3
-RETRY_SLEEP_CAP_SECONDS = 30
-REQUEST_JITTER_MAX_SECONDS = 1.5
-STOCK_BATCH_SIZE = 100
-STOCK_BATCH_PAUSE_MIN_SECONDS = 20
-STOCK_BATCH_PAUSE_MAX_SECONDS = 40
-DEFAULT_STOCK_HISTORY_START_DATE = '19900101'
+HISTORY_FALLBACK_START_DATE = date(1991, 1, 1)
+MAX_HISTORY_CONCURRENCY = 8
 
-STOCK_MISSING_DATE_TASK_NAME = 'stock_missing_date_backfill'
-LOGGER = get_logger('stock')
-PROGRESS_STORE = ProgressStore('stock')
+LOGGER = get_logger("stock")
 
-COL_CODE = '\u4ee3\u7801'
-COL_NAME = '\u540d\u79f0'
-COL_DATE = '\u65e5\u671f'
-COL_OPEN = '\u5f00\u76d8'
-COL_CLOSE = '\u6536\u76d8'
-COL_LATEST = '\u6700\u65b0\u4ef7'
-COL_HIGH = '\u6700\u9ad8'
-COL_LOW = '\u6700\u4f4e'
-COL_SPOT_OPEN = '\u4eca\u5f00'
-COL_VOLUME = '\u6210\u4ea4\u91cf'
-COL_AMOUNT = '\u6210\u4ea4\u989d'
-COL_AMPLITUDE = '\u632f\u5e45'
-COL_CHANGE_RATE = '\u6da8\u8dcc\u5e45'
-COL_CHANGE_AMOUNT = '\u6da8\u8dcc\u989d'
-COL_TURNOVER_RATE = '\u6362\u624b\u7387'
-COL_PE_TTM = '\u5e02\u76c8\u7387-\u52a8\u6001'
-COL_PB = '\u5e02\u51c0\u7387'
-COL_TOTAL_MARKET_VALUE = '\u603b\u5e02\u503c'
-COL_CIRCULATING_MARKET_VALUE = '\u6d41\u901a\u5e02\u503c'
-LISTING_DATE_ITEM = '\u4e0a\u5e02\u65f6\u95f4'
-HISTORY_COL_STOCK_CODE = '\u80a1\u7968\u4ee3\u7801'
+SH_SOURCES = ["主板A股", "主板B股", "科创板"]
+SZ_SOURCES = ["A股列表", "B股列表", "CDR列表", "AB股列表"]
 
 
 def print(*args, **kwargs):
     echo_and_log(LOGGER, *args, **kwargs)
-
-
-def normalize_stock_code(stock_code):
-    code = str(stock_code or '').strip()
-    if '.' in code:
-        code = code.split('.')[0]
-    code = ''.join(ch for ch in code if ch.isdigit())
-    if not code:
-        return ''
-    return code.zfill(6)
-
-
-def save_progress_batch(progress_lines):
-    PROGRESS_STORE.append_lines(progress_lines)
-
-
-def load_progress():
-    return PROGRESS_STORE.load()
-
-
-def log_error(stock_code, trade_date, error_message):
-    LOGGER.error('%s,%s,%s', stock_code, trade_date, error_message)
-
-
-def classify_fetch_error(exc):
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, RemoteDisconnected)):
-        return 'network'
-    if isinstance(exc, ValueError):
-        return 'data'
-    return 'unexpected'
 
 
 def fetch_with_retry(
@@ -106,10 +44,6 @@ def fetch_with_retry(
         retries=retries,
         sleep_seconds=sleep_seconds,
         logger=LOGGER,
-        classify_error=classify_fetch_error,
-        sleep_cap_seconds=RETRY_SLEEP_CAP_SECONDS,
-        jitter_max_seconds=REQUEST_JITTER_MAX_SECONDS,
-        backoff='exponential',
         scheduler_context=scheduler_context,
         return_scheduler_meta=return_scheduler_meta,
         caller_name=LOGGER.name,
@@ -118,540 +52,734 @@ def fetch_with_retry(
     )
 
 
-def throttle_stock_request():
-    time.sleep(random.uniform(0.2, REQUEST_JITTER_MAX_SECONDS))
+def json_safe(value):
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
-def get_stock_history_start_date(stock_code, return_scheduler_meta=False):
-    throttle_stock_request()
+def normalize_stock_code(value):
+    matched = re.search(r"(\d{6})", str(value or ""))
+    return matched.group(1) if matched else ""
+
+
+def infer_market_prefix(stock_code):
+    code = normalize_stock_code(stock_code)
+    if not code:
+        return ""
+    if code.startswith(("4", "8")):
+        return "bj"
+    if code.startswith(("5", "6", "9")):
+        return "sh"
+    return "sz"
+
+
+def build_prefixed_code(stock_code, market_prefix=None):
+    code = normalize_stock_code(stock_code)
+    if not code:
+        return ""
+    prefix = str(market_prefix or "").strip().lower() or infer_market_prefix(code)
+    return f"{prefix}{code}" if prefix else ""
+
+
+def normalize_prefixed_code(value):
+    text = str(value or "").strip().lower()
+    matched = re.search(r"(sh|sz|bj)(\d{6})$", text)
+    if matched:
+        return f"{matched.group(1)}{matched.group(2)}"
+    return build_prefixed_code(text)
+
+
+def normalize_text(value):
+    if value is None or (hasattr(pd, "isna") and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def normalize_numeric(value):
+    if value is None or (hasattr(pd, "isna") and pd.isna(value)):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
     try:
-        info_result = fetch_with_retry(
-            ak.stock_individual_info_em,
-            symbol=stock_code,
-            return_scheduler_meta=return_scheduler_meta,
-        )
-        info_df = info_result.value if return_scheduler_meta else info_result
-        listing_date_series = info_df.loc[info_df['item'] == LISTING_DATE_ITEM, 'value']
-        if listing_date_series.empty:
-            raise ValueError(f'listing date not found for {stock_code}')
-        listing_date = str(listing_date_series.values[0])
-        if return_scheduler_meta:
-            return listing_date, info_result
-        return listing_date
-    except Exception as exc:
-        error_category = classify_fetch_error(exc)
-        print(
-            f'stock_individual_info_em fallback for {stock_code} '
-            f'[{error_category}]: {exc}; using {DEFAULT_STOCK_HISTORY_START_DATE}'
-        )
-        if return_scheduler_meta:
-            return DEFAULT_STOCK_HISTORY_START_DATE, None
-        return DEFAULT_STOCK_HISTORY_START_DATE
-
-
-def get_stock_history(stock_code, end_date):
-    listing_date, info_result = get_stock_history_start_date(stock_code, return_scheduler_meta=True)
-    scheduler_context = None
-    if info_result is not None:
-        scheduler_context = SchedulerContext(
-            parent_job_id=info_result.job_id,
-            root_job_id=info_result.root_job_id,
-            workflow_name=f'stock:{stock_code}:history',
-        )
-
-    return fetch_with_retry(
-        ak.stock_zh_a_hist,
-        symbol=stock_code,
-        period='daily',
-        start_date=listing_date,
-        end_date=end_date,
-        adjust='hfq',
-        scheduler_context=scheduler_context,
-    )
-
-
-def get_stock_spot():
-    return fetch_with_retry(ak.stock_zh_a_spot_em)
-
-
-def get_stock_history_by_range(stock_code, start_date, end_date):
-    throttle_stock_request()
-    return fetch_with_retry(
-        ak.stock_zh_a_hist,
-        symbol=stock_code,
-        period='daily',
-        start_date=start_date,
-        end_date=end_date,
-        adjust='hfq',
-    )
-
-
-def build_basic_rows_from_spot(spot_df):
-    rows = []
-    for _, row in spot_df.iterrows():
-        stock_code = normalize_stock_code(row.get(COL_CODE))
-        if not stock_code:
-            continue
-        rows.append({
-            'stock_code': stock_code,
-            'stock_name': str(row.get(COL_NAME, '')).strip(),
-        })
-    return rows
-
-
-def build_valuation_rows_from_spot(spot_df):
-    rows = []
-    for _, row in spot_df.iterrows():
-        stock_code = normalize_stock_code(row.get(COL_CODE))
-        if not stock_code:
-            continue
-        rows.append({
-            'stock_code': stock_code,
-            'pe_ttm': row.get(COL_PE_TTM),
-            'pb': row.get(COL_PB),
-            'total_market_value': row.get(COL_TOTAL_MARKET_VALUE),
-            'circulating_market_value': row.get(COL_CIRCULATING_MARKET_VALUE),
-        })
-    return rows
-
-
-def build_stock_daily_rows_from_spot(spot_df, trade_date):
-    rows = []
-    for _, row in spot_df.iterrows():
-        stock_code = normalize_stock_code(row.get(COL_CODE))
-        if not stock_code:
-            continue
-        rows.append({
-            'stock_code': stock_code,
-            'open_price': row.get(COL_SPOT_OPEN),
-            'close_price': row.get(COL_LATEST),
-            'high_price': row.get(COL_HIGH),
-            'low_price': row.get(COL_LOW),
-            'volume': row.get(COL_VOLUME),
-            'turnover': row.get(COL_AMOUNT),
-            'amplitude': row.get(COL_AMPLITUDE),
-            'price_change_rate': row.get(COL_CHANGE_RATE),
-            'price_change_amount': row.get(COL_CHANGE_AMOUNT),
-            'turnover_rate': row.get(COL_TURNOVER_RATE),
-            'date': trade_date,
-        })
-    return rows
-
-
-def build_stock_history_rows(history_df, fallback_stock_code=''):
-    rows = []
-    for _, row in history_df.iterrows():
-        trade_date = str(row.get(COL_DATE))
-        if not trade_date:
-            continue
-        rows.append({
-            'stock_code': normalize_stock_code(row.get(HISTORY_COL_STOCK_CODE, fallback_stock_code)) or fallback_stock_code,
-            'open_price': row.get(COL_OPEN),
-            'close_price': row.get(COL_CLOSE),
-            'high_price': row.get(COL_HIGH),
-            'low_price': row.get(COL_LOW),
-            'volume': row.get(COL_VOLUME),
-            'turnover': row.get(COL_AMOUNT),
-            'amplitude': row.get(COL_AMPLITUDE),
-            'price_change_rate': row.get(COL_CHANGE_RATE),
-            'price_change_amount': row.get(COL_CHANGE_AMOUNT),
-            'turnover_rate': row.get(COL_TURNOVER_RATE),
-            'date': trade_date,
-        })
-    return rows
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_trade_date_text(value):
-    value = str(value or '').strip()
-    if not value:
-        raise ValueError('trade_date is required')
-    return datetime.strptime(value, '%Y-%m-%d').strftime('%Y-%m-%d')
+    if value is None or (hasattr(pd, "isna") and pd.isna(value)):
+        return None
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip().split(" ")[0]
+    if not text:
+        return None
+    text = text.replace("/", "-").replace(".", "-")
+    for pattern in ("%Y-%m-%d", "%Y%m%d", "%Y年%m月%d日"):
+        try:
+            return datetime.strptime(text, pattern).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return text
+
+
+def parse_trade_date(value):
+    normalized = normalize_trade_date_text(value)
+    if not normalized:
+        return None
+    try:
+        return datetime.strptime(normalized, "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def format_ak_date(value):
-    return normalize_trade_date_text(value).replace('-', '')
+    if isinstance(value, str):
+        parsed = parse_trade_date(value)
+        if parsed:
+            value = parsed
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    return str(value or "").replace("-", "")
 
 
-def build_stock_missing_task_key(target_date, stock_code):
-    return f'{target_date}:{normalize_stock_code(stock_code)}'
+def normalize_snapshot_time(value):
+    if value is None or (hasattr(pd, "isna") and pd.isna(value)):
+        return datetime.now()
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+
+    text = str(value).strip()
+    if not text:
+        return datetime.now()
+
+    try:
+        numeric = float(text)
+        if numeric > 1_000_000_000_000:
+            return datetime.fromtimestamp(numeric / 1000.0)
+        if numeric > 1_000_000_000:
+            return datetime.fromtimestamp(numeric)
+    except ValueError:
+        pass
+
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, pattern)
+            if pattern == "%H:%M:%S":
+                now = datetime.now()
+                return now.replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, microsecond=0)
+            return parsed
+        except ValueError:
+            continue
+    return datetime.now()
 
 
-def build_stock_missing_payload(target_date, stock_code):
-    return {
-        'task_name': STOCK_MISSING_DATE_TASK_NAME,
-        'stage': 'daily',
-        'target_date': target_date,
-        'stock_code': normalize_stock_code(stock_code),
-    }
+def pick_first(*values):
+    for value in values:
+        normalized = normalize_text(value)
+        if normalized is not None:
+            return normalized
+    return None
 
 
-def load_stock_items():
-    df = pd.read_csv(get_input_path('allstock_em.csv'), dtype={COL_CODE: str})
-    return json.loads(df.to_json(orient='records'))
-
-
-async def gather_in_stock_batches(items, worker_factory):
-    results = []
-    total = len(items)
-    if total == 0:
-        return results
-
-    for start in range(0, total, STOCK_BATCH_SIZE):
-        batch = items[start:start + STOCK_BATCH_SIZE]
-        results.extend(await asyncio.gather(*[worker_factory(item) for item in batch]))
-
-        processed_count = min(start + STOCK_BATCH_SIZE, total)
-        print(f'stock batch progress: {processed_count}/{total}')
-
-        if processed_count < total:
-            pause_seconds = random.uniform(STOCK_BATCH_PAUSE_MIN_SECONDS, STOCK_BATCH_PAUSE_MAX_SECONDS)
-            print(f'stock batch pause: sleeping {pause_seconds:.1f}s before next batch')
-            await asyncio.sleep(pause_seconds)
-
-    return results
-
-
-async def record_stock_missing_failure(db_tools, target_date, stock_code, error_message):
-    await db_tools.upsert_failed_task({
-        'task_name': STOCK_MISSING_DATE_TASK_NAME,
-        'task_stage': 'daily',
-        'task_key': build_stock_missing_task_key(target_date, stock_code),
-        'payload_json': build_stock_missing_payload(target_date, stock_code),
-        'error_message': error_message,
-    })
-
-
-async def resolve_stock_missing_failure(db_tools, target_date, stock_code):
-    await db_tools.resolve_failed_task_by_identity(
-        STOCK_MISSING_DATE_TASK_NAME,
-        'daily',
-        build_stock_missing_task_key(target_date, stock_code),
+def get_stock_info_sh(symbol, return_scheduler_meta=False):
+    return fetch_with_retry(
+        ak.stock_info_sh_name_code,
+        symbol=symbol,
+        return_scheduler_meta=return_scheduler_meta,
+        request_key=f"stock_info_sh_name_code:{symbol}",
     )
 
 
-async def process_stock_daily_from_history(item, semaphore, end_date):
-    raw_code = item.get(COL_CODE)
-    stock_code = normalize_stock_code(raw_code)
-    if not stock_code:
-        log_error(str(raw_code), 'N/A', 'invalid stock code')
+def get_stock_info_sz(symbol, return_scheduler_meta=False):
+    return fetch_with_retry(
+        ak.stock_info_sz_name_code,
+        symbol=symbol,
+        return_scheduler_meta=return_scheduler_meta,
+        request_key=f"stock_info_sz_name_code:{symbol}",
+    )
+
+
+def get_stock_info_bj(return_scheduler_meta=False):
+    return fetch_with_retry(
+        ak.stock_info_bj_name_code,
+        return_scheduler_meta=return_scheduler_meta,
+        request_key="stock_info_bj_name_code",
+    )
+
+
+def get_stock_spot(return_scheduler_meta=False):
+    return fetch_with_retry(
+        ak.stock_zh_a_spot,
+        return_scheduler_meta=return_scheduler_meta,
+        request_key="stock_zh_a_spot:all",
+    )
+
+
+def get_stock_history_tx(prefixed_code, start_date, end_date, scheduler_context=None):
+    request_key = f"stock_zh_a_hist_tx:{normalize_prefixed_code(prefixed_code)}:{format_ak_date(start_date)}:{format_ak_date(end_date)}"
+    return fetch_with_retry(
+        ak.stock_zh_a_hist_tx,
+        symbol=normalize_prefixed_code(prefixed_code),
+        start_date=format_ak_date(start_date),
+        end_date=format_ak_date(end_date),
+        adjust="",
+        scheduler_context=scheduler_context,
+        request_key=request_key,
+    )
+
+
+def get_stock_qfq_daily(prefixed_code, start_date, end_date):
+    request_key = f"stock_zh_a_daily:{normalize_prefixed_code(prefixed_code)}:{format_ak_date(start_date)}:{format_ak_date(end_date)}:qfq"
+    return fetch_with_retry(
+        ak.stock_zh_a_daily,
+        symbol=normalize_prefixed_code(prefixed_code),
+        start_date=format_ak_date(start_date),
+        end_date=format_ak_date(end_date),
+        adjust="qfq",
+        request_key=request_key,
+    )
+
+
+def build_info_record(
+    stock_code,
+    market_prefix,
+    exchange,
+    board,
+    security_type,
+    stock_name=None,
+    security_full_name=None,
+    company_abbr=None,
+    company_full_name=None,
+    list_date=None,
+    industry=None,
+    region=None,
+    total_share_capital=None,
+    circulating_share_capital=None,
+    source_name=None,
+    raw_record=None,
+):
+    code = normalize_stock_code(stock_code)
+    prefixed_code = build_prefixed_code(code, market_prefix)
+    if not code or not prefixed_code:
         return None
+    return {
+        "stock_code": code,
+        "prefixed_code": prefixed_code,
+        "exchange": exchange,
+        "market_prefix": market_prefix,
+        "board": board,
+        "security_type": security_type,
+        "stock_name": normalize_text(stock_name),
+        "security_full_name": normalize_text(security_full_name),
+        "company_abbr": normalize_text(company_abbr),
+        "company_full_name": normalize_text(company_full_name),
+        "list_date": normalize_trade_date_text(list_date),
+        "industry": normalize_text(industry),
+        "region": normalize_text(region),
+        "total_share_capital": normalize_numeric(total_share_capital),
+        "circulating_share_capital": normalize_numeric(circulating_share_capital),
+        "_source_variant": {
+            "source_name": source_name,
+            "exchange": exchange,
+            "market_prefix": market_prefix,
+            "board": board,
+            "security_type": security_type,
+        },
+        "_raw_record": {
+            "source_name": source_name,
+            "record": json_safe(raw_record or {}),
+        },
+    }
 
-    try:
-        async with semaphore:
-            history_df = await asyncio.to_thread(get_stock_history, stock_code, end_date)
 
-        if history_df is None or history_df.empty:
-            return None
+def build_sh_records(df, symbol):
+    records = []
+    security_type = "B" if "B股" in symbol else "A"
+    for _, row in df.iterrows():
+        record = build_info_record(
+            stock_code=row.get("证券代码"),
+            market_prefix="sh",
+            exchange="SH",
+            board=symbol,
+            security_type=security_type,
+            stock_name=row.get("证券简称"),
+            security_full_name=row.get("证券全称"),
+            company_abbr=row.get("公司简称"),
+            company_full_name=row.get("公司全称"),
+            list_date=row.get("上市日期"),
+            source_name=f"stock_info_sh_name_code:{symbol}",
+            raw_record=row.to_dict(),
+        )
+        if record:
+            records.append(record)
+    return records
 
-        history_rows = build_stock_history_rows(history_df, stock_code)
-        if not history_rows:
-            return None
-        history_rows.sort(key=lambda row: row['date'])
-        return history_rows[-1]
-    except Exception as exc:
-        error_message = f'Error processing daily history for {stock_code}: {exc}'
-        print(error_message)
-        log_error(stock_code, 'N/A', error_message)
+
+def build_sz_variant_record(row, symbol, security_label):
+    code = row.get(f"{security_label}代码")
+    if not normalize_stock_code(code):
         return None
+    security_type = "CDR" if security_label == "CDR" else ("B" if security_label.startswith("B") else "A")
+    return build_info_record(
+        stock_code=code,
+        market_prefix="sz",
+        exchange="SZ",
+        board=pick_first(row.get("板块"), symbol),
+        security_type=security_type,
+        stock_name=row.get(f"{security_label}简称"),
+        list_date=row.get(f"{security_label}上市日期"),
+        industry=row.get("所属行业"),
+        total_share_capital=row.get(f"{security_label}总股本"),
+        circulating_share_capital=row.get(f"{security_label}流通股本"),
+        source_name=f"stock_info_sz_name_code:{symbol}",
+        raw_record=row.to_dict(),
+    )
 
 
-async def sync_daily_from_history():
-    db_tools = DbTools()
-    await db_tools.init_pool()
+def build_sz_records(df, symbol):
+    records = []
+    for _, row in df.iterrows():
+        if symbol == "AB股列表":
+            for security_label in ("A股", "B股"):
+                record = build_sz_variant_record(row, symbol, security_label)
+                if record:
+                    records.append(record)
+            continue
 
-    try:
-        df = pd.read_csv(get_input_path('allstock_em.csv'), dtype={COL_CODE: str})
-        df_data = json.loads(df.to_json(orient='records'))
-        if not df_data:
-            print('No stock codes found in data/input/allstock_em.csv.')
-            return 0
+        if symbol == "A股列表":
+            record = build_sz_variant_record(row, symbol, "A股")
+        elif symbol == "B股列表":
+            record = build_sz_variant_record(row, symbol, "B股")
+        elif symbol == "CDR列表":
+            record = build_sz_variant_record(row, symbol, "CDR")
+        else:
+            record = None
 
-        semaphore = asyncio.Semaphore(STOCK_HISTORY_MAX_CONCURRENCY)
-        end_date = datetime.now().strftime('%Y%m%d')
-        gathered_rows = await gather_in_stock_batches(
-            df_data,
-            lambda item: process_stock_daily_from_history(item, semaphore, end_date),
+        if record:
+            records.append(record)
+            continue
+
+        generic_record = build_info_record(
+            stock_code=pick_first(row.get("证券代码"), row.get("代码"), row.get("股票代码")),
+            market_prefix="sz",
+            exchange="SZ",
+            board=pick_first(row.get("板块"), symbol),
+            security_type="A",
+            stock_name=pick_first(row.get("证券简称"), row.get("简称"), row.get("名称")),
+            list_date=pick_first(row.get("上市日期"), row.get("A股上市日期"), row.get("CDR上市日期")),
+            industry=row.get("所属行业"),
+            total_share_capital=pick_first(row.get("总股本"), row.get("A股总股本")),
+            circulating_share_capital=pick_first(row.get("流通股本"), row.get("A股流通股本")),
+            source_name=f"stock_info_sz_name_code:{symbol}",
+            raw_record=row.to_dict(),
         )
-        daily_rows = [row for row in gathered_rows if row]
-        if not daily_rows:
-            print('No stock history rows fetched for daily sync.')
-            return 0
+        if generic_record:
+            records.append(generic_record)
+    return records
 
-        inserted_rows, updated_rows = await db_tools.upsert_stock_daily_snapshots(daily_rows)
 
-        print(
-            'stock daily finished, '
-            f'stock_data inserted: {inserted_rows}, '
-            f'stock_data updated: {updated_rows}'
+def build_bj_records(df):
+    records = []
+    for _, row in df.iterrows():
+        record = build_info_record(
+            stock_code=row.get("证券代码"),
+            market_prefix="bj",
+            exchange="BJ",
+            board="北交所",
+            security_type="A",
+            stock_name=row.get("证券简称"),
+            list_date=row.get("上市日期"),
+            industry=row.get("所属行业"),
+            region=row.get("地区"),
+            total_share_capital=row.get("总股本"),
+            circulating_share_capital=row.get("流通股本"),
+            source_name="stock_info_bj_name_code",
+            raw_record=row.to_dict(),
         )
-        return inserted_rows + updated_rows
-    finally:
-        await db_tools.close()
+        if record:
+            records.append(record)
+    return records
 
 
-async def sync_daily_from_spot():
-    return await sync_daily_from_history()
+def merge_stock_info_records(records):
+    merged = {}
+    for record in records:
+        prefixed_code = record["prefixed_code"]
+        current = merged.get(prefixed_code)
+        if current is None:
+            merged[prefixed_code] = {
+                "stock_code": record["stock_code"],
+                "prefixed_code": prefixed_code,
+                "exchange": record.get("exchange"),
+                "market_prefix": record.get("market_prefix"),
+                "board": record.get("board"),
+                "security_type": record.get("security_type"),
+                "stock_name": record.get("stock_name"),
+                "security_full_name": record.get("security_full_name"),
+                "company_abbr": record.get("company_abbr"),
+                "company_full_name": record.get("company_full_name"),
+                "list_date": record.get("list_date"),
+                "industry": record.get("industry"),
+                "region": record.get("region"),
+                "total_share_capital": record.get("total_share_capital"),
+                "circulating_share_capital": record.get("circulating_share_capital"),
+                "source_variants_json": [record["_source_variant"]],
+                "raw_records_json": [record["_raw_record"]],
+            }
+            continue
+
+        for field in (
+            "exchange",
+            "market_prefix",
+            "board",
+            "security_type",
+            "stock_name",
+            "security_full_name",
+            "company_abbr",
+            "company_full_name",
+            "list_date",
+            "industry",
+            "region",
+        ):
+            if not current.get(field) and record.get(field):
+                current[field] = record[field]
+
+        for numeric_field in ("total_share_capital", "circulating_share_capital"):
+            if current.get(numeric_field) is None and record.get(numeric_field) is not None:
+                current[numeric_field] = record[numeric_field]
+
+        current["source_variants_json"].append(record["_source_variant"])
+        current["raw_records_json"].append(record["_raw_record"])
+
+    return list(merged.values())
 
 
-async def process_stock_missing_date(stock_code, target_date, db_tools, semaphore, swallow_exceptions=True):
-    stock_code = normalize_stock_code(stock_code)
-    if not stock_code:
-        raise ValueError('invalid stock code')
-
-    target_date_text = normalize_trade_date_text(target_date)
-    target_dt = datetime.strptime(target_date_text, '%Y-%m-%d')
-    start_date = (target_dt - timedelta(days=7)).strftime('%Y%m%d')
-    end_date = target_dt.strftime('%Y%m%d')
-
-    try:
-        async with semaphore:
-            history_df = await asyncio.to_thread(get_stock_history_by_range, stock_code, start_date, end_date)
-
-        if history_df is None or history_df.empty:
-            raise ValueError(f'empty history data for {stock_code}')
-
-        history_rows = build_stock_history_rows(history_df, stock_code)
-        if not history_rows:
-            raise ValueError(f'no parsed history rows for {stock_code}')
-
-        target_rows = [row for row in history_rows if row['date'] == target_date_text]
-        if not target_rows:
-            raise ValueError(f'target trade_date {target_date_text} not found for {stock_code}')
-
-        inserted = await db_tools.batch_stock_info(history_rows)
-        await resolve_stock_missing_failure(db_tools, target_date_text, stock_code)
-        print(f'stock missing-date filled: {stock_code}, trade_date={target_date_text}, inserted={inserted}')
-        return inserted
-    except Exception as exc:
-        await record_stock_missing_failure(db_tools, target_date_text, stock_code, str(exc))
-        error_message = f'{stock_code},{target_date_text},{exc}'
-        print(error_message)
-        log_error(stock_code, target_date_text, str(exc))
-        if swallow_exceptions:
-            return 0
-        raise
+async def load_all_stock_info_records():
+    all_records = []
+    for symbol in SH_SOURCES:
+        df = await asyncio.to_thread(get_stock_info_sh, symbol)
+        all_records.extend(build_sh_records(df, symbol))
+    for symbol in SZ_SOURCES:
+        df = await asyncio.to_thread(get_stock_info_sz, symbol)
+        all_records.extend(build_sz_records(df, symbol))
+    bj_df = await asyncio.to_thread(get_stock_info_bj)
+    all_records.extend(build_bj_records(bj_df))
+    return merge_stock_info_records(all_records)
 
 
-async def process_stock(item, processed, db_tools, semaphore, progress_lock, end_date):
-    raw_code = item.get(COL_CODE)
-    stock_code = normalize_stock_code(raw_code)
-    if not stock_code:
-        log_error(str(raw_code), 'N/A', 'invalid stock code')
-        return
-
-    try:
-        async with semaphore:
-            history_df = await asyncio.to_thread(get_stock_history, stock_code, end_date)
-
-        if history_df is None or history_df.empty:
-            return
-
-        pending_updates = []
-        new_progress_lines = []
-
-        for _, row in history_df.iterrows():
-            trade_date = str(row.get(COL_DATE))
-            progress_key = f'{stock_code},{trade_date}'
-            if progress_key in processed:
-                continue
-
-            pending_updates.append({
-                'stock_code': normalize_stock_code(row.get(HISTORY_COL_STOCK_CODE, stock_code)) or stock_code,
-                'open_price': row.get(COL_OPEN),
-                'close_price': row.get(COL_CLOSE),
-                'high_price': row.get(COL_HIGH),
-                'low_price': row.get(COL_LOW),
-                'volume': row.get(COL_VOLUME),
-                'turnover': row.get(COL_AMOUNT),
-                'amplitude': row.get(COL_AMPLITUDE),
-                'price_change_rate': row.get(COL_CHANGE_RATE),
-                'price_change_amount': row.get(COL_CHANGE_AMOUNT),
-                'turnover_rate': row.get(COL_TURNOVER_RATE),
-                'date': trade_date,
-            })
-            new_progress_lines.append(f'{progress_key}\n')
-
-        if not pending_updates:
-            return
-
-        await db_tools.batch_stock_info(pending_updates)
-
-        async with progress_lock:
-            await asyncio.to_thread(save_progress_batch, new_progress_lines)
-            processed.update(line.strip() for line in new_progress_lines)
-
-    except Exception as exc:
-        error_message = f'Error processing {stock_code}: {exc}'
-        print(error_message)
-        log_error(stock_code, 'N/A', error_message)
+def build_spot_snapshot_rows(spot_df, selected_codes=None):
+    selected = {
+        normalize_stock_code(code)
+        for code in (selected_codes or [])
+        if normalize_stock_code(code)
+    }
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    rows = []
+    for _, row in spot_df.iterrows():
+        stock_code = normalize_stock_code(row.get("代码"))
+        if not stock_code or (selected and stock_code not in selected):
+            continue
+        prefixed_code = build_prefixed_code(stock_code)
+        rows.append({
+            "stock_code": stock_code,
+            "prefixed_code": prefixed_code,
+            "stock_name": normalize_text(row.get("名称")),
+            "trade_date": trade_date,
+            "open_price": row.get("今开"),
+            "close_price": row.get("最新价"),
+            "high_price": row.get("最高"),
+            "low_price": row.get("最低"),
+            "latest_price": row.get("最新价"),
+            "pre_close_price": row.get("昨收"),
+            "buy_price": row.get("买入"),
+            "sell_price": row.get("卖出"),
+            "price_change_amount": row.get("涨跌额"),
+            "price_change_rate": row.get("涨跌幅"),
+            "volume": row.get("成交量"),
+            "turnover_amount": row.get("成交额"),
+            "data_source": "stock_zh_a_spot",
+            "snapshot_time": normalize_snapshot_time(row.get("时间戳")),
+        })
+    return rows
 
 
-async def backfill_history():
-    df_data = load_stock_items()
-    processed = load_progress()
-
-    db_tools = DbTools()
-    await db_tools.init_pool()
-
-    semaphore = asyncio.Semaphore(STOCK_HISTORY_MAX_CONCURRENCY)
-    progress_lock = asyncio.Lock()
-    end_date = datetime.now().strftime('%Y%m%d')
-
-    try:
-        await gather_in_stock_batches(
-            df_data,
-            lambda item: process_stock(item, processed, db_tools, semaphore, progress_lock, end_date),
-        )
-        print('stock history backfill finished.')
-    finally:
-        await db_tools.close()
-
-
-async def backfill_missing_trade_date_once(target_date):
-    target_date = normalize_trade_date_text(target_date)
-    stock_items = load_stock_items()
-    stock_codes = [normalize_stock_code(item.get(COL_CODE)) for item in stock_items]
-    stock_codes = [code for code in stock_codes if code]
-
-    db_tools = DbTools()
-    await db_tools.init_pool()
-    semaphore = asyncio.Semaphore(STOCK_HISTORY_MAX_CONCURRENCY)
-
-    try:
-        existing_codes = await db_tools.get_existing_stock_codes_on_date(target_date, stock_codes)
-        missing_codes = [code for code in stock_codes if code not in existing_codes]
-        if not missing_codes:
-            print(f'No missing stock_code found for {target_date}.')
-            return 0
-
-        results = await gather_in_stock_batches(
-            missing_codes,
-            lambda stock_code: process_stock_missing_date(
-                stock_code,
-                target_date,
-                db_tools,
-                semaphore,
-                swallow_exceptions=True,
-            ),
-        )
-        inserted = sum(results)
-        print(
-            f'stock missing-date backfill finished, '
-            f'trade_date={target_date}, '
-            f'missing_count={len(missing_codes)}, '
-            f'inserted_rows={inserted}'
-        )
-        return inserted
-    finally:
-        await db_tools.close()
+def build_hist_tx_rows(prefixed_code, stock_name, history_df):
+    rows = []
+    stock_code = normalize_stock_code(prefixed_code)
+    for _, row in history_df.iterrows():
+        trade_date = normalize_trade_date_text(row.get("date") or getattr(row, "name", None))
+        if not trade_date:
+            continue
+        rows.append({
+            "stock_code": stock_code,
+            "prefixed_code": normalize_prefixed_code(prefixed_code),
+            "stock_name": stock_name,
+            "trade_date": trade_date,
+            "open_price": row.get("open"),
+            "close_price": row.get("close"),
+            "high_price": row.get("high"),
+            "low_price": row.get("low"),
+            "latest_price": row.get("close"),
+            "pre_close_price": None,
+            "buy_price": None,
+            "sell_price": None,
+            "price_change_amount": None,
+            "price_change_rate": None,
+            "volume": row.get("volume"),
+            "turnover_amount": row.get("amount"),
+            "data_source": "stock_zh_a_hist_tx",
+            "snapshot_time": None,
+        })
+    return rows
 
 
-async def retry_missing_trade_date_failures_once(target_date):
-    target_date = normalize_trade_date_text(target_date)
-    db_tools = DbTools()
-    await db_tools.init_pool()
-    semaphore = asyncio.Semaphore(STOCK_HISTORY_MAX_CONCURRENCY)
-
-    try:
-        failed_tasks = await db_tools.get_pending_failed_tasks(task_name=STOCK_MISSING_DATE_TASK_NAME)
-        failed_tasks = [
-            task for task in failed_tasks
-            if str((task.get('payload') or {}).get('target_date', '')).strip() == target_date
-        ]
-        if not failed_tasks:
-            print(f'No pending stock missing-date failed tasks for {target_date}.')
-            return 0
-
-        total_inserted = 0
-        for failure in failed_tasks:
-            payload = failure.get('payload') or {}
-            stock_code = payload.get('stock_code')
-            try:
-                total_inserted += await process_stock_missing_date(
-                    stock_code,
-                    target_date,
-                    db_tools,
-                    semaphore,
-                    swallow_exceptions=False,
-                )
-                await db_tools.mark_failed_task_retry_result(failure['id'], success=True)
-            except Exception as exc:
-                await db_tools.mark_failed_task_retry_result(failure['id'], success=False, error_message=str(exc))
-
-        print(
-            f'stock missing-date retry round finished, '
-            f'trade_date={target_date}, '
-            f'pending_count={len(failed_tasks)}, '
-            f'inserted_rows={total_inserted}'
-        )
-        return total_inserted
-    finally:
-        await db_tools.close()
+def build_qfq_rows(prefixed_code, stock_name, request_start_date, request_end_date, refresh_batch_id, qfq_df):
+    rows = []
+    stock_code = normalize_stock_code(prefixed_code)
+    normalized_prefixed_code = normalize_prefixed_code(prefixed_code)
+    request_start = normalize_trade_date_text(request_start_date)
+    request_end = normalize_trade_date_text(request_end_date)
+    for _, row in qfq_df.iterrows():
+        trade_date = normalize_trade_date_text(row.get("date") or getattr(row, "name", None))
+        if not trade_date:
+            continue
+        rows.append({
+            "stock_code": stock_code,
+            "prefixed_code": normalized_prefixed_code,
+            "stock_name": stock_name,
+            "trade_date": trade_date,
+            "open_price": row.get("open"),
+            "close_price": row.get("close"),
+            "high_price": row.get("high"),
+            "low_price": row.get("low"),
+            "volume": row.get("volume"),
+            "turnover_amount": row.get("amount"),
+            "outstanding_share": row.get("outstanding_share"),
+            "turnover_rate": row.get("turnover"),
+            "data_source": "stock_zh_a_daily_qfq",
+            "request_start_date": request_start,
+            "request_end_date": request_end,
+            "refresh_batch_id": refresh_batch_id,
+        })
+    return rows
 
 
-async def repair_missing_trade_date_until_complete(target_date):
-    target_date = normalize_trade_date_text(target_date)
-    stock_items = load_stock_items()
-    stock_codes = [normalize_stock_code(item.get(COL_CODE)) for item in stock_items]
-    stock_codes = [code for code in stock_codes if code]
-    round_no = 0
-    total_inserted = 0
-
-    while True:
-        round_no += 1
-        print(f'stock missing-date repair round {round_no} started: trade_date={target_date}')
-        total_inserted += await backfill_missing_trade_date_once(target_date)
-        total_inserted += await retry_missing_trade_date_failures_once(target_date)
-
-        db_tools = DbTools()
+async def sync_stock_info_all(db_tools=None):
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
         await db_tools.init_pool()
-        try:
-            existing_codes = await db_tools.get_existing_stock_codes_on_date(target_date, stock_codes)
-            pending = await db_tools.get_pending_failed_tasks(task_name=STOCK_MISSING_DATE_TASK_NAME)
-            pending = [
-                task for task in pending
-                if str((task.get('payload') or {}).get('target_date', '')).strip() == target_date
-            ]
-        finally:
+    try:
+        merged_rows = await load_all_stock_info_records()
+        affected = await db_tools.upsert_stock_info_all(merged_rows)
+        print(f"stock info synced: rows={len(merged_rows)}, affected={affected}")
+        return merged_rows
+    finally:
+        if own_db:
             await db_tools.close()
 
-        remaining_count = len([code for code in stock_codes if code not in existing_codes])
-        print(
-            f'stock missing-date repair round {round_no} finished, '
-            f'trade_date={target_date}, '
-            f'remaining_missing={remaining_count}, '
-            f'pending_failures={len(pending)}'
+
+async def sync_daily(selected_codes=None, db_tools=None):
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
+        await db_tools.init_pool()
+    try:
+        await sync_stock_info_all(db_tools=db_tools)
+        spot_df = await asyncio.to_thread(get_stock_spot)
+        rows = build_spot_snapshot_rows(spot_df, selected_codes=selected_codes)
+        affected = await db_tools.upsert_stock_daily_data(rows)
+        print(f"stock daily finished: rows={len(rows)}, affected={affected}")
+        return affected
+    finally:
+        if own_db:
+            await db_tools.close()
+
+
+async def _backfill_single_stock(db_tools, stock_row, stock_info_map, end_date, scheduler_context=None, semaphore=None):
+    async with semaphore:
+        stock_code = stock_row["stock_code"]
+        prefixed_code = stock_row["prefixed_code"]
+        stock_name = stock_row.get("stock_name")
+        info_row = stock_info_map.get(stock_code) or stock_info_map.get(prefixed_code)
+        list_date = parse_trade_date((info_row or {}).get("list_date")) or HISTORY_FALLBACK_START_DATE
+        if list_date > end_date:
+            return 0
+
+        history_df = await asyncio.to_thread(
+            get_stock_history_tx,
+            prefixed_code,
+            list_date,
+            end_date,
+            scheduler_context,
         )
+        if history_df is None or history_df.empty:
+            return 0
+        rows = build_hist_tx_rows(prefixed_code, stock_name or (info_row or {}).get("stock_name"), history_df)
+        return await db_tools.upsert_stock_daily_data(rows)
 
-        if remaining_count == 0:
-            print(
-                f'stock missing-date repair completed, '
-                f'trade_date={target_date}, '
-                f'total_inserted={total_inserted}'
+
+async def backfill_history(selected_codes=None, db_tools=None):
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
+        await db_tools.init_pool()
+    try:
+        await sync_stock_info_all(db_tools=db_tools)
+        spot_result = await asyncio.to_thread(get_stock_spot, True)
+        spot_df = spot_result.value
+        universe_rows = build_spot_snapshot_rows(spot_df, selected_codes=selected_codes)
+        if not universe_rows:
+            print("stock backfill finished: no stocks matched current spot universe")
+            return 0
+
+        stock_info_rows = await db_tools.get_stock_info_rows_by_codes([row["stock_code"] for row in universe_rows])
+        stock_info_map = {
+            str(row.get("stock_code", "")).strip(): row
+            for row in stock_info_rows
+        }
+        stock_info_map.update({
+            str(row.get("prefixed_code", "")).strip().lower(): row
+            for row in stock_info_rows
+            if row.get("prefixed_code")
+        })
+
+        scheduler_context = None
+        if getattr(spot_result, "job_id", None):
+            scheduler_context = SchedulerContext(
+                parent_job_id=int(spot_result.job_id),
+                root_job_id=int(spot_result.root_job_id or spot_result.job_id),
+                workflow_name="stock_backfill",
             )
-            return total_inserted
 
-        await asyncio.sleep(API_RETRY_SLEEP_SECONDS)
+        semaphore = asyncio.Semaphore(MAX_HISTORY_CONCURRENCY)
+        end_date = date.today() - timedelta(days=1)
+        tasks = [
+            _backfill_single_stock(
+                db_tools=db_tools,
+                stock_row=row,
+                stock_info_map=stock_info_map,
+                end_date=end_date,
+                scheduler_context=scheduler_context,
+                semaphore=semaphore,
+            )
+            for row in universe_rows
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        affected = 0
+        failed = 0
+        for row, result in zip(universe_rows, results):
+            if isinstance(result, Exception):
+                failed += 1
+                print(f"stock history failed for {row['prefixed_code']}: {result}")
+                continue
+            affected += int(result or 0)
+
+        print(
+            "stock backfill finished: "
+            f"stocks={len(universe_rows)}, affected={affected}, failed={failed}"
+        )
+        return affected
+    finally:
+        if own_db:
+            await db_tools.close()
+
+
+async def collect_qfq_for_request(stock_code, start_date=None, end_date=None, db_tools=None):
+    normalized_code = normalize_stock_code(stock_code)
+    if not normalized_code:
+        raise ValueError("stock_code must be a 6-digit code")
+
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
+        await db_tools.init_pool()
+    try:
+        info_rows = await db_tools.get_stock_info_rows_by_codes([normalized_code])
+        info_row = info_rows[0] if info_rows else {}
+        prefixed_code = normalize_prefixed_code(info_row.get("prefixed_code")) or build_prefixed_code(normalized_code)
+        stock_name = normalize_text(info_row.get("stock_name"))
+        list_date = parse_trade_date(info_row.get("list_date")) or HISTORY_FALLBACK_START_DATE
+
+        request_start = parse_trade_date(start_date) or list_date
+        effective_start = max(request_start, list_date, HISTORY_FALLBACK_START_DATE)
+        effective_end = parse_trade_date(end_date) or date.today()
+        if effective_start > effective_end:
+            raise ValueError("start_date can not be later than end_date")
+
+        existing_window = await db_tools.get_stock_qfq_request_window(prefixed_code)
+        effective_start_text = effective_start.strftime("%Y-%m-%d")
+        effective_end_text = effective_end.strftime("%Y-%m-%d")
+        if (
+            existing_window
+            and existing_window.get("request_start_date") == effective_start_text
+            and existing_window.get("request_end_date") == effective_end_text
+        ):
+            return {
+                "status": "UNCHANGED",
+                "stock_code": normalized_code,
+                "prefixed_code": prefixed_code,
+                "effective_start_date": effective_start_text,
+                "effective_end_date": effective_end_text,
+                "refreshed": False,
+                "unchanged": True,
+                "deleted_rows": 0,
+                "written_rows": 0,
+            }
+
+        qfq_df = await asyncio.to_thread(
+            get_stock_qfq_daily,
+            prefixed_code,
+            effective_start,
+            effective_end,
+        )
+        if qfq_df is None or qfq_df.empty:
+            raise ValueError(f"no qfq data returned for {prefixed_code}")
+
+        refresh_batch_id = uuid.uuid4().hex
+        rows = build_qfq_rows(
+            prefixed_code=prefixed_code,
+            stock_name=stock_name,
+            request_start_date=effective_start_text,
+            request_end_date=effective_end_text,
+            refresh_batch_id=refresh_batch_id,
+            qfq_df=qfq_df,
+        )
+        deleted_rows, written_rows = await db_tools.replace_stock_qfq_daily_data(prefixed_code, rows)
+        return {
+            "status": "SUCCESS",
+            "stock_code": normalized_code,
+            "prefixed_code": prefixed_code,
+            "effective_start_date": effective_start_text,
+            "effective_end_date": effective_end_text,
+            "refreshed": True,
+            "unchanged": False,
+            "deleted_rows": deleted_rows,
+            "written_rows": written_rows,
+        }
+    finally:
+        if own_db:
+            await db_tools.close()
 
 
 async def main():
-    command = sys.argv[1].strip().lower() if len(sys.argv) > 1 else 'backfill'
-    trade_date = sys.argv[2].strip() if len(sys.argv) > 2 else None
+    command = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "backfill"
+    selected_codes = sys.argv[2:]
 
-    if command == 'backfill':
-        await backfill_history()
+    if command == "backfill":
+        await backfill_history(selected_codes=selected_codes or None)
         return
-    if command == 'daily':
-        await sync_daily_from_history()
-        return
-    if command == 'repair-missing-date':
-        if not trade_date:
-            raise ValueError('usage: python main.py repair-missing-date YYYY-MM-DD')
-        await repair_missing_trade_date_until_complete(trade_date)
+    if command == "daily":
+        await sync_daily(selected_codes=selected_codes or None)
         return
 
-    raise ValueError('supported commands: backfill, daily, repair-missing-date')
+    raise ValueError("stock supports: backfill [stock_code ...] | daily [stock_code ...]")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())

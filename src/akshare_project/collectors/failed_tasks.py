@@ -18,7 +18,7 @@ async def dispatch_failed_task(failure):
     payload = failure.get('payload') or {}
 
     if task_name == 'stock_daily':
-        return await stock.sync_daily_from_history()
+        return await stock.sync_daily()
     if task_name == 'index_daily':
         return await index.sync_daily_from_spot()
     if task_name == 'cffex_daily':
@@ -38,10 +38,7 @@ async def dispatch_failed_task(failure):
     if task_name == 'option_missing_date_backfill':
         return 0
     if task_name == 'stock_missing_date_backfill':
-        target_date = payload.get('target_date')
-        if not target_date:
-            raise ValueError('missing target_date for stock_missing_date_backfill')
-        return await stock.retry_missing_trade_date_failures_once(target_date)
+        return 0
 
     raise ValueError(f'unsupported failed task: {task_name}/{task_stage}')
 

@@ -1,74 +1,125 @@
-# 数据库展示对接说明
+# 数据库展示说明
 
-这份文档用于给其他项目快速对接本项目数据库，重点说明：
-- 每类数据在哪张表
-- 关键字段是什么
-- 前端/接口层应该按什么维度展示
+本文档给前端项目、接口项目和报表项目使用，帮助快速理解当前数据库里每类数据应该从哪张表读取、如何区分来源、哪些表已经停更。
 
-## 总览
-
-| 模块 | 表名 | 主展示维度 |
-|---|---|---|
-| 股票基础信息 | `stock_basic_info` | `stock_code` |
-| 股票行情 | `stock_data` | `stock_code + date` |
-| 指数基础信息 | `index_basic_info` | `index_code` |
-| 指数日线 | `index_daily_data` | `index_code + trade_date` |
-| CFFEX 会员排名 | `cffex_member_rankings` | `product_code + contract_code + trade_date + rank_no` |
-| 抖音情绪 | `douyin_index_emotion_daily` | `emotion_date` |
-| Excel 情绪 | `excel_index_emotion_daily` | `emotion_date + index_name` |
-| 外汇基础信息 | `forex_basic_info` | `symbol_code` |
-| 外汇日线 | `forex_daily_data` | `symbol_code + trade_date` |
-| ETF 基础信息 | `etf_basic_info_sina` | `etf_code` |
-| ETF 日线/快照 | `etf_daily_data_sina` | `etf_code + trade_date` |
-| 中金所期货 | `futures_daily_data` | `symbol + trade_date + data_source` |
-| 旧 AK 期权链 | `option_cffex_spot_data` / `option_cffex_daily_data` | 旧历史用途 |
-| 新网页期权日统计 | `option_cffex_rtj_daily_data` | `contract_code + trade_date` |
-| 失败任务 | `daily_task_failures` | `task_name + task_stage + task_key` |
-| AK 调度请求 | `ak_request_jobs` | `id / request_key` |
+## 总表
+| 数据类型 | 表名 | 唯一键/核心键 | 备注 |
+| --- | --- | --- | --- |
+| 股票基础信息 | `stock_info_all` | `prefixed_code` | 新股票主表 |
+| 股票日线/日快照 | `stock_daily_data` | `prefixed_code + trade_date` | 新股票主表 |
+| 股票前复权日线 | `stock_qfq_daily_data` | `prefixed_code + trade_date` | 仅临时服务刷新 |
+| 指数基础信息 | `index_basic_info` | `index_code` | 持续更新 |
+| 指数日线 | `index_daily_data` | `index_code + trade_date + data_source` | 持续更新 |
+| CFFEX 会员排名 | `cffex_member_rankings` | `trade_date + product_code + contract_code + rank_no` | 持续更新 |
+| 外汇基础信息 | `forex_basic_info` | `symbol_code` | 持续更新 |
+| 外汇日线 | `forex_daily_data` | `symbol_code + trade_date` | 持续更新 |
+| ETF 基础信息（新浪） | `etf_basic_info_sina` | `etf_code` | 新链路 |
+| ETF 日线（新浪） | `etf_daily_data_sina` | `etf_code + trade_date` | 新链路 |
+| 期货日线 | `futures_daily_data` | `symbol + trade_date + data_source` | 具体合约和连续共存 |
+| 期权网页日统计 | `option_cffex_rtj_daily_data` | `contract_code + trade_date` | 新链路 |
+| 抖音情绪指标 | `douyin_index_emotion_daily` | `emotion_date` | 持续更新 |
+| Excel 情绪指标 | `excel_index_emotion_daily` | `emotion_date + index_name` | 手工导入 |
+| 失败任务 | `daily_task_failures` | `task_name + task_stage + task_key` | 调度/回补辅助 |
+| AK 调度请求 | `ak_request_jobs` | `id / request_key` | AK 调度服务内部表 |
 
 ## 股票
-
-### `stock_basic_info`
-- 用途：股票搜索、代码名称映射、下拉列表
-- 关键字段：
-  - `stock_code`
+### `stock_info_all`
+- 用途：股票代码、前缀代码、交易所、板块、上市日期以及多来源原始字段归档。
+- 推荐展示：
+  - 股票搜索框
+  - 股票名称和代码映射
+  - 证券基础资料页
+- 核心字段：
+  - `stock_code`：6 位纯代码
+  - `prefixed_code`：`sh/sz/bj + stock_code`
+  - `exchange`
+  - `market_prefix`
+  - `board`
+  - `security_type`
   - `stock_name`
-  - `created_at`
-  - `updated_at`
+  - `security_full_name`
+  - `company_abbr`
+  - `company_full_name`
+  - `list_date`
+  - `industry`
+  - `region`
+  - `total_share_capital`
+  - `circulating_share_capital`
+  - `source_variants_json`
+  - `raw_records_json`
+- 说明：
+  - 该表已经替代旧的 `stock_basic_info`
+  - `source_variants_json` / `raw_records_json` 用于保留三交易所接口的全部来源字段
 
-### `stock_data`
-- 用途：个股 K 线、行情表、估值面板
-- 关键字段：
+### `stock_daily_data`
+- 用途：股票非复权日线和当天快照。
+- 推荐展示：
+  - 股票日 K
+  - 当日行情表
+  - 历史非复权走势
+- 核心字段：
   - `stock_code`
-  - `date`
+  - `prefixed_code`
+  - `stock_name`
+  - `trade_date`
+  - `open_price`
+  - `close_price`
+  - `high_price`
+  - `low_price`
+  - `latest_price`
+  - `pre_close_price`
+  - `buy_price`
+  - `sell_price`
+  - `price_change_amount`
+  - `price_change_rate`
+  - `volume`
+  - `turnover_amount`
+  - `data_source`
+  - `snapshot_time`
+- `data_source` 说明：
+  - `stock_zh_a_spot`：当日快照
+  - `stock_zh_a_hist_tx`：腾讯历史非复权日线
+- 说明：
+  - 该表已经替代旧的 `stock_data`
+  - 若需要当天实时快照，请优先读取 `data_source='stock_zh_a_spot'`
+  - 若需要历史非复权日线，请优先读取 `data_source='stock_zh_a_hist_tx'`
+
+### `stock_qfq_daily_data`
+- 用途：按单只股票临时采集的前复权日线。
+- 推荐展示：
+  - 前复权 K 线
+  - 供另一个项目按需刷新后读取
+- 核心字段：
+  - `stock_code`
+  - `prefixed_code`
+  - `stock_name`
+  - `trade_date`
   - `open_price`
   - `close_price`
   - `high_price`
   - `low_price`
   - `volume`
-  - `turnover`
-  - `amplitude`
-  - `price_change_rate`
-  - `price_change_amount`
+  - `turnover_amount`
+  - `outstanding_share`
   - `turnover_rate`
-  - `pe_ttm`
-  - `pb`
-  - `total_market_value`
-  - `circulating_market_value`
-  - `created_at`
-  - `updated_at`
+  - `data_source`
+  - `request_start_date`
+  - `request_end_date`
+  - `refresh_batch_id`
+- 说明：
+  - 该表只由独立服务 `stock_temp_service.py` 写入
+  - 同一股票如果请求区间变化，会删除旧数据后整表重写
 
 ## 指数
-
 ### `index_basic_info`
-- 关键字段：
+- 核心字段：
   - `index_code`
   - `simple_code`
   - `market`
   - `index_name`
 
 ### `index_daily_data`
-- 关键字段：
+- 核心字段：
   - `index_code`
   - `trade_date`
   - `open_price`
@@ -84,10 +135,9 @@
   - `data_source`
 
 ## CFFEX 会员排名
-
 ### `cffex_member_rankings`
-- 用途：期货会员排名榜、持仓分析
-- 关键字段：
+- 用途：中金所会员排名、持仓变化分析。
+- 核心字段：
   - `product_code`
   - `product_name`
   - `contract_code`
@@ -106,40 +156,14 @@
   - `short_open_interest`
   - `short_change_value`
 
-## 情绪指标
-
-### `douyin_index_emotion_daily`
-- 用途：视频来源情绪指标
-- 关键字段：
-  - `emotion_date`
-  - `hs300_emotion`
-  - `zz500_emotion`
-  - `zz1000_emotion`
-  - `sz50_emotion`
-  - `video_id`
-  - `video_url`
-  - `video_title`
-  - `extraction_status`
-
-### `excel_index_emotion_daily`
-- 用途：稳定展示口径
-- 关键字段：
-  - `emotion_date`
-  - `index_name`
-  - `emotion_value`
-  - `source_file`
-  - `data_source`
-
-## 外汇
-
+## 外汇与美元指数
 ### `forex_basic_info`
-- 关键字段：
+- 核心字段：
   - `symbol_code`
   - `symbol_name`
 
 ### `forex_daily_data`
-- 用途：汇率和美元指数日线
-- 关键字段：
+- 核心字段：
   - `symbol_code`
   - `symbol_name`
   - `trade_date`
@@ -149,61 +173,20 @@
   - `low_price`
   - `amplitude`
   - `data_source`
-  - `created_at`
-  - `updated_at`
+- 说明：
+  - 普通汇率和美元指数共用这张表
 
 ## ETF
-
-### `etf_basic_info`
-- 关键字段：
-  - `etf_code`
-  - `etf_name`
-  - `created_at`
-  - `updated_at`
-
-### `etf_daily_data`
-- 用途：ETF 历史前复权和当日快照
-- 关键字段：
-  - `etf_code`
-  - `etf_name`
-  - `trade_date`
-  - `open_price`
-  - `close_price`
-  - `high_price`
-  - `low_price`
-  - `volume`
-  - `turnover`
-  - `amplitude`
-  - `price_change_rate`
-  - `price_change_amount`
-  - `turnover_rate`
-  - `data_source`
-  - `adjust_type`
-  - `spot_data_date`
-  - `spot_update_time`
-  - `created_at`
-  - `updated_at`
-
-展示建议：
-- `fund_etf_hist_em + adjust_type='qfq'` 适合历史图表
-- `fund_etf_spot_em / fund_etf_spot_ths` 适合当日快照
-
-## 中金所期货
-
-当前正式 ETF 新链路：
-
 ### `etf_basic_info_sina`
-- 用途：ETF 搜索、代码名称映射、保存新浪完整代码
-- 关键字段：
+- 用途：ETF 基础信息。
+- 核心字段：
   - `etf_code`
   - `etf_name`
   - `sina_symbol`
-  - `created_at`
-  - `updated_at`
 
 ### `etf_daily_data_sina`
-- 用途：ETF 历史日线和当日快照
-- 关键字段：
+- 用途：ETF 当日快照和历史日线。
+- 核心字段：
   - `etf_code`
   - `etf_name`
   - `sina_symbol`
@@ -220,17 +203,16 @@
   - `turnover_rate`
   - `pre_close_price`
   - `data_source`
-  - `created_at`
-  - `updated_at`
+- `data_source` 说明：
+  - `fund_etf_category_sina`
+  - `fund_etf_hist_sina`
+- 说明：
+  - 旧表 `etf_basic_info`、`etf_daily_data` 已停止更新
 
-展示建议：
-- `fund_etf_hist_sina` 适合历史图表
-- `fund_etf_category_sina` 适合当日快照
-- 新链路统一读取 `etf_basic_info_sina` / `etf_daily_data_sina`
-- 旧表 `etf_basic_info` / `etf_daily_data` 保留旧数据，但不再更新
-
+## 中金所期货
 ### `futures_daily_data`
-- 关键字段：
+- 用途：具体合约、主连、月连共用一张表。
+- 核心字段：
   - `market`
   - `symbol`
   - `variety`
@@ -245,37 +227,15 @@
   - `settle_price`
   - `pre_settle_price`
   - `data_source`
-
-展示建议：
-- `data_source='get_futures_daily'` 作为普通期货日线
-- `data_source='get_futures_daily_derived'` 作为默认主连/当月连续专题页
-- `data_source='futures_hist_em'` 作为旧连续数据参考
-- 项目默认 `futures backfill` / `futures daily` 现在生成的是 `get_futures_daily` 与 `get_futures_daily_derived`
-
-连续合约派生规则：
-- 只对 `IF / IC / IH / IM` 派生连续数据
-- 主连：
-  - `IFM / ICM / IHM / IMM`
-  - 取同日同品种成交量最大的具体合约
-- 月连：
-  - `IFM0 / ICM0 / IHM0 / IMM0`
-  - 取同日同品种最近到期的具体合约
-  - 比较依据是完整 `YYMM`，可正确处理跨年
+- `data_source` 说明：
+  - `get_futures_daily`：具体合约
+  - `get_futures_daily_derived`：由具体合约派生的主连/月连
+  - `futures_hist_em`：旧连续合约历史口径，保留但默认流程不再新增
 
 ## 中金所期权
-
-### 旧表：`option_cffex_spot_data`
-- 来源：旧 AKShare `spot_sina`
-- 状态：保留历史数据，不再更新
-
-### 旧表：`option_cffex_daily_data`
-- 来源：旧 AKShare `daily_sina`
-- 状态：保留历史数据，不再更新
-
-### 新表：`option_cffex_rtj_daily_data`
-- 来源：中金所日统计页面 [http://www.cffex.com.cn/rtj/](http://www.cffex.com.cn/rtj/)
-- 状态：当前正式期权主展示表
-- 关键字段：
+### `option_cffex_rtj_daily_data`
+- 用途：中金所网页日统计期权数据。
+- 核心字段：
   - `index_type`
   - `index_name`
   - `product_prefix`
@@ -298,38 +258,54 @@
   - `open_interest_change`
   - `data_source`
   - `source_url`
-  - `created_at`
-  - `updated_at`
+- 说明：
+  - 这是当前唯一持续更新的期权表
+  - 旧 AK 期权表 `option_cffex_spot_data`、`option_cffex_daily_data` 保留但停止更新
 
-解析规则：
-- `IO` -> `HS300`
-- `MO` -> `ZZ1000`
-- `HO` -> `SZ50`
-- `-C-` -> `CALL`
-- `-P-` -> `PUT`
+## 情绪指标
+### `douyin_index_emotion_daily`
+- 用途：抖音视频解析后的指数情绪指标。
+- 核心字段：
+  - `emotion_date`
+  - `hs300_emotion`
+  - `zz500_emotion`
+  - `zz1000_emotion`
+  - `sz50_emotion`
+  - `video_id`
+  - `video_url`
+  - `video_title`
+  - `extraction_status`
 
-展示建议：
-- 前端新的期权页面统一读取 `option_cffex_rtj_daily_data`
-- 不再从旧 AK 期权表取新数据
-- 如果历史回补时少数日期失败，可以用 `python run.py option repair-backfill` 按数据库缺失交易日重新抓取
+### `excel_index_emotion_daily`
+- 用途：Excel 导入的稳定版指数情绪指标。
+- 核心字段：
+  - `emotion_date`
+  - `index_name`
+  - `emotion_value`
+  - `source_file`
+  - `data_source`
+- 说明：
+  - 前端如果需要稳定展示情绪指标，优先使用这张表
 
-## Excel / 调度 / 运维表
-
+## 调度与失败恢复
 ### `daily_task_failures`
-- 用途：顶层任务失败记录和人工重试
-- 关键字段：
+- 用途：日更失败、专项补抓失败的数据库级追踪。
+- 核心字段：
   - `task_name`
   - `task_stage`
   - `task_key`
   - `payload_json`
   - `error_message`
-  - `status`
   - `result_status`
+  - `status`
   - `retry_count`
+  - `first_failed_at`
+  - `last_failed_at`
+  - `resolved_at`
 
 ### `ak_request_jobs`
-- 用途：AK 调度服务请求队列
-- 关键字段：
+- 用途：AK scheduler 服务内部队列表。
+- 核心字段：
   - `request_key`
   - `function_name`
   - `source_group`
@@ -340,11 +316,17 @@
   - `root_job_id`
   - `workflow_name`
   - `caller_name`
+  - `error_category`
+  - `error_message`
 
-## 时间字段说明
+## 旧表说明
+以下表当前保留但已停止更新：
 
-项目当前的业务表元数据时间统一采用：
-- `DATETIME`
-- 数据库 session 固定 `+08:00`
+- `stock_basic_info`
+- `stock_data`
+- `etf_basic_info`
+- `etf_daily_data`
+- `option_cffex_spot_data`
+- `option_cffex_daily_data`
 
-因此当前新表的 `created_at / updated_at` 不应再出现 8 小时时差问题。
+如果要做新页面或新接口，请优先接入本文档中说明的新主表。  

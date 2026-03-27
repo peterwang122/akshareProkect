@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 
-from akshare_project.collectors import cffex, etf, forex, futures, index, option
+from akshare_project.collectors import cffex, etf, forex, futures, index, option, stock
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.db.db_tool import DbTools
 
@@ -50,6 +50,7 @@ async def main():
 
     try:
         tasks = [
+            ('stock_daily', stock.sync_daily),
             ('index_daily', index.sync_daily_from_spot),
             ('cffex_daily', lambda: cffex.sync_latest_daily_data(headless=True)),
             ('forex_daily', forex.sync_daily_from_history),
