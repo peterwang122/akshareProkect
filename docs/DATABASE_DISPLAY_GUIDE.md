@@ -10,6 +10,7 @@
 | 股票前复权日线 | `stock_qfq_daily_data` | `prefixed_code + trade_date` | 仅临时服务刷新 |
 | 指数基础信息 | `index_basic_info` | `index_code` | 持续更新 |
 | 指数日线 | `index_daily_data` | `index_code + trade_date + data_source` | 持续更新 |
+| 量化指数看板预计算 | `quant_index_dashboard_daily` | `index_code + trade_date` | 持续更新 |
 | CFFEX 会员排名 | `cffex_member_rankings` | `trade_date + product_code + contract_code + rank_no` | 持续更新 |
 | 外汇基础信息 | `forex_basic_info` | `symbol_code` | 持续更新 |
 | 外汇日线 | `forex_daily_data` | `symbol_code + trade_date` | 持续更新 |
@@ -133,6 +134,31 @@
   - `price_change_amount`
   - `turnover_rate`
   - `data_source`
+
+### `quant_index_dashboard_daily`
+- 用途：给 FIT 指数量化页直接读取的预计算表。
+- 每个交易日固定 5 行：
+  - 上证指数
+  - 上证50
+  - 沪深300
+  - 中证500
+  - 中证1000
+- 核心字段：
+  - `trade_date`
+  - `index_code`
+  - `index_name`
+  - `emotion_value`
+  - `main_basis`
+  - `month_basis`
+  - `breadth_up_count`
+  - `breadth_total_count`
+  - `breadth_up_pct`
+- 口径说明：
+  - 情绪值来自 `excel_index_emotion_daily`
+  - 期现差来自 `futures_daily_data` 与 `index_daily_data`
+  - 涨跌家数来自 `stock_daily_data`
+  - 上证指数的情绪值和期现差按四大核心指数同日平均计算
+  - 5 个指数在同一天共用同一份涨跌家数数据
 
 ## CFFEX 会员排名
 ### `cffex_member_rankings`

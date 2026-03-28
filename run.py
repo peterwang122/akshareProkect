@@ -18,6 +18,7 @@ from akshare_project.collectors import (  # noqa: E402
     futures,
     index,
     option,
+    quant_index,
     runner,
     stock,
 )
@@ -34,7 +35,7 @@ async def dispatch():
     if len(sys.argv) < 3:
         raise ValueError(
             "usage: python run.py <domain> <command> [args]\n"
-            "domains: stock, index, cffex, douyin, forex, futures, etf, option, runner, emotion-excel"
+            "domains: stock, index, quant-index, cffex, douyin, forex, futures, etf, option, runner, emotion-excel"
         )
 
     domain = sys.argv[1].strip().lower()
@@ -48,6 +49,10 @@ async def dispatch():
     if domain == "index":
         set_argv("index", [command, *args])
         await index.main()
+        return
+    if domain == "quant-index":
+        set_argv("quant-index", [command, *args])
+        await quant_index.main()
         return
     if domain == "cffex":
         set_argv("cffex", [command, *args])

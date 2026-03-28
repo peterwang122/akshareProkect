@@ -20,6 +20,13 @@ class SchedulerStore:
         self.db_info = load_db_info()
         self.session_time_zone = str(self.db_info.get("timezone", "+08:00")).strip() or "+08:00"
 
+    @staticmethod
+    def is_lock_contention_error(exc):
+        if not isinstance(exc, pymysql.err.OperationalError):
+            return False
+        error_code = int(exc.args[0]) if exc.args else 0
+        return error_code in {1205, 1213}
+
     @contextmanager
     def connection(self):
         conn = pymysql.connect(
@@ -34,6 +41,9 @@ class SchedulerStore:
             init_command=f"SET time_zone = '{self.session_time_zone}'",
         )
         try:
+            with conn.cursor() as cursor:
+                cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                cursor.execute("SET SESSION innodb_lock_wait_timeout = 3")
             yield conn
             conn.commit()
         except Exception:
@@ -146,76 +156,90 @@ class SchedulerStore:
 
     def recover_stale_jobs(self, lease_seconds):
         now = datetime.now()
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE ak_request_jobs
-                    SET status = 'PENDING',
-                        error_category = NULL,
-                        error_message = NULL,
-                        lease_until = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE status = 'RUNNING'
-                      AND lease_until IS NOT NULL
-                      AND lease_until < %s
-                    """
-                    ,
-                    (now,),
-                )
-                return cursor.rowcount
+        try:
+            with self.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE ak_request_jobs
+                        SET status = 'PENDING',
+                            error_category = NULL,
+                            error_message = NULL,
+                            lease_until = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE status = 'RUNNING'
+                          AND lease_until IS NOT NULL
+                          AND lease_until < %s
+                        """,
+                        (now,),
+                    )
+                    return cursor.rowcount
+        except pymysql.err.OperationalError as exc:
+            if self.is_lock_contention_error(exc):
+                return 0
+            raise
 
     def cleanup_old_results(self, retention_hours):
         threshold = datetime.now() - timedelta(hours=float(retention_hours))
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    DELETE FROM ak_request_jobs
-                    WHERE status IN ('SUCCESS', 'FAILED', 'CANCELLED')
-                      AND finished_at IS NOT NULL
-                      AND finished_at < %s
-                    """,
-                    (threshold,),
-                )
-                return cursor.rowcount
+        try:
+            with self.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        DELETE FROM ak_request_jobs
+                        WHERE status IN ('SUCCESS', 'FAILED', 'CANCELLED')
+                          AND finished_at IS NOT NULL
+                          AND finished_at < %s
+                        """,
+                        (threshold,),
+                    )
+                    return cursor.rowcount
+        except pymysql.err.OperationalError as exc:
+            if self.is_lock_contention_error(exc):
+                return 0
+            raise
 
     def reconcile_waiting_children(self, cancel_on_parent_failure=True):
         changed = 0
         now = datetime.now()
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE ak_request_jobs child
-                    INNER JOIN ak_request_jobs parent ON parent.id = child.parent_job_id
-                    SET child.status = 'PENDING',
-                        child.next_run_at = %s,
-                        child.updated_at = CURRENT_TIMESTAMP
-                    WHERE child.status = 'WAITING_PARENT'
-                      AND parent.status = 'SUCCESS'
-                    """,
-                    (now,),
-                )
-                changed += cursor.rowcount
-
-                if cancel_on_parent_failure:
+        try:
+            with self.connection() as conn:
+                with conn.cursor() as cursor:
                     cursor.execute(
                         """
                         UPDATE ak_request_jobs child
                         INNER JOIN ak_request_jobs parent ON parent.id = child.parent_job_id
-                        SET child.status = 'CANCELLED',
-                            child.error_category = 'parent_failed',
-                            child.error_message = CONCAT('parent job failed: ', parent.id),
-                            child.finished_at = %s,
+                        SET child.status = 'PENDING',
+                            child.next_run_at = %s,
                             child.updated_at = CURRENT_TIMESTAMP
                         WHERE child.status = 'WAITING_PARENT'
-                          AND parent.status IN ('FAILED', 'CANCELLED')
+                          AND parent.status = 'SUCCESS'
                         """,
                         (now,),
                     )
                     changed += cursor.rowcount
-        return changed
+
+                    if cancel_on_parent_failure:
+                        cursor.execute(
+                            """
+                            UPDATE ak_request_jobs child
+                            INNER JOIN ak_request_jobs parent ON parent.id = child.parent_job_id
+                            SET child.status = 'CANCELLED',
+                                child.error_category = 'parent_failed',
+                                child.error_message = CONCAT('parent job failed: ', parent.id),
+                                child.finished_at = %s,
+                                child.updated_at = CURRENT_TIMESTAMP
+                            WHERE child.status = 'WAITING_PARENT'
+                              AND parent.status IN ('FAILED', 'CANCELLED')
+                            """,
+                            (now,),
+                        )
+                        changed += cursor.rowcount
+            return changed
+        except pymysql.err.OperationalError as exc:
+            if self.is_lock_contention_error(exc):
+                return 0
+            raise
 
     def lease_next_job(self, source_group, lease_seconds):
         now = datetime.now()

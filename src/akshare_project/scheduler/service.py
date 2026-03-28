@@ -229,7 +229,7 @@ class SchedulerService:
                     log(f"recovered stale jobs: {recovered}")
             except Exception as exc:
                 log(f"recovery loop failed: {exc}", level="error")
-            self.stop_event.wait(max(5.0, float(self.config.get("poll_interval_seconds", 1.0))))
+            self.stop_event.wait(max(30.0, float(self.config.get("poll_interval_seconds", 1.0))))
 
     def cleanup_loop(self):
         while not self.stop_event.is_set():
@@ -251,7 +251,7 @@ class SchedulerService:
                     log(f"reconciled waiting children: {changed}")
             except Exception as exc:
                 log(f"reconcile loop failed: {exc}", level="error")
-            self.stop_event.wait(max(1.0, float(self.config.get("poll_interval_seconds", 1.0))))
+            self.stop_event.wait(max(5.0, float(self.config.get("poll_interval_seconds", 1.0))))
 
     def wait_for_rate_limit(self, source_group, policy):
         last_dispatch_at = self.state.get_source_state(source_group).get("last_dispatch_at")

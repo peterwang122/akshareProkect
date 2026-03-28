@@ -10,6 +10,7 @@
 - ETF
 - 中金所期货
 - 中金所期权网页日统计
+- 量化指数看板预计算
 - 抖音情绪指标
 - Excel 情绪指标导入
 
@@ -127,6 +128,31 @@ python stock_temp_service.py health
 python run.py index backfill
 python run.py index daily
 ```
+
+### 量化指数看板预计算
+- 用途：为 FIT 指数量化页预计算情绪、期现差、涨跌家数
+- 来源：
+  - `index_daily_data`
+  - `excel_index_emotion_daily`
+  - `futures_daily_data`
+  - `stock_daily_data`
+- 写入表：
+  - `quant_index_dashboard_daily`
+- 命令：
+```bash
+python run.py quant-index backfill
+python run.py quant-index daily
+```
+- 说明：
+  - 固定落 5 个指数：
+    - 上证指数
+    - 上证50
+    - 沪深300
+    - 中证500
+    - 中证1000
+  - 上证指数的情绪值和期现差按四大核心指数同日平均计算
+  - 涨跌家数 5 个指数共用同一份值
+  - `index_code` 按 FIT 当前 `/stocks/indexes/options` 口径对齐
 
 ### CFFEX 会员排名
 - 用途：中金所持仓排名
@@ -267,6 +293,7 @@ python run.py runner daily
 - 期货 `futures_daily`
 - ETF `etf_daily`
 - 期权 `option_daily`
+- 量化指数看板 `quant_index_daily`
 
 当前不包含：
 
@@ -319,6 +346,7 @@ python stock_temp_service.py health
 
 - [sql/stock_tables.sql](C:\Users\Administrator\PycharmProjects\akshareProkect\sql\stock_tables.sql)
 - [sql/index_tables.sql](C:\Users\Administrator\PycharmProjects\akshareProkect\sql\index_tables.sql)
+- [sql/quant_index_tables.sql](C:\Users\Administrator\PycharmProjects\akshareProkect\sql\quant_index_tables.sql)
 - [sql/cffex_tables.sql](C:\Users\Administrator\PycharmProjects\akshareProkect\sql\cffex_tables.sql)
 - [sql/forex_tables.sql](C:\Users\Administrator\PycharmProjects\akshareProkect\sql\forex_tables.sql)
 - [sql/etf_tables.sql](C:\Users\Administrator\PycharmProjects\akshareProkect\sql\etf_tables.sql)

@@ -4,12 +4,14 @@ import re
 import sys
 import uuid
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import akshare as ak
 import pandas as pd
 
 from akshare_project.core.ak_scheduler_client import SchedulerContext
 from akshare_project.core.logging_utils import echo_and_log, get_logger
+from akshare_project.core.paths import get_state_path
 from akshare_project.core.retry import fetch_with_retry as shared_fetch_with_retry
 from akshare_project.db.db_tool import DbTools
 
@@ -19,6 +21,7 @@ HISTORY_FALLBACK_START_DATE = date(1991, 1, 1)
 MAX_HISTORY_CONCURRENCY = 8
 
 LOGGER = get_logger("stock")
+STOCK_INFO_SYNC_STATE_PATH = get_state_path("stock_info_all", suffix="daily-sync")
 
 SH_SOURCES = ["主板A股", "主板B股", "科创板"]
 SZ_SOURCES = ["A股列表", "B股列表", "CDR列表", "AB股列表"]
@@ -65,6 +68,8 @@ def infer_market_prefix(stock_code):
     code = normalize_stock_code(stock_code)
     if not code:
         return ""
+    if code.startswith("92"):
+        return "bj"
     if code.startswith(("4", "8")):
         return "bj"
     if code.startswith(("5", "6", "9")):
@@ -78,6 +83,28 @@ def build_prefixed_code(stock_code, market_prefix=None):
         return ""
     prefix = str(market_prefix or "").strip().lower() or infer_market_prefix(code)
     return f"{prefix}{code}" if prefix else ""
+
+
+def build_stock_info_map(rows):
+    stock_info_map = {}
+    for row in rows or []:
+        stock_code = normalize_stock_code(row.get("stock_code"))
+        prefixed_code = normalize_prefixed_code(row.get("prefixed_code"))
+        if stock_code:
+            stock_info_map[stock_code] = row
+        if prefixed_code:
+            stock_info_map[prefixed_code] = row
+    return stock_info_map
+
+
+def resolve_prefixed_code(stock_code, stock_info_map=None):
+    normalized_code = normalize_stock_code(stock_code)
+    if stock_info_map:
+        info_row = stock_info_map.get(normalized_code) or stock_info_map.get(normalized_code.lower())
+        prefixed_code = normalize_prefixed_code((info_row or {}).get("prefixed_code"))
+        if prefixed_code:
+            return prefixed_code
+    return build_prefixed_code(normalized_code)
 
 
 def normalize_prefixed_code(value):
@@ -183,6 +210,19 @@ def pick_first(*values):
         if normalized is not None:
             return normalized
     return None
+
+
+def load_stock_info_sync_marker():
+    if not Path(STOCK_INFO_SYNC_STATE_PATH).exists():
+        return None
+    try:
+        return Path(STOCK_INFO_SYNC_STATE_PATH).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def save_stock_info_sync_marker(marker):
+    Path(STOCK_INFO_SYNC_STATE_PATH).write_text(str(marker or "").strip(), encoding="utf-8")
 
 
 def get_stock_info_sh(symbol, return_scheduler_meta=False):
@@ -471,7 +511,7 @@ async def load_all_stock_info_records():
     return merge_stock_info_records(all_records)
 
 
-def build_spot_snapshot_rows(spot_df, selected_codes=None):
+def build_spot_snapshot_rows(spot_df, selected_codes=None, stock_info_map=None):
     selected = {
         normalize_stock_code(code)
         for code in (selected_codes or [])
@@ -483,7 +523,7 @@ def build_spot_snapshot_rows(spot_df, selected_codes=None):
         stock_code = normalize_stock_code(row.get("代码"))
         if not stock_code or (selected and stock_code not in selected):
             continue
-        prefixed_code = build_prefixed_code(stock_code)
+        prefixed_code = resolve_prefixed_code(stock_code, stock_info_map=stock_info_map)
         rows.append({
             "stock_code": stock_code,
             "prefixed_code": prefixed_code,
@@ -568,14 +608,22 @@ def build_qfq_rows(prefixed_code, stock_name, request_start_date, request_end_da
     return rows
 
 
-async def sync_stock_info_all(db_tools=None):
+async def sync_stock_info_all(db_tools=None, force=False):
     own_db = db_tools is None
     db_tools = db_tools or DbTools()
     if own_db:
         await db_tools.init_pool()
     try:
+        today_marker = date.today().strftime("%Y-%m-%d")
+        if not force and load_stock_info_sync_marker() == today_marker:
+            existing_rows = await db_tools.get_all_stock_info_rows()
+            if existing_rows:
+                print(f"stock info already synced today ({today_marker}), skipping refresh")
+                return existing_rows
+
         merged_rows = await load_all_stock_info_records()
         affected = await db_tools.upsert_stock_info_all(merged_rows)
+        save_stock_info_sync_marker(today_marker)
         print(f"stock info synced: rows={len(merged_rows)}, affected={affected}")
         return merged_rows
     finally:
@@ -589,9 +637,10 @@ async def sync_daily(selected_codes=None, db_tools=None):
     if own_db:
         await db_tools.init_pool()
     try:
-        await sync_stock_info_all(db_tools=db_tools)
+        info_rows = await sync_stock_info_all(db_tools=db_tools)
+        stock_info_map = build_stock_info_map(info_rows)
         spot_df = await asyncio.to_thread(get_stock_spot)
-        rows = build_spot_snapshot_rows(spot_df, selected_codes=selected_codes)
+        rows = build_spot_snapshot_rows(spot_df, selected_codes=selected_codes, stock_info_map=stock_info_map)
         affected = await db_tools.upsert_stock_daily_data(rows)
         print(f"stock daily finished: rows={len(rows)}, affected={affected}")
         return affected
@@ -629,24 +678,18 @@ async def backfill_history(selected_codes=None, db_tools=None):
     if own_db:
         await db_tools.init_pool()
     try:
-        await sync_stock_info_all(db_tools=db_tools)
+        info_rows = await sync_stock_info_all(db_tools=db_tools)
         spot_result = await asyncio.to_thread(get_stock_spot, True)
         spot_df = spot_result.value
-        universe_rows = build_spot_snapshot_rows(spot_df, selected_codes=selected_codes)
+        stock_info_map = build_stock_info_map(info_rows)
+        universe_rows = build_spot_snapshot_rows(
+            spot_df,
+            selected_codes=selected_codes,
+            stock_info_map=stock_info_map,
+        )
         if not universe_rows:
             print("stock backfill finished: no stocks matched current spot universe")
             return 0
-
-        stock_info_rows = await db_tools.get_stock_info_rows_by_codes([row["stock_code"] for row in universe_rows])
-        stock_info_map = {
-            str(row.get("stock_code", "")).strip(): row
-            for row in stock_info_rows
-        }
-        stock_info_map.update({
-            str(row.get("prefixed_code", "")).strip().lower(): row
-            for row in stock_info_rows
-            if row.get("prefixed_code")
-        })
 
         scheduler_context = None
         if getattr(spot_result, "job_id", None):

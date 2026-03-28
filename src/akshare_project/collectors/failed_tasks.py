@@ -1,7 +1,7 @@
 import asyncio
 import sys
 
-from akshare_project.collectors import cffex, etf, forex, futures, index, option, stock
+from akshare_project.collectors import cffex, etf, forex, futures, index, option, quant_index, stock
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.db.db_tool import DbTools
 
@@ -35,6 +35,8 @@ async def dispatch_failed_task(failure):
         if task_stage != 'task':
             return 0
         return await option.sync_daily(record_failures=False)
+    if task_name == 'quant_index_daily':
+        return await quant_index.sync_daily()
     if task_name == 'option_missing_date_backfill':
         return 0
     if task_name == 'stock_missing_date_backfill':

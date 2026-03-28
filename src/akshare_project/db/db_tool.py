@@ -54,6 +54,10 @@ class DbTools:
         'pb': 9999999999.9999,
         'total_market_value': 9999999999999999999999.99,
         'circulating_market_value': 9999999999999999999999.99,
+        'emotion_value': 9999999999.9999,
+        'main_basis': 9999999999.9999,
+        'month_basis': 9999999999.9999,
+        'breadth_up_pct': 9999999999.9999,
     }
 
     def __init__(self):
@@ -303,6 +307,19 @@ class DbTools:
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'futures_hist_em'
         return sanitized
 
+    def _sanitize_quant_index_dashboard_row(self, row):
+        sanitized = dict(row)
+        sanitized['trade_date'] = str(row.get('trade_date', '')).strip()
+        sanitized['index_code'] = str(row.get('index_code', '')).strip()
+        sanitized['index_name'] = str(row.get('index_name', '')).strip()
+        sanitized['emotion_value'] = self._normalize_numeric('emotion_value', row.get('emotion_value'))
+        sanitized['main_basis'] = self._normalize_numeric('main_basis', row.get('main_basis'))
+        sanitized['month_basis'] = self._normalize_numeric('month_basis', row.get('month_basis'))
+        sanitized['breadth_up_count'] = int(row.get('breadth_up_count') or 0)
+        sanitized['breadth_total_count'] = int(row.get('breadth_total_count') or 0)
+        sanitized['breadth_up_pct'] = self._normalize_numeric('breadth_up_pct', row.get('breadth_up_pct'))
+        return sanitized
+
     def _sanitize_excel_emotion_row(self, row):
         sanitized = dict(row)
         sanitized['emotion_date'] = str(row.get('emotion_date', '')).strip()
@@ -529,6 +546,36 @@ class DbTools:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, normalized_codes)
+                return list(await cursor.fetchall())
+
+    async def get_all_stock_info_rows(self):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT
+            stock_code,
+            prefixed_code,
+            exchange,
+            market_prefix,
+            board,
+            security_type,
+            stock_name,
+            security_full_name,
+            company_abbr,
+            company_full_name,
+            list_date,
+            industry,
+            region,
+            total_share_capital,
+            circulating_share_capital
+        FROM stock_info_all
+        ORDER BY prefixed_code ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query)
                 return list(await cursor.fetchall())
 
     async def upsert_stock_daily_data(self, rows):
@@ -1923,6 +1970,310 @@ class DbTools:
                 await cursor.executemany(query_upsert, values)
                 await conn.commit()
                 return len(sanitized_updates)
+
+    async def get_index_codes_by_names(self, index_names):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return {}
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT index_name, index_code "
+            f"FROM index_basic_info "
+            f"WHERE index_name IN ({placeholders}) "
+            f"ORDER BY id ASC"
+        )
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, normalized_names)
+                rows = await cursor.fetchall()
+
+        code_by_name = {}
+        for index_name, index_code in rows:
+            normalized_name = str(index_name or '').strip()
+            normalized_code = str(index_code or '').strip()
+            if normalized_name and normalized_code and normalized_name not in code_by_name:
+                code_by_name[normalized_name] = normalized_code
+        return code_by_name
+
+    async def get_latest_quant_index_trade_date(self, index_names):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return None
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT MAX(d.trade_date) "
+            f"FROM index_daily_data d "
+            f"INNER JOIN index_basic_info b ON b.index_code = d.index_code "
+            f"WHERE b.index_name IN ({placeholders})"
+        )
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, normalized_names)
+                row = await cursor.fetchone()
+
+        if not row or row[0] is None:
+            return None
+        return str(row[0]).split(' ')[0]
+
+    async def get_quant_index_dashboard_trade_dates(self, index_names, start_date=None, end_date=None):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT DISTINCT d.trade_date "
+            f"FROM index_daily_data d "
+            f"INNER JOIN index_basic_info b ON b.index_code = d.index_code "
+            f"WHERE b.index_name IN ({placeholders})"
+        )
+        params = [*normalized_names]
+        if start_date:
+            query += " AND d.trade_date >= %s"
+            params.append(str(start_date))
+        if end_date:
+            query += " AND d.trade_date <= %s"
+            params.append(str(end_date))
+        query += " ORDER BY d.trade_date ASC"
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, params)
+                rows = await cursor.fetchall()
+
+        return [str(row[0]).split(' ')[0] for row in rows if row and row[0] is not None]
+
+    async def get_quant_index_dashboard_index_closes(self, index_names, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT b.index_name, d.trade_date, d.close_price "
+            f"FROM index_daily_data d "
+            f"INNER JOIN index_basic_info b ON b.index_code = d.index_code "
+            f"WHERE b.index_name IN ({placeholders}) "
+            f"AND d.trade_date BETWEEN %s AND %s "
+            f"AND d.close_price IS NOT NULL "
+            f"ORDER BY d.trade_date ASC, b.index_name ASC"
+        )
+        params = [*normalized_names, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_emotions(self, index_names, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT emotion_date, index_name, emotion_value "
+            f"FROM excel_index_emotion_daily "
+            f"WHERE index_name IN ({placeholders}) "
+            f"AND emotion_date BETWEEN %s AND %s "
+            f"AND emotion_value IS NOT NULL "
+            f"ORDER BY emotion_date ASC, index_name ASC"
+        )
+        params = [*normalized_names, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_futures_closes(self, symbols, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_symbols = [
+            str(symbol).strip().upper()
+            for symbol in (symbols or [])
+            if str(symbol).strip()
+        ]
+        if not normalized_symbols:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_symbols))
+        query = (
+            f"SELECT trade_date, symbol, close_price, data_source "
+            f"FROM futures_daily_data "
+            f"WHERE symbol IN ({placeholders}) "
+            f"AND trade_date BETWEEN %s AND %s "
+            f"AND data_source IN ('get_futures_daily_derived', 'futures_hist_em') "
+            f"AND close_price IS NOT NULL "
+            f"ORDER BY trade_date ASC, symbol ASC"
+        )
+        params = [*normalized_symbols, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_hist_breadth(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT
+            breadth.trade_date,
+            SUM(CASE WHEN breadth.prev_close IS NOT NULL AND breadth.close_price > breadth.prev_close THEN 1 ELSE 0 END) AS breadth_up_count,
+            SUM(CASE WHEN breadth.prev_close IS NOT NULL AND breadth.close_price IS NOT NULL THEN 1 ELSE 0 END) AS breadth_total_count
+        FROM (
+            SELECT
+                prefixed_code,
+                trade_date,
+                close_price,
+                LAG(close_price) OVER (PARTITION BY prefixed_code ORDER BY trade_date) AS prev_close
+            FROM stock_daily_data
+            WHERE data_source = 'stock_zh_a_hist_tx'
+              AND trade_date <= %s
+        ) breadth
+        WHERE breadth.trade_date BETWEEN %s AND %s
+        GROUP BY breadth.trade_date
+        ORDER BY breadth.trade_date ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(end_date), str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_spot_breadth(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT
+            trade_date,
+            SUM(
+                CASE
+                    WHEN COALESCE(price_change_amount, COALESCE(latest_price, close_price) - pre_close_price) > 0
+                    THEN 1 ELSE 0
+                END
+            ) AS breadth_up_count,
+            SUM(
+                CASE
+                    WHEN price_change_amount IS NOT NULL
+                      OR (COALESCE(latest_price, close_price) IS NOT NULL AND pre_close_price IS NOT NULL)
+                    THEN 1 ELSE 0
+                END
+            ) AS breadth_total_count
+        FROM stock_daily_data
+        WHERE data_source = 'stock_zh_a_spot'
+          AND trade_date BETWEEN %s AND %s
+        GROUP BY trade_date
+        ORDER BY trade_date ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def upsert_quant_index_dashboard_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_quant_index_dashboard_row(row) for row in rows]
+        deduped_rows = {}
+        for row in sanitized_rows:
+            if not (row['trade_date'] and row['index_code'] and row['index_name']):
+                continue
+            deduped_rows[(row['index_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped_rows.values())
+        if not sanitized_rows:
+            return 0
+
+        values = [
+            (
+                row['trade_date'],
+                row['index_code'],
+                row['index_name'],
+                row['emotion_value'] if row['emotion_value'] is not None else 50,
+                row['main_basis'] if row['main_basis'] is not None else 0,
+                row['month_basis'] if row['month_basis'] is not None else 0,
+                row['breadth_up_count'],
+                row['breadth_total_count'],
+                row['breadth_up_pct'] if row['breadth_up_pct'] is not None else 0,
+            )
+            for row in sanitized_rows
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                INSERT INTO quant_index_dashboard_daily (
+                    trade_date,
+                    index_code,
+                    index_name,
+                    emotion_value,
+                    main_basis,
+                    month_basis,
+                    breadth_up_count,
+                    breadth_total_count,
+                    breadth_up_pct
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    index_name = VALUES(index_name),
+                    emotion_value = VALUES(emotion_value),
+                    main_basis = VALUES(main_basis),
+                    month_basis = VALUES(month_basis),
+                    breadth_up_count = VALUES(breadth_up_count),
+                    breadth_total_count = VALUES(breadth_total_count),
+                    breadth_up_pct = VALUES(breadth_up_pct),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
 
     async def batch_futures_daily_data(self, rows):
         if not rows:
