@@ -64,6 +64,7 @@ class DbTools:
         self.db_info = self.load_db_info()
         self.session_time_zone = str(self.db_info.get('timezone', '+08:00')).strip() or '+08:00'
         self.pool = None
+        self._stock_qfq_change_columns_ready = False
 
     def load_db_info(self):
         db_info_path = os.path.join(get_config_dir(), 'db_info.json')
@@ -164,6 +165,8 @@ class DbTools:
         sanitized['close_price'] = self._normalize_numeric('close_price', row.get('close_price'))
         sanitized['high_price'] = self._normalize_numeric('high_price', row.get('high_price'))
         sanitized['low_price'] = self._normalize_numeric('low_price', row.get('low_price'))
+        sanitized['price_change_amount'] = self._normalize_numeric('price_change_amount', row.get('price_change_amount'))
+        sanitized['price_change_rate'] = self._normalize_numeric('price_change_rate', row.get('price_change_rate'))
         sanitized['volume'] = self._normalize_numeric('volume', row.get('volume'))
         sanitized['turnover_amount'] = self._normalize_numeric('turnover_amount', row.get('turnover_amount'))
         sanitized['outstanding_share'] = self._normalize_numeric('outstanding_share', row.get('outstanding_share'))
@@ -312,12 +315,21 @@ class DbTools:
         sanitized['trade_date'] = str(row.get('trade_date', '')).strip()
         sanitized['index_code'] = str(row.get('index_code', '')).strip()
         sanitized['index_name'] = str(row.get('index_name', '')).strip()
-        sanitized['emotion_value'] = self._normalize_numeric('emotion_value', row.get('emotion_value'))
-        sanitized['main_basis'] = self._normalize_numeric('main_basis', row.get('main_basis'))
-        sanitized['month_basis'] = self._normalize_numeric('month_basis', row.get('month_basis'))
+        emotion_value = self._normalize_numeric('emotion_value', row.get('emotion_value'))
+        main_basis = self._normalize_numeric('main_basis', row.get('main_basis'))
+        month_basis = self._normalize_numeric('month_basis', row.get('month_basis'))
         sanitized['breadth_up_count'] = int(row.get('breadth_up_count') or 0)
         sanitized['breadth_total_count'] = int(row.get('breadth_total_count') or 0)
-        sanitized['breadth_up_pct'] = self._normalize_numeric('breadth_up_pct', row.get('breadth_up_pct'))
+
+        breadth_up_pct = self._normalize_numeric('breadth_up_pct', row.get('breadth_up_pct'))
+        if breadth_up_pct is not None:
+            breadth_up_pct = max(0.0, min(100.0, float(breadth_up_pct)))
+
+        # Keep the values aligned with DECIMAL(18, 6) to avoid SQL truncation warnings.
+        sanitized['emotion_value'] = round(float(emotion_value), 6) if emotion_value is not None else None
+        sanitized['main_basis'] = round(float(main_basis), 6) if main_basis is not None else None
+        sanitized['month_basis'] = round(float(month_basis), 6) if month_basis is not None else None
+        sanitized['breadth_up_pct'] = round(float(breadth_up_pct), 6) if breadth_up_pct is not None else None
         return sanitized
 
     def _sanitize_excel_emotion_row(self, row):
@@ -434,6 +446,43 @@ class DbTools:
         self.pool.close()
         await self.pool.wait_closed()
         self.pool = None
+
+    async def ensure_stock_qfq_change_columns(self):
+        if self._stock_qfq_change_columns_ready:
+            return
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'stock_qfq_daily_data'
+                      AND column_name IN ('price_change_amount', 'price_change_rate')
+                    """
+                )
+                existing_columns = {str(row[0]).strip().lower() for row in await cursor.fetchall()}
+
+                alter_clauses = []
+                if 'price_change_amount' not in existing_columns:
+                    alter_clauses.append("ADD COLUMN price_change_amount DECIMAL(18, 4) NULL AFTER low_price")
+                if 'price_change_rate' not in existing_columns:
+                    after_column = 'price_change_amount' if ('price_change_amount' in existing_columns or alter_clauses) else 'low_price'
+                    alter_clauses.append(
+                        f"ADD COLUMN price_change_rate DECIMAL(18, 4) NULL AFTER {after_column}"
+                    )
+
+                if alter_clauses:
+                    await cursor.execute(
+                        "ALTER TABLE stock_qfq_daily_data " + ", ".join(alter_clauses)
+                    )
+                    await conn.commit()
+
+        self._stock_qfq_change_columns_ready = True
 
     async def upsert_stock_info_all(self, rows):
         if not rows:
@@ -578,6 +627,32 @@ class DbTools:
                 await cursor.execute(query)
                 return list(await cursor.fetchall())
 
+    async def delete_stock_info_all_by_prefixed_codes(self, prefixed_codes, chunk_size=500):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_codes = sorted(
+            {
+                str(prefixed_code).strip().lower()
+                for prefixed_code in (prefixed_codes or [])
+                if str(prefixed_code).strip()
+            }
+        )
+        if not normalized_codes:
+            return 0
+
+        deleted_rows = 0
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for offset in range(0, len(normalized_codes), chunk_size):
+                    chunk = normalized_codes[offset:offset + chunk_size]
+                    placeholders = ','.join(['%s'] * len(chunk))
+                    query = f"DELETE FROM stock_info_all WHERE prefixed_code IN ({placeholders})"
+                    await cursor.execute(query, chunk)
+                    deleted_rows += cursor.rowcount
+                await conn.commit()
+        return deleted_rows
+
     async def upsert_stock_daily_data(self, rows):
         if not rows:
             return 0
@@ -668,6 +743,74 @@ class DbTools:
                 await conn.commit()
                 return len(sanitized_rows)
 
+    async def get_stock_daily_prefixed_codes_by_date(self, trade_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_trade_date = str(trade_date or '').split(' ')[0].strip()
+        if not normalized_trade_date:
+            return []
+
+        query = """
+        SELECT prefixed_code
+        FROM stock_daily_data
+        WHERE trade_date = %s
+        ORDER BY prefixed_code ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, (normalized_trade_date,))
+                rows = await cursor.fetchall()
+                return [str(row[0]).strip().lower() for row in rows if row and row[0]]
+
+    async def get_stock_daily_hist_prefixed_codes(self):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT DISTINCT prefixed_code
+        FROM stock_daily_data
+        WHERE data_source = 'stock_zh_a_hist_tx'
+        ORDER BY prefixed_code ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                rows = await cursor.fetchall()
+                return [str(row[0]).strip().lower() for row in rows if row and row[0]]
+
+    async def delete_stock_daily_data_by_trade_date_and_prefixed_codes(self, trade_date, prefixed_codes, chunk_size=500):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_trade_date = str(trade_date or '').split(' ')[0].strip()
+        normalized_codes = sorted(
+            {
+                str(prefixed_code).strip().lower()
+                for prefixed_code in (prefixed_codes or [])
+                if str(prefixed_code).strip()
+            }
+        )
+        if not normalized_trade_date or not normalized_codes:
+            return 0
+
+        deleted_rows = 0
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for offset in range(0, len(normalized_codes), chunk_size):
+                    chunk = normalized_codes[offset:offset + chunk_size]
+                    placeholders = ','.join(['%s'] * len(chunk))
+                    query = (
+                        f"DELETE FROM stock_daily_data "
+                        f"WHERE trade_date = %s AND prefixed_code IN ({placeholders})"
+                    )
+                    await cursor.execute(query, [normalized_trade_date, *chunk])
+                    deleted_rows += cursor.rowcount
+                await conn.commit()
+        return deleted_rows
+
     async def get_stock_qfq_request_window(self, prefixed_code):
         if self.pool is None:
             await self.init_pool()
@@ -700,6 +843,7 @@ class DbTools:
     async def replace_stock_qfq_daily_data(self, prefixed_code, rows):
         if self.pool is None:
             await self.init_pool()
+        await self.ensure_stock_qfq_change_columns()
 
         normalized_prefixed_code = str(prefixed_code or '').strip().lower()
         sanitized_rows = [self._sanitize_stock_qfq_daily_row(row) for row in rows]
@@ -734,6 +878,8 @@ class DbTools:
                             row['close_price'],
                             row['high_price'],
                             row['low_price'],
+                            row['price_change_amount'],
+                            row['price_change_rate'],
                             row['volume'],
                             row['turnover_amount'],
                             row['outstanding_share'],
@@ -755,6 +901,8 @@ class DbTools:
                         close_price,
                         high_price,
                         low_price,
+                        price_change_amount,
+                        price_change_rate,
                         volume,
                         turnover_amount,
                         outstanding_share,
@@ -763,7 +911,7 @@ class DbTools:
                         request_start_date,
                         request_end_date,
                         refresh_batch_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
                     await cursor.executemany(query, values)
                     written_rows = len(values)
@@ -2154,60 +2302,49 @@ class DbTools:
                 await cursor.execute(query, params)
                 return list(await cursor.fetchall())
 
-    async def get_quant_index_dashboard_hist_breadth(self, start_date, end_date):
+    async def get_quant_index_dashboard_breadth(self, start_date, end_date):
         if self.pool is None:
             await self.init_pool()
 
         query = """
         SELECT
             breadth.trade_date,
-            SUM(CASE WHEN breadth.prev_close IS NOT NULL AND breadth.close_price > breadth.prev_close THEN 1 ELSE 0 END) AS breadth_up_count,
-            SUM(CASE WHEN breadth.prev_close IS NOT NULL AND breadth.close_price IS NOT NULL THEN 1 ELSE 0 END) AS breadth_total_count
-        FROM (
-            SELECT
-                prefixed_code,
-                trade_date,
-                close_price,
-                LAG(close_price) OVER (PARTITION BY prefixed_code ORDER BY trade_date) AS prev_close
-            FROM stock_daily_data
-            WHERE data_source = 'stock_zh_a_hist_tx'
-              AND trade_date <= %s
-        ) breadth
-        WHERE breadth.trade_date BETWEEN %s AND %s
-        GROUP BY breadth.trade_date
-        ORDER BY breadth.trade_date ASC
-        """
-
-        async with self.pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
-                await cursor.execute(query, [str(end_date), str(start_date), str(end_date)])
-                return list(await cursor.fetchall())
-
-    async def get_quant_index_dashboard_spot_breadth(self, start_date, end_date):
-        if self.pool is None:
-            await self.init_pool()
-
-        query = """
-        SELECT
-            trade_date,
             SUM(
                 CASE
-                    WHEN COALESCE(price_change_amount, COALESCE(latest_price, close_price) - pre_close_price) > 0
+                    WHEN breadth.derived_prev_close IS NOT NULL
+                     AND breadth.derived_close IS NOT NULL
+                     AND breadth.derived_close > breadth.derived_prev_close
                     THEN 1 ELSE 0
                 END
             ) AS breadth_up_count,
             SUM(
                 CASE
-                    WHEN price_change_amount IS NOT NULL
-                      OR (COALESCE(latest_price, close_price) IS NOT NULL AND pre_close_price IS NOT NULL)
+                    WHEN breadth.derived_prev_close IS NOT NULL
+                     AND breadth.derived_close IS NOT NULL
                     THEN 1 ELSE 0
                 END
             ) AS breadth_total_count
-        FROM stock_daily_data
-        WHERE data_source = 'stock_zh_a_spot'
-          AND trade_date BETWEEN %s AND %s
-        GROUP BY trade_date
-        ORDER BY trade_date ASC
+        FROM (
+            SELECT
+                current_rows.prefixed_code,
+                current_rows.trade_date,
+                COALESCE(current_rows.latest_price, current_rows.close_price) AS derived_close,
+                COALESCE(
+                    current_rows.pre_close_price,
+                    (
+                        SELECT COALESCE(prev_rows.latest_price, prev_rows.close_price)
+                        FROM stock_daily_data prev_rows
+                        WHERE prev_rows.prefixed_code = current_rows.prefixed_code
+                          AND prev_rows.trade_date < current_rows.trade_date
+                        ORDER BY prev_rows.trade_date DESC
+                        LIMIT 1
+                    )
+                ) AS derived_prev_close
+            FROM stock_daily_data current_rows
+            WHERE current_rows.trade_date BETWEEN %s AND %s
+        ) breadth
+        GROUP BY breadth.trade_date
+        ORDER BY breadth.trade_date ASC
         """
 
         async with self.pool.acquire() as conn:

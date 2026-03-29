@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import akshare as ak
-import pandas as pd
 
 
 @dataclass(frozen=True)
@@ -9,16 +8,6 @@ class SchedulerFunctionSpec:
     function_name: str
     source_group: str
     callable: object
-
-
-def _safe_stock_zh_a_hist_tx(*args, **kwargs):
-    try:
-        return ak.stock_zh_a_hist_tx(*args, **kwargs)
-    except KeyError as exc:
-        if str(exc).strip("'\"") in {"day", "qfqday", "hfqday"}:
-            return pd.DataFrame()
-        raise
-
 
 FUNCTION_SPECS = {
     "stock_individual_info_em": SchedulerFunctionSpec("stock_individual_info_em", "eastmoney", ak.stock_individual_info_em),
@@ -28,7 +17,7 @@ FUNCTION_SPECS = {
     "stock_info_sz_name_code": SchedulerFunctionSpec("stock_info_sz_name_code", "sina", ak.stock_info_sz_name_code),
     "stock_info_bj_name_code": SchedulerFunctionSpec("stock_info_bj_name_code", "sina", ak.stock_info_bj_name_code),
     "stock_zh_a_spot": SchedulerFunctionSpec("stock_zh_a_spot", "sina", ak.stock_zh_a_spot),
-    "stock_zh_a_hist_tx": SchedulerFunctionSpec("stock_zh_a_hist_tx", "sina", _safe_stock_zh_a_hist_tx),
+    "stock_zh_a_hist_tx": SchedulerFunctionSpec("stock_zh_a_hist_tx", "sina", ak.stock_zh_a_hist_tx),
     "stock_zh_a_daily": SchedulerFunctionSpec("stock_zh_a_daily", "sina", ak.stock_zh_a_daily),
     "fund_etf_spot_em": SchedulerFunctionSpec("fund_etf_spot_em", "eastmoney", ak.fund_etf_spot_em),
     "fund_etf_hist_em": SchedulerFunctionSpec("fund_etf_hist_em", "eastmoney", ak.fund_etf_hist_em),

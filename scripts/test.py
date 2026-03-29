@@ -99,11 +99,19 @@ if __name__ == "__main__":
     # ):
     #     print(forex_spot_em_df)
         #futures_contract_info_cffex
-    forex_spot_em_df = ak.stock_individual_basic_info_xq(symbol="SH601127")
-    with pd.option_context(
-            'display.max_rows', None,
-            'display.max_columns', None,
-            'display.width', None,
-            'display.max_colwidth', None
-    ):
-        print(forex_spot_em_df)
+    # forex_spot_em_df = ak.stock_individual_basic_info_xq(symbol="SH601127")
+    # with pd.option_context(
+    #         'display.max_rows', None,
+    #         'display.max_columns', None,
+    #         'display.width', None,
+    #         'display.max_colwidth', None
+    # ):
+    #     print(forex_spot_em_df)
+
+
+    stock_zh_a_hist_tx_df = ak.stock_zh_a_hist_tx(symbol="bj920000", start_date="20201223", end_date="20260328",
+                                                  adjust="")
+    print(stock_zh_a_hist_tx_df)
+
+    #{"adjust": "", "symbol": "bj920001", "end_date": "20260328", "start_date": "20221227"}
+    #{"adjust": "", "symbol": "bj920000", "end_date": "20260328", "start_date": "20201223"}

@@ -27,6 +27,20 @@ class SchedulerStore:
         error_code = int(exc.args[0]) if exc.args else 0
         return error_code in {1205, 1213}
 
+    @staticmethod
+    def is_empty_dataframe_payload(result_type, result_json):
+        if str(result_type or "").strip().lower() != "dataframe":
+            return False
+        if not result_json:
+            return False
+        try:
+            payload = json.loads(result_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        columns = payload.get("columns")
+        records = payload.get("records")
+        return isinstance(records, list) and len(records) == 0 and (columns is None or isinstance(columns, list))
+
     @contextmanager
     def connection(self):
         conn = pymysql.connect(
@@ -51,6 +65,15 @@ class SchedulerStore:
             raise
         finally:
             conn.close()
+
+    def run_with_lock_retry(self, operation, max_attempts=5, base_sleep_seconds=0.05):
+        for attempt in range(1, int(max_attempts) + 1):
+            try:
+                return operation()
+            except pymysql.err.OperationalError as exc:
+                if not self.is_lock_contention_error(exc) or attempt >= int(max_attempts):
+                    raise
+                time.sleep(float(base_sleep_seconds) * attempt)
 
     def submit_job(self, payload):
         request_key = str(payload["request_key"]).strip()
@@ -108,7 +131,10 @@ class SchedulerStore:
                                 payload.get("caller_name"),
                             ),
                         )
-                        is_new_row = bool(cursor.lastrowid)
+                        # For INSERT ... ON DUPLICATE KEY UPDATE, PyMySQL may still expose
+                        # lastrowid for the existing row. Use rowcount semantics instead:
+                        # 1 => inserted, 0/2 => duplicate-path reuse.
+                        is_new_row = int(cursor.rowcount or 0) == 1
                         if is_new_row:
                             job_id = cursor.lastrowid
                             cursor.execute(
@@ -122,7 +148,40 @@ class SchedulerStore:
 
                         cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
                         row = cursor.fetchone()
-                        row["_dedupe_reused"] = not is_new_row
+                        reused_existing = not is_new_row
+                        was_empty_success = (
+                            reused_existing
+                            and str(payload.get("function_name") or "").strip().lower() == "stock_zh_a_hist_tx"
+                            and str(row.get("status") or "").strip().upper() == "SUCCESS"
+                            and self.is_empty_dataframe_payload(row.get("result_type"), row.get("result_json"))
+                        )
+                        if was_empty_success:
+                            # Empty dataframe cache from a previous run should not block re-execution.
+                            cursor.execute(
+                                """
+                                UPDATE ak_request_jobs
+                                SET status = %s,
+                                    attempt_count = 0,
+                                    next_run_at = %s,
+                                    lease_until = NULL,
+                                    error_category = NULL,
+                                    error_message = NULL,
+                                    result_type = NULL,
+                                    result_json = NULL,
+                                    started_at = NULL,
+                                    finished_at = NULL,
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = %s
+                                """,
+                                (status, now, job_id),
+                            )
+                            cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
+                            row = cursor.fetchone()
+                            row["_dedupe_reused"] = False
+                            row["_dedupe_requeued_empty_success"] = True
+                            return row
+
+                        row["_dedupe_reused"] = reused_existing
                         return row
             except pymysql.err.OperationalError as exc:
                 error_code = int(exc.args[0]) if exc.args else 0
@@ -280,61 +339,70 @@ class SchedulerStore:
 
     def mark_success(self, job_id, result_type, result_json):
         now = datetime.now()
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE ak_request_jobs
-                    SET status = 'SUCCESS',
-                        error_category = NULL,
-                        error_message = NULL,
-                        result_type = %s,
-                        result_json = %s,
-                        lease_until = NULL,
-                        finished_at = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (result_type, result_json, now, job_id),
-                )
-                return cursor.rowcount
+        def operation():
+            with self.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE ak_request_jobs
+                        SET status = 'SUCCESS',
+                            error_category = NULL,
+                            error_message = NULL,
+                            result_type = %s,
+                            result_json = %s,
+                            lease_until = NULL,
+                            finished_at = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (result_type, result_json, now, job_id),
+                    )
+                    return cursor.rowcount
+
+        return self.run_with_lock_retry(operation)
 
     def mark_retry(self, job_id, error_category, error_message, next_run_at):
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE ak_request_jobs
-                    SET status = 'PENDING',
-                        error_category = %s,
-                        error_message = %s,
-                        next_run_at = %s,
-                        lease_until = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (error_category, error_message, next_run_at, job_id),
-                )
-                return cursor.rowcount
+        def operation():
+            with self.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE ak_request_jobs
+                        SET status = 'PENDING',
+                            error_category = %s,
+                            error_message = %s,
+                            next_run_at = %s,
+                            lease_until = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (error_category, error_message, next_run_at, job_id),
+                    )
+                    return cursor.rowcount
+
+        return self.run_with_lock_retry(operation)
 
     def mark_failed(self, job_id, error_category, error_message):
         now = datetime.now()
-        with self.connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE ak_request_jobs
-                    SET status = 'FAILED',
-                        error_category = %s,
-                        error_message = %s,
-                        lease_until = NULL,
-                        finished_at = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (error_category, error_message, now, job_id),
-                )
-                return cursor.rowcount
+        def operation():
+            with self.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE ak_request_jobs
+                        SET status = 'FAILED',
+                            error_category = %s,
+                            error_message = %s,
+                            lease_until = NULL,
+                            finished_at = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (error_category, error_message, now, job_id),
+                    )
+                    return cursor.rowcount
+
+        return self.run_with_lock_retry(operation)
 
     def get_queue_stats(self):
         stats = {}
@@ -350,3 +418,39 @@ class SchedulerStore:
                 for row in cursor.fetchall():
                     stats.setdefault(row["source_group"], {})[row["status"]] = int(row["total"])
         return stats
+
+    def count_empty_stock_hist_successes(self):
+        with self.connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM ak_request_jobs
+                    WHERE function_name = 'stock_zh_a_hist_tx'
+                      AND status = 'SUCCESS'
+                      AND result_type = 'dataframe'
+                      AND JSON_VALID(result_json) = 1
+                      AND JSON_LENGTH(result_json, '$.records') = 0
+                    """
+                )
+                row = cursor.fetchone() or {}
+                return int(row.get("total") or 0)
+
+    def get_recent_empty_stock_hist_successes(self, limit=20):
+        with self.connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, request_key, attempt_count, created_at, updated_at
+                    FROM ak_request_jobs
+                    WHERE function_name = 'stock_zh_a_hist_tx'
+                      AND status = 'SUCCESS'
+                      AND result_type = 'dataframe'
+                      AND JSON_VALID(result_json) = 1
+                      AND JSON_LENGTH(result_json, '$.records') = 0
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+                return list(cursor.fetchall())

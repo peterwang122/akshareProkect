@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS stock_qfq_daily_data (
   close_price DECIMAL(18, 4) NULL,
   high_price DECIMAL(18, 4) NULL,
   low_price DECIMAL(18, 4) NULL,
+  price_change_amount DECIMAL(18, 4) NULL,
+  price_change_rate DECIMAL(18, 4) NULL,
   volume DECIMAL(24, 2) NULL,
   turnover_amount DECIMAL(24, 2) NULL,
   outstanding_share DECIMAL(24, 2) NULL,
@@ -73,3 +75,7 @@ CREATE TABLE IF NOT EXISTS stock_qfq_daily_data (
   KEY idx_stock_qfq_code_date (stock_code, trade_date),
   KEY idx_stock_qfq_refresh_batch (refresh_batch_id)
 );
+
+ALTER TABLE stock_qfq_daily_data
+  ADD COLUMN IF NOT EXISTS price_change_amount DECIMAL(18, 4) NULL AFTER low_price,
+  ADD COLUMN IF NOT EXISTS price_change_rate DECIMAL(18, 4) NULL AFTER price_change_amount;

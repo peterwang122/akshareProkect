@@ -26,6 +26,13 @@
 ## 股票
 ### `stock_info_all`
 - 用途：股票代码、前缀代码、交易所、板块、上市日期以及多来源原始字段归档。
+- 成分口径：
+  - 上交所仅保留 `主板A股` 和 `科创板`
+  - 深交所仅保留 `主板` 和 `创业板`
+  - 北交所保留全量
+- 同步规则：
+  - 每天最多刷新一次
+  - 若库中存在不属于上述口径的旧记录，下一次同步会强制重刷并删除这些多余记录
 - 推荐展示：
   - 股票搜索框
   - 股票名称和代码映射
@@ -82,6 +89,7 @@
   - `stock_zh_a_hist_tx`：腾讯历史非复权日线
 - 说明：
   - 该表已经替代旧的 `stock_data`
+  - 若需要补历史覆盖范围，可运行 `python run.py stock repair-backfill`，它会以 `stock_info_all` 为准补齐还没有任何历史日线的股票
   - 若需要当天实时快照，请优先读取 `data_source='stock_zh_a_spot'`
   - 若需要历史非复权日线，请优先读取 `data_source='stock_zh_a_hist_tx'`
 
@@ -99,6 +107,8 @@
   - `close_price`
   - `high_price`
   - `low_price`
+  - `price_change_amount`
+  - `price_change_rate`
   - `volume`
   - `turnover_amount`
   - `outstanding_share`
@@ -110,6 +120,10 @@
 - 说明：
   - 该表只由独立服务 `stock_temp_service.py` 写入
   - 同一股票如果请求区间变化，会删除旧数据后整表重写
+  - 当前会在写库前按“前一交易日收盘价”自行计算：
+    - `price_change_amount = 当日 close_price - 前一交易日 close_price`
+    - `price_change_rate = price_change_amount / 前一交易日 close_price * 100`
+  - 每次请求区间中的第一条记录因为没有区间内上一交易日收盘价，`price_change_amount` 和 `price_change_rate` 允许为 `NULL`
 
 ## 指数
 ### `index_basic_info`
@@ -159,6 +173,7 @@
   - 涨跌家数来自 `stock_daily_data`
   - 上证指数的情绪值和期现差按四大核心指数同日平均计算
   - 5 个指数在同一天共用同一份涨跌家数数据
+  - 若股票数据补录或修正后需要整体重算，可执行 `python run.py quant-index refresh-breadth [start_date] [end_date]`
 
 ## CFFEX 会员排名
 ### `cffex_member_rankings`

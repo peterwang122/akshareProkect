@@ -1,5 +1,7 @@
 import json
+import os
 import random
+import subprocess
 import threading
 import time
 import builtins
@@ -11,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import requests
+import pandas as pd
 
 from akshare_project.core.logging_utils import get_logger
 from akshare_project.core.paths import ensure_runtime_layout
@@ -21,6 +24,7 @@ from akshare_project.scheduler.store import SchedulerStore
 
 LOGGER = get_logger("ak_scheduler")
 LOG_PREFIX = "[AK-SCHEDULER]"
+SERVICE_BUILD = "2026-03-29-empty-guard-v3"
 def log(message, level="info"):
     normalized_level = str(level or "info").strip().lower()
     level_name = normalized_level.upper()
@@ -51,6 +55,22 @@ def compact_json(value, limit=240):
     if len(text) > limit:
         return text[: limit - 3] + "..."
     return text
+
+
+def is_empty_dataframe_payload(result_type, result_json):
+    if str(result_type or "").strip().lower() != "dataframe":
+        return False
+    if not result_json:
+        return False
+    try:
+        payload = json.loads(result_json)
+    except Exception:
+        return False
+    columns = payload.get("columns")
+    records = payload.get("records")
+    return isinstance(records, list) and len(records) == 0 and (columns is None or isinstance(columns, list))
+
+
 def summarize_job(job):
     if not job:
         return "job=<none>"
@@ -153,6 +173,11 @@ class SchedulerService:
         self.state = SchedulerRuntimeState()
         self.stop_event = threading.Event()
         self.threads = []
+        self.started_at = None
+        self.process_id = os.getpid()
+
+    def mark_started(self):
+        self.started_at = datetime.now()
 
     def submit_job(self, payload):
         if not str(payload.get("request_key", "")).strip():
@@ -164,7 +189,11 @@ class SchedulerService:
             raise ValueError(f"source_group mismatch for {payload.get('function_name')}")
         payload["source_group"] = spec.source_group
         job = self.store.submit_job(payload)
-        queue_entry = "reused" if job.get("_dedupe_reused") else "new"
+        queue_entry = (
+            "requeued-empty-cache"
+            if job.get("_dedupe_requeued_empty_success")
+            else ("reused" if job.get("_dedupe_reused") else "new")
+        )
         log(
             "job submitted: "
             f"{summarize_job(job)} "
@@ -204,6 +233,9 @@ class SchedulerService:
             running_jobs += int(source_stats.get("RUNNING", 0))
         return {
             "service_status": "running",
+            "build": SERVICE_BUILD,
+            "pid": self.process_id,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
             "queue_depth": queue_depth,
             "running_jobs": running_jobs,
             "queue_stats": queue_stats,
@@ -269,7 +301,11 @@ class SchedulerService:
 
         args = json.loads(job.get("args_json") or "[]")
         kwargs = json.loads(job.get("kwargs_json") or "{}")
-        return spec.callable(*args, **kwargs)
+        result = spec.callable(*args, **kwargs)
+        if spec.function_name == "stock_zh_a_hist_tx" and isinstance(result, pd.DataFrame) and result.empty:
+            # Prevent caching empty payload (no rows) as SUCCESS.
+            raise RuntimeError("stock_zh_a_hist_tx returned empty dataframe rows")
+        return result
 
     def worker_loop(self, source_group):
         policy = load_policy(self.config, source_group)
@@ -297,7 +333,22 @@ class SchedulerService:
             try:
                 result = self.execute_job(job, policy)
                 result_type, result_json = serialize_result(result)
-                self.store.mark_success(job["id"], result_type, result_json)
+                if (
+                    job.get("function_name") == "stock_zh_a_hist_tx"
+                    and is_empty_dataframe_payload(result_type, result_json)
+                ):
+                    # Double guard: even if upstream returned an odd object,
+                    # do not allow empty-row cache to become SUCCESS.
+                    raise RuntimeError("stock_zh_a_hist_tx serialized to empty dataframe rows")
+                try:
+                    self.store.mark_success(job["id"], result_type, result_json)
+                except Exception as state_exc:
+                    log(
+                        f"{source_group} mark_success failed: {summarize_job(job)} error={state_exc}",
+                        level="error",
+                    )
+                    self.stop_event.wait(poll_interval)
+                    continue
                 self.state.mark_success(source_group)
                 log(
                     f"{source_group} job success: {summarize_job(job)} "
@@ -319,14 +370,30 @@ class SchedulerService:
                     )
                     wait_seconds += random.uniform(0, float(policy.get("jitter_seconds", 0)))
                     next_run_at = datetime.now() + timedelta(seconds=wait_seconds)
-                    self.store.mark_retry(job["id"], error_category, error_message, next_run_at)
+                    try:
+                        self.store.mark_retry(job["id"], error_category, error_message, next_run_at)
+                    except Exception as state_exc:
+                        log(
+                            f"{source_group} mark_retry failed: {summarize_job(job)} error={state_exc}",
+                            level="error",
+                        )
+                        self.stop_event.wait(poll_interval)
+                        continue
                     log(
                         f"{source_group} job retry scheduled: {summarize_job(job)} "
                         f"category={error_category} wait={wait_seconds:.1f}s error={error_message}",
                         level="warning",
                     )
                 else:
-                    self.store.mark_failed(job["id"], error_category, error_message)
+                    try:
+                        self.store.mark_failed(job["id"], error_category, error_message)
+                    except Exception as state_exc:
+                        log(
+                            f"{source_group} mark_failed failed: {summarize_job(job)} error={state_exc}",
+                            level="error",
+                        )
+                        self.stop_event.wait(poll_interval)
+                        continue
                     log(
                         f"{source_group} job failed: {summarize_job(job)} "
                         f"category={error_category} error={error_message}",
@@ -419,12 +486,85 @@ class SchedulerRequestHandler(BaseHTTPRequestHandler):
         return
 
 
+def inspect_listening_port_owner(port):
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    target_suffix = f":{int(port)}"
+    for raw_line in (result.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line or "LISTENING" not in line.upper():
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local_address = parts[1]
+        state = parts[3].upper()
+        pid_text = parts[4]
+        if state != "LISTENING" or not local_address.endswith(target_suffix):
+            continue
+        owner = {
+            "pid": int(pid_text) if str(pid_text).isdigit() else None,
+            "image_name": None,
+        }
+        if owner["pid"] is not None:
+            try:
+                task = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {owner['pid']}", "/FO", "CSV", "/NH"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                task_line = (task.stdout or "").strip().splitlines()
+                if task_line:
+                    first_line = task_line[0].strip().strip('"')
+                    if first_line and not first_line.startswith("INFO:"):
+                        owner["image_name"] = first_line.split('","')[0].strip('"')
+            except Exception:
+                pass
+        return owner
+    return None
+
+
+def create_scheduler_server(host, port):
+    try:
+        return ThreadingHTTPServer((host, int(port)), SchedulerRequestHandler)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) not in {10048} and exc.errno not in {48, 98}:
+            raise
+        owner = inspect_listening_port_owner(port)
+        if owner:
+            image_name = owner.get("image_name") or "unknown"
+            raise RuntimeError(
+                f"AK scheduler service can not start because {host}:{port} is already in use "
+                f"by pid={owner.get('pid')} image={image_name}"
+            ) from exc
+        raise RuntimeError(
+            f"AK scheduler service can not start because {host}:{port} is already in use"
+        ) from exc
+
+
 def run_scheduler_service():
     config = SERVICE_INSTANCE.config
-    SERVICE_INSTANCE.start_background_threads()
-    server = ThreadingHTTPServer((config.get("host", "127.0.0.1"), int(config.get("port", 8765))), SchedulerRequestHandler)
+    host = config.get("host", "127.0.0.1")
+    port = int(config.get("port", 8765))
+    server = create_scheduler_server(host, port)
     server.daemon_threads = True
-    log(f"AK scheduler service started at http://{config.get('host')}:{config.get('port')}")
+    SERVICE_INSTANCE.mark_started()
+    SERVICE_INSTANCE.start_background_threads()
+    log(
+        f"AK scheduler service started at http://{host}:{port} "
+        f"build={SERVICE_BUILD}"
+    )
     try:
         server.serve_forever()
     finally:
@@ -446,3 +586,43 @@ def run_healthcheck():
             "Please start it first with: python ak_scheduler_service.py serve"
         ) from exc
     print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+
+
+def run_scheduler_doctor(limit=20):
+    config = load_scheduler_config()
+    host = config.get('host', '127.0.0.1')
+    port = int(config.get('port', 8765))
+    base_url = f"http://{config.get('host', '127.0.0.1')}:{int(config.get('port', 8765))}"
+    health = None
+    try:
+        response = requests.get(f"{base_url}/health", timeout=10)
+        response.raise_for_status()
+        health = response.json()
+    except requests.RequestException:
+        health = {
+            "service_status": "unavailable",
+            "build": None,
+            "pid": None,
+            "started_at": None,
+        }
+
+    store = SchedulerStore()
+    empty_count = None
+    recent_empty = []
+    db_error = None
+    try:
+        empty_count = store.count_empty_stock_hist_successes()
+        recent_empty = store.get_recent_empty_stock_hist_successes(limit=int(limit))
+    except Exception as exc:
+        db_error = str(exc)
+    payload = {
+        "expected_build": SERVICE_BUILD,
+        "health": health,
+        "port_owner": inspect_listening_port_owner(port),
+        "host": host,
+        "port": port,
+        "empty_stock_hist_success_count": empty_count,
+        "recent_empty_stock_hist_successes": recent_empty,
+        "db_error": db_error,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))

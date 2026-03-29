@@ -139,22 +139,9 @@ def build_futures_close_map(rows):
     }
 
 
-def build_breadth_map(hist_rows, spot_rows):
+def build_breadth_map(rows):
     result = {}
-    for row in hist_rows:
-        trade_date = normalize_date_text(row.get("trade_date"))
-        if not trade_date:
-            continue
-        up_count = to_int(row.get("breadth_up_count"))
-        total_count = to_int(row.get("breadth_total_count"))
-        up_pct = (up_count / total_count * 100) if total_count else 0
-        result[trade_date] = {
-            "breadth_up_count": up_count,
-            "breadth_total_count": total_count,
-            "breadth_up_pct": up_pct,
-        }
-
-    for row in spot_rows:
+    for row in rows:
         trade_date = normalize_date_text(row.get("trade_date"))
         if not trade_date:
             continue
@@ -269,8 +256,7 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         start_date,
         end_date,
     )
-    hist_breadth_rows = await db_tools.get_quant_index_dashboard_hist_breadth(start_date, end_date)
-    spot_breadth_rows = await db_tools.get_quant_index_dashboard_spot_breadth(start_date, end_date)
+    breadth_rows = await db_tools.get_quant_index_dashboard_breadth(start_date, end_date)
 
     rows = build_dashboard_rows(
         trade_dates=trade_dates,
@@ -278,7 +264,7 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         emotion_map=build_emotion_map(emotion_rows),
         index_close_map=build_index_close_map(index_close_rows),
         futures_close_map=build_futures_close_map(futures_rows),
-        breadth_map=build_breadth_map(hist_breadth_rows, spot_breadth_rows),
+        breadth_map=build_breadth_map(breadth_rows),
     )
     affected = await db_tools.upsert_quant_index_dashboard_daily(rows)
     print(
@@ -320,6 +306,31 @@ async def sync_daily(target_date=None):
         await db_tools.close()
 
 
+async def refresh_breadth_data(start_date=None, end_date=None):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        if start_date is None or end_date is None:
+            trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(INDEX_NAME_ORDER)
+            if not trade_dates:
+                print("quant index breadth refresh finished: no index trade dates found")
+                return 0
+            actual_start = start_date or trade_dates[0]
+            actual_end = end_date or trade_dates[-1]
+        else:
+            actual_start = start_date
+            actual_end = end_date
+
+        affected = await compute_and_upsert_range(db_tools, actual_start, actual_end)
+        print(
+            "quant index breadth refresh finished: "
+            f"start_date={actual_start}, end_date={actual_end}, affected={affected}"
+        )
+        return affected
+    finally:
+        await db_tools.close()
+
+
 async def main():
     command = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "backfill"
     args = sys.argv[2:]
@@ -333,8 +344,16 @@ async def main():
         target_date = parse_date_arg(args[0]) if args else None
         await sync_daily(target_date=target_date)
         return
+    if command == "refresh-breadth":
+        start_date = parse_date_arg(args[0]) if len(args) > 0 else None
+        end_date = parse_date_arg(args[1]) if len(args) > 1 else None
+        await refresh_breadth_data(start_date=start_date, end_date=end_date)
+        return
 
-    raise ValueError("quant-index supports: backfill [start_date] [end_date] | daily [trade_date]")
+    raise ValueError(
+        "quant-index supports: backfill [start_date] [end_date] | "
+        "daily [trade_date] | refresh-breadth [start_date] [end_date]"
+    )
 
 
 if __name__ == "__main__":
