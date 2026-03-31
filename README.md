@@ -210,7 +210,8 @@ python ak_scheduler_service.py doctor
   - 先同步 `stock_info_all`
   - 再调用 `stock_zh_a_spot`
   - 只写当前 `stock_info_all` 成分内的股票到 `stock_daily_data`
-  - 默认整市场执行时，会顺带做一次“昨日对齐修补”，修正昨天被错误写入或缺失的日线
+  - 日常采集只使用 `stock_zh_a_spot` 返回的整表快照写库
+  - 不会在 `daily` 链路中逐股调用 `stock_zh_a_hist_tx`
   - 完成后会刷新受影响日期的 `quant_index_dashboard_daily`
 - `python run.py stock backfill [stock_code ...]`
   - 先同步 `stock_info_all`
