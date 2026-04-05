@@ -2181,6 +2181,41 @@ class DbTools:
             return None
         return str(row[0]).split(' ')[0]
 
+    async def get_latest_quant_index_trade_dates(self, index_names, limit=10):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return []
+
+        try:
+            normalized_limit = int(limit)
+        except (TypeError, ValueError):
+            normalized_limit = 10
+        normalized_limit = max(1, normalized_limit)
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT DISTINCT d.trade_date "
+            f"FROM index_daily_data d "
+            f"INNER JOIN index_basic_info b ON b.index_code = d.index_code "
+            f"WHERE b.index_name IN ({placeholders}) "
+            f"ORDER BY d.trade_date DESC "
+            f"LIMIT %s"
+        )
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, [*normalized_names, normalized_limit])
+                rows = await cursor.fetchall()
+
+        return [str(row[0]).split(' ')[0] for row in rows if row and row[0] is not None]
+
     async def get_quant_index_dashboard_trade_dates(self, index_names, start_date=None, end_date=None):
         if self.pool is None:
             await self.init_pool()
@@ -2478,7 +2513,12 @@ class DbTools:
 
     async def batch_excel_emotion_data(self, rows):
         if not rows:
-            return 0
+            return {
+                'parsed_rows': 0,
+                'inserted_rows': 0,
+                'updated_rows': 0,
+                'affected_dates': [],
+            }
 
         if self.pool is None:
             await self.init_pool()
@@ -2489,39 +2529,85 @@ class DbTools:
             if row['emotion_date'] and row['index_name'] and row['emotion_value'] is not None
         ]
         if not sanitized_rows:
-            return 0
+            return {
+                'parsed_rows': 0,
+                'inserted_rows': 0,
+                'updated_rows': 0,
+                'affected_dates': [],
+            }
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[(row['emotion_date'], row['index_name'])] = row
+        sanitized_rows = list(deduped_rows.values())
 
         async with self.pool.acquire() as conn:
-            async with conn.cursor() as cursor:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
                 dates = sorted({row['emotion_date'] for row in sanitized_rows})
                 index_names = sorted({row['index_name'] for row in sanitized_rows})
 
                 date_placeholders = ','.join(['%s'] * len(dates))
                 index_placeholders = ','.join(['%s'] * len(index_names))
                 query_existing = (
-                    f"SELECT emotion_date, index_name FROM excel_index_emotion_daily "
+                    f"SELECT emotion_date, index_name, emotion_value, source_file, data_source "
+                    f"FROM excel_index_emotion_daily "
                     f"WHERE emotion_date IN ({date_placeholders}) AND index_name IN ({index_placeholders})"
                 )
                 await cursor.execute(query_existing, [*dates, *index_names])
                 existing_keys = {
-                    (str(emotion_date), str(index_name))
-                    for emotion_date, index_name in await cursor.fetchall()
+                    (str(row['emotion_date']), str(row['index_name'])): {
+                        'emotion_value': row.get('emotion_value'),
+                        'source_file': row.get('source_file'),
+                        'data_source': row.get('data_source'),
+                    }
+                    for row in await cursor.fetchall()
                 }
 
-                rows_to_insert = [
-                    (
-                        row['emotion_date'],
-                        row['index_name'],
-                        row['emotion_value'],
-                        row['source_file'],
-                        row['data_source'],
-                    )
-                    for row in sanitized_rows
-                    if (row['emotion_date'], row['index_name']) not in existing_keys
-                ]
+                rows_to_upsert = []
 
-                if not rows_to_insert:
-                    return 0
+                inserted_rows = 0
+                updated_rows = 0
+                affected_dates = set()
+                for row in sanitized_rows:
+                    row_key = (row['emotion_date'], row['index_name'])
+                    existing_row = existing_keys.get(row_key)
+                    if existing_row is None:
+                        inserted_rows += 1
+                        affected_dates.add(row['emotion_date'])
+                        rows_to_upsert.append((
+                            row['emotion_date'],
+                            row['index_name'],
+                            row['emotion_value'],
+                            row['source_file'],
+                            row['data_source'],
+                        ))
+                        continue
+
+                    existing_emotion = self._normalize_numeric('douyin_emotion_value', existing_row.get('emotion_value'))
+                    existing_source_file = str(existing_row.get('source_file') or '').strip() or None
+                    existing_data_source = str(existing_row.get('data_source') or '').strip() or None
+                    if (
+                        existing_emotion != row['emotion_value']
+                        or existing_source_file != row['source_file']
+                        or existing_data_source != row['data_source']
+                    ):
+                        updated_rows += 1
+                        affected_dates.add(row['emotion_date'])
+                        rows_to_upsert.append((
+                            row['emotion_date'],
+                            row['index_name'],
+                            row['emotion_value'],
+                            row['source_file'],
+                            row['data_source'],
+                        ))
+
+                if not rows_to_upsert:
+                    return {
+                        'parsed_rows': len(sanitized_rows),
+                        'inserted_rows': 0,
+                        'updated_rows': 0,
+                        'affected_dates': [],
+                    }
 
                 query_insert = """
                 INSERT INTO excel_index_emotion_daily (
@@ -2531,10 +2617,20 @@ class DbTools:
                     source_file,
                     data_source
                 ) VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    emotion_value = VALUES(emotion_value),
+                    source_file = VALUES(source_file),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
                 """
-                await cursor.executemany(query_insert, rows_to_insert)
+                await cursor.executemany(query_insert, rows_to_upsert)
                 await conn.commit()
-                return len(rows_to_insert)
+                return {
+                    'parsed_rows': len(sanitized_rows),
+                    'inserted_rows': inserted_rows,
+                    'updated_rows': updated_rows,
+                    'affected_dates': sorted(affected_dates),
+                }
 
     async def upsert_failed_task(self, row):
         if not row:

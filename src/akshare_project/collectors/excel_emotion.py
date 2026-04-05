@@ -6,6 +6,7 @@ import pandas as pd
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.paths import get_input_dir
+from akshare_project.collectors.quant_index import refresh_trade_dates
 from akshare_project.db.db_tool import DbTools
 
 DATE_COLUMN_CANDIDATES = ["\u65e5\u671f", "date", "Date", "Unnamed: 0"]
@@ -90,8 +91,19 @@ async def run():
     await db_tools.init_pool()
 
     try:
-        inserted = await db_tools.batch_excel_emotion_data(rows)
-        print(f"excel emotion import finished, parsed rows: {len(rows)}, inserted rows: {inserted}")
+        result = await db_tools.batch_excel_emotion_data(rows)
+        affected_dates = result.get("affected_dates", [])
+        quant_affected = 0
+        if affected_dates:
+            quant_affected = await refresh_trade_dates(db_tools, affected_dates)
+        print(
+            "excel emotion import finished, "
+            f"parsed rows: {result.get('parsed_rows', 0)}, "
+            f"inserted rows: {result.get('inserted_rows', 0)}, "
+            f"updated rows: {result.get('updated_rows', 0)}, "
+            f"affected dates: {','.join(affected_dates) if affected_dates else 'NONE'}, "
+            f"quant refreshed: {quant_affected}"
+        )
     finally:
         await db_tools.close()
 

@@ -96,6 +96,7 @@ python run.py index backfill
 python run.py quant-index daily [trade_date]
 python run.py quant-index backfill [start_date] [end_date]
 python run.py quant-index refresh-breadth [start_date] [end_date]
+python run.py quant-index repair-recent [trade_day_count]
 
 python run.py cffex daily [PRODUCT_CODE ...]
 python run.py cffex backfill [PRODUCT_CODE ...]
@@ -685,3 +686,11 @@ python run.py runner retry-failures stock_daily 20
 - 若怀疑 scheduler 命中了旧进程、空成功缓存或异常复用，优先执行：
   - `python ak_scheduler_service.py health`
   - `python ak_scheduler_service.py doctor`
+
+## Quant Index Notes
+
+- `python run.py quant-index repair-recent [trade_day_count]`
+  - default recalculates the latest 10 trade dates in `quant_index_dashboard_daily`
+- `python run.py emotion-excel import [xlsx_path]`
+  - now upserts `excel_index_emotion_daily` by `emotion_date + index_name`
+  - after import, it automatically refreshes `quant_index_dashboard_daily` only for the affected trade dates
