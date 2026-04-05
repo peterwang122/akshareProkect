@@ -28,6 +28,9 @@ PRODUCTS = {
     "T": {"name": "10-Year Treasury Futures", "listed_date": "2015-03-20"},
     "TL": {"name": "30-Year Treasury Futures", "listed_date": "2023-04-21"},
 }
+CONTRACT_CODE_PATTERN = re.compile(r"(?:TL|TF|TS|IF|IH|IC|IM|T)\d{3,4}", re.IGNORECASE)
+CONTRACT_PRODUCT_PATTERN = re.compile(r"^(TL|TF|TS|IF|IH|IC|IM|T)\d{3,4}$", re.IGNORECASE)
+FUTURES_RADIO_VALUE = "\u671f\u8d27"
 
 
 def print(*args, **kwargs):
@@ -57,11 +60,36 @@ def clean_text(value):
 
 
 def parse_contract_code(contract_text, product_code):
-    contract_text = clean_text(contract_text).upper()
-    match = re.search(rf"{product_code}\d{{3,4}}", contract_text)
+    contract_text = clean_text(contract_text).upper().replace("：", ":")
+    match = re.search(rf"\b{re.escape(product_code)}\d{{3,4}}\b", contract_text)
     if match:
         return match.group(0)
-    return contract_text.replace("CONTRACT:", "").replace("CONTRACT", "").strip()
+
+    normalized_text = (
+        contract_text
+        .replace("合约:", " ")
+        .replace("合约", " ")
+        .replace("CONTRACT:", " ")
+        .replace("CONTRACT", " ")
+    )
+    normalized_text = clean_text(normalized_text)
+    match = re.search(rf"\b{re.escape(product_code)}\d{{3,4}}\b", normalized_text)
+    if match:
+        return match.group(0)
+
+    generic_match = CONTRACT_CODE_PATTERN.search(normalized_text)
+    if generic_match:
+        return generic_match.group(0).upper()
+
+    return ""
+
+
+def infer_product_code_from_contract_code(contract_code):
+    text = clean_text(contract_code).upper()
+    match = CONTRACT_PRODUCT_PATTERN.match(text)
+    if not match:
+        return ""
+    return match.group(1).upper()
 
 
 def parse_numeric(value):
@@ -103,13 +131,21 @@ def parse_trade_date_text(trade_date_text, fallback_date):
 def parse_html_rows(html_content, product_code, product_name, target_date):
     doc = Selector(text=html_content)
     rows_to_save = []
+    mismatch_contract_codes = []
 
     contract_sections = doc.xpath('//div[contains(@class, "IF_first") and contains(@class, "clearFloat")]')
     for section in contract_sections:
-        contract_text = clean_text(section.xpath(".//a/text()").get())
+        contract_text = clean_text(" ".join(section.xpath(".//a//text()").getall()))
+        if not contract_text:
+            contract_text = clean_text(section.xpath("string(.)").get())
         contract_code = parse_contract_code(contract_text, product_code)
         if not contract_code:
             continue
+        resolved_product_code = infer_product_code_from_contract_code(contract_code) or product_code
+        if resolved_product_code != product_code:
+            mismatch_contract_codes.append(contract_code)
+            continue
+        resolved_product_name = PRODUCTS.get(resolved_product_code, {}).get("name", product_name)
 
         trade_date_text = section.xpath(".//p/text()").get()
         trade_date = parse_trade_date_text(trade_date_text, target_date)
@@ -146,8 +182,8 @@ def parse_html_rows(html_content, product_code, product_name, target_date):
                 continue
 
             rows_to_save.append({
-                "product_code": product_code,
-                "product_name": product_name,
+                "product_code": resolved_product_code,
+                "product_name": resolved_product_name,
                 "contract_code": contract_code,
                 "trade_date": trade_date,
                 "rank_no": rank_no,
@@ -166,6 +202,16 @@ def parse_html_rows(html_content, product_code, product_name, target_date):
                 "source_url": BASE_URL,
             })
 
+    if mismatch_contract_codes:
+        preview = ",".join(mismatch_contract_codes[:5])
+        LOGGER.warning(
+            "cffex requested product %s but skipped mismatched contracts on %s: %s%s",
+            product_code,
+            target_date,
+            preview,
+            "..." if len(mismatch_contract_codes) > 5 else "",
+        )
+
     return rows_to_save
 
 
@@ -180,17 +226,139 @@ def iter_weekdays(start_date, end_date):
 async def query_single_trade_day(page, product_code, target_date):
     product_name = PRODUCTS[product_code]["name"]
     await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+    await ensure_futures_mode(page)
+    await ensure_product_option_ready(page, product_code)
     await page.fill("#actualDate", target_date)
     await page.select_option("#selectSec", product_code)
+    await page.wait_for_function(
+        """
+        (expectedProductCode) => {
+            const select = document.querySelector("#selectSec");
+            if (!select) {
+                return false;
+            }
+            return ((select.value || "").trim().toUpperCase() === expectedProductCode);
+        }
+        """,
+        arg=product_code,
+        timeout=PAGE_TIMEOUT_MS,
+    )
     await page.click(".btn-query")
 
     try:
-        await page.wait_for_selector(".if-table", state="visible", timeout=PAGE_TIMEOUT_MS)
+        await wait_for_query_result(page, product_code)
     except PlaywrightTimeoutError:
-        return []
+        state = await describe_query_state(page)
+        raise RuntimeError(
+            f"cffex query did not switch to {product_code} on {target_date}; "
+            f"selected={state['selected_product'] or '-'} headings={','.join(state['headings']) or '-'}"
+        )
 
     html_content = await page.content()
     return parse_html_rows(html_content, product_code, product_name, target_date)
+
+
+async def ensure_futures_mode(page):
+    futures_radio = page.locator(f'input[name="radio"][value="{FUTURES_RADIO_VALUE}"]')
+    await futures_radio.wait_for(state="attached", timeout=PAGE_TIMEOUT_MS)
+    if await futures_radio.is_checked():
+        await futures_radio.click()
+    else:
+        await futures_radio.check()
+    await page.wait_for_function(
+        """
+        () => {
+            const checkedRadio = document.querySelector('input[name="radio"]:checked');
+            return !!checkedRadio && (checkedRadio.value || "").trim() === "\u671f\u8d27";
+        }
+        """,
+        timeout=PAGE_TIMEOUT_MS,
+    )
+
+
+async def ensure_product_option_ready(page, product_code):
+    await page.wait_for_selector("#selectSec", state="visible", timeout=PAGE_TIMEOUT_MS)
+    await page.wait_for_function(
+        """
+        (expectedProductCode) => {
+            const select = document.querySelector("#selectSec");
+            if (!select) {
+                return false;
+            }
+            return Array.from(select.options).some(
+                (option) => ((option.value || "").trim().toUpperCase() === expectedProductCode)
+            );
+        }
+        """,
+        arg=product_code,
+        timeout=PAGE_TIMEOUT_MS,
+    )
+
+
+async def wait_for_query_result(page, product_code):
+    await page.wait_for_function(
+        """
+        (expectedProductCode) => {
+            const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim().toUpperCase();
+            const select = document.querySelector("#selectSec");
+            const selectedProduct = normalize(select ? select.value : "");
+            if (selectedProduct !== expectedProductCode) {
+                return false;
+            }
+
+            const noDataTokens = ["\u6682\u65e0\u6570\u636e", "\u65e0\u6570\u636e", "\u672a\u67e5\u8be2\u5230", "\u6ca1\u6709\u67e5\u8be2\u5230"];
+            const bodyText = normalize(document.body ? document.body.innerText : "");
+            if (noDataTokens.some((token) => bodyText.includes(token))) {
+                return true;
+            }
+
+            const sections = Array.from(document.querySelectorAll("div.IF_first.clearFloat"));
+            if (!sections.length) {
+                return false;
+            }
+
+            const contractMatches = sections
+                .map((section) => {
+                    const anchorText = Array.from(section.querySelectorAll("a"))
+                        .map((node) => node.textContent || "")
+                        .join(" ");
+                    const rawText = normalize(anchorText || section.textContent || "");
+                    const match = rawText.match(/(?:TL|TF|TS|IF|IH|IC|IM|T)\\d{3,4}/);
+                    return match ? match[0] : "";
+                })
+                .filter(Boolean);
+
+            return contractMatches.length > 0
+                && contractMatches.every((contractCode) => contractCode.startsWith(expectedProductCode));
+        }
+        """,
+        arg=product_code,
+        timeout=PAGE_TIMEOUT_MS,
+    )
+
+
+async def describe_query_state(page):
+    return await page.evaluate(
+        """
+        () => {
+            const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim().toUpperCase();
+            const select = document.querySelector("#selectSec");
+            const headings = Array.from(document.querySelectorAll("div.IF_first.clearFloat"))
+                .map((section) => {
+                    const anchorText = Array.from(section.querySelectorAll("a"))
+                        .map((node) => node.textContent || "")
+                        .join(" ");
+                    return normalize(anchorText || section.textContent || "");
+                })
+                .filter(Boolean)
+                .slice(0, 5);
+            return {
+                selected_product: normalize(select ? select.value : ""),
+                headings,
+            };
+        }
+        """
+    )
 
 
 async def sync_rows(db_tools, rows):
@@ -209,7 +377,10 @@ async def process_trade_day(page, db_tools, product_code, target_date, processed
         inserted = await sync_rows(db_tools, rows)
         save_progress(progress_key)
         processed.add(progress_key)
-        print(f"{product_code} {target_date} saved rows: {inserted}")
+        if rows:
+            print(f"{product_code} {target_date} parsed rows: {len(rows)}, saved rows: {inserted}")
+        else:
+            print(f"{product_code} {target_date} parsed rows: 0, saved rows: 0")
         await asyncio.sleep(REQUEST_SLEEP_SECONDS)
         return inserted
     except Exception as exc:
@@ -254,7 +425,7 @@ async def backfill_all_history(headless=True, end_date=None, product_codes=None)
 
 async def sync_latest_daily_data(headless=True, end_date=None, product_codes=None):
     selected_codes = product_codes or list(PRODUCTS.keys())
-    processed = load_progress()
+    processed = set()
     db_tools = DbTools()
     await db_tools.init_pool()
 

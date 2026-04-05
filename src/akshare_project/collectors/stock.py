@@ -23,7 +23,6 @@ STOCK_HIST_TX_REQUEST_KEY_VERSION = "v4"
 
 LOGGER = get_logger("stock")
 STOCK_INFO_SYNC_STATE_PATH = get_state_path("stock_info_all", suffix="daily-sync")
-STOCK_DAILY_ONE_TIME_REPAIR_STATE_PATH = get_state_path("stock_daily", suffix="one-time-repair")
 
 SH_SOURCES = ["主板A股", "科创板"]
 SZ_SOURCES = ["A股列表"]
@@ -323,19 +322,6 @@ def load_stock_info_sync_marker():
 
 def save_stock_info_sync_marker(marker):
     Path(STOCK_INFO_SYNC_STATE_PATH).write_text(str(marker or "").strip(), encoding="utf-8")
-
-
-def load_stock_daily_one_time_repair_marker():
-    if not Path(STOCK_DAILY_ONE_TIME_REPAIR_STATE_PATH).exists():
-        return None
-    try:
-        return Path(STOCK_DAILY_ONE_TIME_REPAIR_STATE_PATH).read_text(encoding="utf-8").strip() or None
-    except OSError:
-        return None
-
-
-def save_stock_daily_one_time_repair_marker(marker):
-    Path(STOCK_DAILY_ONE_TIME_REPAIR_STATE_PATH).write_text(str(marker or "").strip(), encoding="utf-8")
 
 
 def get_stock_info_sh(symbol, return_scheduler_meta=False):
@@ -795,17 +781,9 @@ async def sync_daily(selected_codes=None, db_tools=None):
         stock_info_map = build_stock_info_map(info_rows)
         spot_result = await asyncio.to_thread(get_stock_spot, True)
         spot_df = spot_result.value
-        scheduler_context = None
-        if getattr(spot_result, "job_id", None):
-            scheduler_context = SchedulerContext(
-                parent_job_id=int(spot_result.job_id),
-                root_job_id=int(spot_result.root_job_id or spot_result.job_id),
-                workflow_name="stock_daily",
-            )
         rows = build_spot_snapshot_rows(spot_df, selected_codes=target_codes, stock_info_map=stock_info_map)
         affected = await db_tools.upsert_stock_daily_data(rows)
         deleted_today = 0
-        yesterday_summary = None
         if selected_codes is None:
             today_text = date.today().strftime("%Y-%m-%d")
             existing_today_codes = set(await db_tools.get_stock_daily_prefixed_codes_by_date(today_text))
@@ -815,42 +793,20 @@ async def sync_daily(selected_codes=None, db_tools=None):
                     today_text,
                     extra_today_codes,
                 )
-            yesterday_trade_day = date.today() - timedelta(days=1)
-            yesterday_marker = yesterday_trade_day.strftime("%Y-%m-%d")
-            if load_stock_daily_one_time_repair_marker() != yesterday_marker:
-                yesterday_summary = await repair_stock_daily_trade_date_alignment(
-                    db_tools=db_tools,
-                    info_rows=info_rows,
-                    trade_day=yesterday_trade_day,
-                    scheduler_context=scheduler_context,
-                )
-                save_stock_daily_one_time_repair_marker(yesterday_marker)
 
         print(
             "stock daily finished: "
             f"rows={len(rows)}, affected={affected}, deleted_today={deleted_today}, "
             f"target_universe={len(target_rows)}"
         )
-        if yesterday_summary:
-            print(
-                "stock daily yesterday repair: "
-                f"trade_date={yesterday_summary['trade_date']}, "
-                f"target={yesterday_summary['target_count']}, "
-                f"existing_before={yesterday_summary['existing_count']}, "
-                f"deleted={yesterday_summary['deleted']}, "
-                f"missing={yesterday_summary['missing']}, "
-                f"written={yesterday_summary['written']}, "
-                f"failed={yesterday_summary['failed']}"
-            )
-        quant_refresh_start = yesterday_summary["trade_date"] if yesterday_summary else date.today().strftime("%Y-%m-%d")
         quant_affected = await refresh_quant_index_dashboard_range(
             db_tools,
-            start_date=quant_refresh_start,
+            start_date=date.today().strftime("%Y-%m-%d"),
             end_date=date.today().strftime("%Y-%m-%d"),
         )
         print(
             "stock daily quant-index refresh: "
-            f"start_date={quant_refresh_start}, end_date={date.today().strftime('%Y-%m-%d')}, affected={quant_affected}"
+            f"start_date={date.today().strftime('%Y-%m-%d')}, end_date={date.today().strftime('%Y-%m-%d')}, affected={quant_affected}"
         )
         return affected
     finally:
@@ -893,97 +849,6 @@ async def refresh_quant_index_dashboard_range(db_tools, start_date, end_date):
     if parse_trade_date(start_text) > parse_trade_date(end_text):
         return 0
     return await compute_and_upsert_range(db_tools, start_text, end_text)
-
-
-async def _repair_single_trade_day_stock(db_tools, stock_row, trade_day, scheduler_context=None, semaphore=None):
-    async with semaphore:
-        prefixed_code = stock_row["prefixed_code"]
-        stock_name = stock_row.get("stock_name")
-        history_df = await asyncio.to_thread(
-            get_stock_history_tx,
-            prefixed_code,
-            trade_day,
-            trade_day,
-            scheduler_context,
-        )
-        if history_df is None or history_df.empty:
-            return 0
-        trade_day_text = trade_day.strftime("%Y-%m-%d")
-        rows = [
-            row
-            for row in build_hist_tx_rows(prefixed_code, stock_name, history_df)
-            if row.get("trade_date") == trade_day_text
-        ]
-        if not rows:
-            return 0
-        return await db_tools.upsert_stock_daily_data(rows)
-
-
-async def repair_stock_daily_trade_date_alignment(
-    db_tools,
-    info_rows,
-    trade_day,
-    scheduler_context=None,
-    selected_codes=None,
-):
-    target_rows = build_target_stock_rows(
-        info_rows,
-        selected_codes=selected_codes,
-        listed_on_or_before=trade_day,
-    )
-    target_prefixed_codes = {
-        normalize_prefixed_code(row.get("prefixed_code"))
-        for row in target_rows
-        if normalize_prefixed_code(row.get("prefixed_code"))
-    }
-    trade_day_text = trade_day.strftime("%Y-%m-%d")
-    existing_prefixed_codes = set(await db_tools.get_stock_daily_prefixed_codes_by_date(trade_day_text))
-
-    extra_prefixed_codes = sorted(existing_prefixed_codes - target_prefixed_codes)
-    deleted = 0
-    if extra_prefixed_codes:
-        deleted = await db_tools.delete_stock_daily_data_by_trade_date_and_prefixed_codes(
-            trade_day_text,
-            extra_prefixed_codes,
-        )
-
-    missing_rows = [
-        row for row in target_rows
-        if normalize_prefixed_code(row.get("prefixed_code")) not in existing_prefixed_codes
-    ]
-    written = 0
-    failed = 0
-    if missing_rows:
-        semaphore = asyncio.Semaphore(MAX_HISTORY_CONCURRENCY)
-        results = await asyncio.gather(
-            *[
-                _repair_single_trade_day_stock(
-                    db_tools=db_tools,
-                    stock_row=row,
-                    trade_day=trade_day,
-                    scheduler_context=scheduler_context,
-                    semaphore=semaphore,
-                )
-                for row in missing_rows
-            ],
-            return_exceptions=True,
-        )
-        for row, result in zip(missing_rows, results):
-            if isinstance(result, Exception):
-                failed += 1
-                print(f"stock trade-date repair failed for {row['prefixed_code']} on {trade_day_text}: {result}")
-                continue
-            written += int(result or 0)
-
-    return {
-        "trade_date": trade_day_text,
-        "target_count": len(target_prefixed_codes),
-        "existing_count": len(existing_prefixed_codes),
-        "deleted": deleted,
-        "missing": len(missing_rows),
-        "written": written,
-        "failed": failed,
-    }
 
 
 async def backfill_history(selected_codes=None, db_tools=None):

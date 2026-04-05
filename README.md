@@ -96,6 +96,7 @@ python run.py index backfill
 python run.py quant-index daily [trade_date]
 python run.py quant-index backfill [start_date] [end_date]
 python run.py quant-index refresh-breadth [start_date] [end_date]
+python run.py quant-index repair-recent [trade_day_count]
 
 python run.py cffex daily [PRODUCT_CODE ...]
 python run.py cffex backfill [PRODUCT_CODE ...]
@@ -210,7 +211,8 @@ python ak_scheduler_service.py doctor
   - 先同步 `stock_info_all`
   - 再调用 `stock_zh_a_spot`
   - 只写当前 `stock_info_all` 成分内的股票到 `stock_daily_data`
-  - 默认整市场执行时，会顺带做一次“昨日对齐修补”，修正昨天被错误写入或缺失的日线
+  - 日常采集只使用 `stock_zh_a_spot` 返回的整表快照写库
+  - 不会在 `daily` 链路中逐股调用 `stock_zh_a_hist_tx`
   - 完成后会刷新受影响日期的 `quant_index_dashboard_daily`
 - `python run.py stock backfill [stock_code ...]`
   - 先同步 `stock_info_all`
@@ -684,3 +686,11 @@ python run.py runner retry-failures stock_daily 20
 - 若怀疑 scheduler 命中了旧进程、空成功缓存或异常复用，优先执行：
   - `python ak_scheduler_service.py health`
   - `python ak_scheduler_service.py doctor`
+
+## Quant Index Notes
+
+- `python run.py quant-index repair-recent [trade_day_count]`
+  - default recalculates the latest 10 trade dates in `quant_index_dashboard_daily`
+- `python run.py emotion-excel import [xlsx_path]`
+  - now upserts `excel_index_emotion_daily` by `emotion_date + index_name`
+  - after import, it automatically refreshes `quant_index_dashboard_daily` only for the affected trade dates

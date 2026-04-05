@@ -371,3 +371,10 @@
 - `option_cffex_daily_data`
 
 如果要做新页面或新接口，请优先接入本文档中说明的新主表。  
+## Quant Index Refresh Notes
+
+- `quant_index_dashboard_daily` can be recalculated with:
+  - `python run.py quant-index repair-recent [trade_day_count]`
+  - `python run.py quant-index refresh-breadth [start_date] [end_date]`
+- `excel_index_emotion_daily` now uses upsert semantics on `emotion_date + index_name`
+- after `python run.py emotion-excel import [xlsx_path]`, the project automatically refreshes `quant_index_dashboard_daily` only for the affected trade dates

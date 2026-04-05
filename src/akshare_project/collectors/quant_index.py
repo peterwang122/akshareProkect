@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.db.db_tool import DbTools
@@ -60,6 +60,18 @@ def parse_date_arg(value):
         except ValueError:
             continue
     raise ValueError(f"invalid date: {value}")
+
+
+def parse_trade_day_count_arg(value, default_value=10):
+    if value is None:
+        return default_value
+    try:
+        parsed_value = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid trade day count: {value}")
+    if parsed_value <= 0:
+        raise ValueError(f"invalid trade day count: {value}")
+    return parsed_value
 
 
 def to_float(value):
@@ -274,6 +286,48 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
     return affected
 
 
+def merge_trade_dates_to_ranges(trade_dates):
+    normalized_dates = sorted({
+        normalize_date_text(trade_date)
+        for trade_date in (trade_dates or [])
+        if normalize_date_text(trade_date)
+    })
+    if not normalized_dates:
+        return []
+
+    ranges = []
+    current_start = normalized_dates[0]
+    current_end = normalized_dates[0]
+    current_end_date = datetime.strptime(current_end, "%Y-%m-%d").date()
+
+    for trade_date in normalized_dates[1:]:
+        parsed_trade_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
+        if parsed_trade_date == current_end_date + timedelta(days=1):
+            current_end = trade_date
+            current_end_date = parsed_trade_date
+            continue
+
+        ranges.append((current_start, current_end))
+        current_start = trade_date
+        current_end = trade_date
+        current_end_date = parsed_trade_date
+
+    ranges.append((current_start, current_end))
+    return ranges
+
+
+async def refresh_trade_dates(db_tools, trade_dates):
+    merged_ranges = merge_trade_dates_to_ranges(trade_dates)
+    if not merged_ranges:
+        print("quant index dashboard refresh skipped: no valid trade dates")
+        return 0
+
+    total_affected = 0
+    for start_date, end_date in merged_ranges:
+        total_affected += await compute_and_upsert_range(db_tools, start_date, end_date)
+    return total_affected
+
+
 async def backfill_history(start_date=None, end_date=None):
     db_tools = DbTools()
     await db_tools.init_pool()
@@ -302,6 +356,31 @@ async def sync_daily(target_date=None):
             print("quant index dashboard daily finished: no latest trade date found")
             return 0
         return await compute_and_upsert_range(db_tools, actual_date, actual_date)
+    finally:
+        await db_tools.close()
+
+
+async def repair_recent(trade_day_count=10):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        recent_trade_dates = await db_tools.get_latest_quant_index_trade_dates(
+            INDEX_NAME_ORDER,
+            limit=trade_day_count,
+        )
+        if not recent_trade_dates:
+            print("quant index dashboard repair recent finished: no trade dates found")
+            return 0
+
+        affected = await refresh_trade_dates(db_tools, recent_trade_dates)
+        print(
+            "quant index dashboard repair recent finished: "
+            f"trade_day_count={trade_day_count}, "
+            f"trade_dates={len(recent_trade_dates)}, "
+            f"start_date={min(recent_trade_dates)}, end_date={max(recent_trade_dates)}, "
+            f"affected={affected}"
+        )
+        return affected
     finally:
         await db_tools.close()
 
@@ -349,10 +428,15 @@ async def main():
         end_date = parse_date_arg(args[1]) if len(args) > 1 else None
         await refresh_breadth_data(start_date=start_date, end_date=end_date)
         return
+    if command == "repair-recent":
+        trade_day_count = parse_trade_day_count_arg(args[0]) if args else 10
+        await repair_recent(trade_day_count=trade_day_count)
+        return
 
     raise ValueError(
         "quant-index supports: backfill [start_date] [end_date] | "
-        "daily [trade_date] | refresh-breadth [start_date] [end_date]"
+        "daily [trade_date] | refresh-breadth [start_date] [end_date] | "
+        "repair-recent [trade_day_count]"
     )
 
 
