@@ -149,10 +149,11 @@ class SchedulerStore:
                         cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
                         row = cursor.fetchone()
                         reused_existing = not is_new_row
+                        existing_status = str(row.get("status") or "").strip().upper()
                         was_empty_success = (
                             reused_existing
                             and str(payload.get("function_name") or "").strip().lower() == "stock_zh_a_hist_tx"
-                            and str(row.get("status") or "").strip().upper() == "SUCCESS"
+                            and existing_status == "SUCCESS"
                             and self.is_empty_dataframe_payload(row.get("result_type"), row.get("result_json"))
                         )
                         if was_empty_success:
@@ -179,6 +180,35 @@ class SchedulerStore:
                             row = cursor.fetchone()
                             row["_dedupe_reused"] = False
                             row["_dedupe_requeued_empty_success"] = True
+                            return row
+
+                        requeue_terminal_status = (
+                            reused_existing
+                            and existing_status in {"FAILED", "CANCELLED"}
+                        )
+                        if requeue_terminal_status:
+                            cursor.execute(
+                                """
+                                UPDATE ak_request_jobs
+                                SET status = %s,
+                                    attempt_count = 0,
+                                    next_run_at = %s,
+                                    lease_until = NULL,
+                                    error_category = NULL,
+                                    error_message = NULL,
+                                    result_type = NULL,
+                                    result_json = NULL,
+                                    started_at = NULL,
+                                    finished_at = NULL,
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = %s
+                                """,
+                                (status, now, job_id),
+                            )
+                            cursor.execute("SELECT * FROM ak_request_jobs WHERE id = %s", (job_id,))
+                            row = cursor.fetchone()
+                            row["_dedupe_reused"] = False
+                            row["_dedupe_requeued_terminal_status"] = existing_status
                             return row
 
                         row["_dedupe_reused"] = reused_existing

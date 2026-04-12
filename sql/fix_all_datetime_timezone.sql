@@ -48,6 +48,20 @@ SET @stmt = (
   SELECT IF(
     EXISTS (
       SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'stock_hfq_daily_data' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE stock_hfq_daily_data
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
       WHERE table_schema = DATABASE() AND table_name = 'stock_basic_info' AND column_name = 'created_at'
     ),
     "ALTER TABLE stock_basic_info

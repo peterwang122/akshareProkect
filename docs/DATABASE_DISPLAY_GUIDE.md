@@ -7,7 +7,8 @@
 | --- | --- | --- | --- |
 | 股票基础信息 | `stock_info_all` | `prefixed_code` | 新股票主表 |
 | 股票日线/日快照 | `stock_daily_data` | `prefixed_code + trade_date` | 新股票主表 |
-| 股票前复权日线 | `stock_qfq_daily_data` | `prefixed_code + trade_date` | 仅临时服务刷新 |
+| 股票后复权日线 | `stock_hfq_daily_data` | `prefixed_code + trade_date` | 临时服务当前活动表 |
+| 股票前复权日线 | `stock_qfq_daily_data` | `prefixed_code + trade_date` | 历史参考，不再供 FIT 使用 |
 | 指数基础信息 | `index_basic_info` | `index_code` | 持续更新 |
 | 指数日线 | `index_daily_data` | `index_code + trade_date + data_source` | 持续更新 |
 | 量化指数看板预计算 | `quant_index_dashboard_daily` | `index_code + trade_date` | 持续更新 |
@@ -93,11 +94,11 @@
   - 若需要当天实时快照，请优先读取 `data_source='stock_zh_a_spot'`
   - 若需要历史非复权日线，请优先读取 `data_source='stock_zh_a_hist_tx'`
 
-### `stock_qfq_daily_data`
-- 用途：按单只股票临时采集的前复权日线。
+### `stock_hfq_daily_data`
+- 用途：按单只股票临时采集的后复权日线。
 - 推荐展示：
-  - 前复权 K 线
-  - 供另一个项目按需刷新后读取
+  - 后复权 K 线
+  - 供 FIT 和其他项目按需刷新后读取
 - 核心字段：
   - `stock_code`
   - `prefixed_code`
@@ -119,11 +120,18 @@
   - `refresh_batch_id`
 - 说明：
   - 该表只由独立服务 `stock_temp_service.py` 写入
+  - 当前临时服务调用 `stock_zh_a_daily(adjust="hfq")`
   - 同一股票如果请求区间变化，会删除旧数据后整表重写
   - 当前会在写库前按“前一交易日收盘价”自行计算：
     - `price_change_amount = 当日 close_price - 前一交易日 close_price`
     - `price_change_rate = price_change_amount / 前一交易日 close_price * 100`
   - 每次请求区间中的第一条记录因为没有区间内上一交易日收盘价，`price_change_amount` 和 `price_change_rate` 允许为 `NULL`
+
+### `stock_qfq_daily_data`
+- 用途：历史前复权参考表。
+- 说明：
+  - 该表保留历史数据，但 FIT 不再读取它
+  - 当前临时服务已不再向该表写入新数据
 
 ## 指数
 ### `index_basic_info`

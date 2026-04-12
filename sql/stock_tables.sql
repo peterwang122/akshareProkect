@@ -76,6 +76,29 @@ CREATE TABLE IF NOT EXISTS stock_qfq_daily_data (
   KEY idx_stock_qfq_refresh_batch (refresh_batch_id)
 );
 
-ALTER TABLE stock_qfq_daily_data
-  ADD COLUMN IF NOT EXISTS price_change_amount DECIMAL(18, 4) NULL AFTER low_price,
-  ADD COLUMN IF NOT EXISTS price_change_rate DECIMAL(18, 4) NULL AFTER price_change_amount;
+CREATE TABLE IF NOT EXISTS stock_hfq_daily_data (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  stock_code VARCHAR(16) NOT NULL,
+  prefixed_code VARCHAR(16) NOT NULL,
+  stock_name VARCHAR(128) NULL,
+  trade_date DATE NOT NULL,
+  open_price DECIMAL(18, 4) NULL,
+  close_price DECIMAL(18, 4) NULL,
+  high_price DECIMAL(18, 4) NULL,
+  low_price DECIMAL(18, 4) NULL,
+  price_change_amount DECIMAL(18, 4) NULL,
+  price_change_rate DECIMAL(18, 4) NULL,
+  volume DECIMAL(24, 2) NULL,
+  turnover_amount DECIMAL(24, 2) NULL,
+  outstanding_share DECIMAL(24, 2) NULL,
+  turnover_rate DECIMAL(18, 4) NULL,
+  data_source VARCHAR(64) NOT NULL,
+  request_start_date DATE NULL,
+  request_end_date DATE NULL,
+  refresh_batch_id VARCHAR(64) NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_stock_hfq_prefixed_date (prefixed_code, trade_date),
+  KEY idx_stock_hfq_code_date (stock_code, trade_date),
+  KEY idx_stock_hfq_refresh_batch (refresh_batch_id)
+);
