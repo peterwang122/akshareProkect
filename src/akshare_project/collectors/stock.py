@@ -187,6 +187,44 @@ def format_ak_date(value):
     return str(value or "").replace("-", "")
 
 
+def resolve_scheduler_bucket_date_text(value=None):
+    parsed = parse_trade_date(value)
+    return parsed.strftime("%Y-%m-%d") if parsed else date.today().strftime("%Y-%m-%d")
+
+
+def parse_required_trade_dates(values):
+    normalized_dates = []
+    for value in values or []:
+        normalized = normalize_trade_date_text(value)
+        if not normalized or not parse_trade_date(normalized):
+            raise ValueError(f"invalid trade date: {value}")
+        normalized_dates.append(normalized)
+    unique_dates = sorted(set(normalized_dates))
+    if not unique_dates:
+        raise ValueError("at least one trade date is required")
+    return unique_dates
+
+
+def parse_repair_daily_dates_cli_args(args):
+    args = list(args or [])
+    selected_codes = None
+    if "--codes" in args:
+        separator_index = args.index("--codes")
+        date_args = args[:separator_index]
+        code_args = args[separator_index + 1:]
+        selected_codes = [
+            normalize_stock_code(code)
+            for code in code_args
+            if normalize_stock_code(code)
+        ]
+        if code_args and not selected_codes:
+            raise ValueError("repair-daily-dates --codes requires at least one valid stock code")
+    else:
+        date_args = args
+    trade_dates = parse_required_trade_dates(date_args)
+    return trade_dates, (selected_codes or None)
+
+
 def normalize_snapshot_time(value):
     if value is None or (hasattr(pd, "isna") and pd.isna(value)):
         return datetime.now()
@@ -350,11 +388,12 @@ def get_stock_info_bj(return_scheduler_meta=False):
     )
 
 
-def get_stock_spot(return_scheduler_meta=False):
+def get_stock_spot(return_scheduler_meta=False, bucket_date=None):
+    request_bucket_date = resolve_scheduler_bucket_date_text(bucket_date)
     return fetch_with_retry(
         ak.stock_zh_a_spot,
         return_scheduler_meta=return_scheduler_meta,
-        request_key="stock_zh_a_spot:all",
+        request_key=f"stock_zh_a_spot:all:{request_bucket_date}",
     )
 
 
@@ -374,14 +413,14 @@ def get_stock_history_tx(prefixed_code, start_date, end_date, scheduler_context=
     )
 
 
-def get_stock_qfq_daily(prefixed_code, start_date, end_date):
-    request_key = f"stock_zh_a_daily:{normalize_prefixed_code(prefixed_code)}:{format_ak_date(start_date)}:{format_ak_date(end_date)}:qfq"
+def get_stock_hfq_daily(prefixed_code, start_date, end_date):
+    request_key = f"stock_zh_a_daily:{normalize_prefixed_code(prefixed_code)}:{format_ak_date(start_date)}:{format_ak_date(end_date)}:hfq"
     return fetch_with_retry(
         ak.stock_zh_a_daily,
         symbol=normalize_prefixed_code(prefixed_code),
         start_date=format_ak_date(start_date),
         end_date=format_ak_date(end_date),
-        adjust="qfq",
+        adjust="hfq",
         request_key=request_key,
     )
 
@@ -611,13 +650,14 @@ def build_spot_snapshot_rows(spot_df, selected_codes=None, stock_info_map=None):
         for code in (selected_codes or [])
         if normalize_stock_code(code)
     }
-    trade_date = datetime.now().strftime("%Y-%m-%d")
     rows = []
     for _, row in spot_df.iterrows():
         stock_code = normalize_stock_code(row.get("代码"))
         if not stock_code or (selected and stock_code not in selected):
             continue
         prefixed_code = resolve_prefixed_code(stock_code, stock_info_map=stock_info_map)
+        snapshot_time = normalize_snapshot_time(row.get("时间戳"))
+        trade_date = snapshot_time.date().strftime("%Y-%m-%d") if snapshot_time else date.today().strftime("%Y-%m-%d")
         rows.append({
             "stock_code": stock_code,
             "prefixed_code": prefixed_code,
@@ -636,7 +676,7 @@ def build_spot_snapshot_rows(spot_df, selected_codes=None, stock_info_map=None):
             "volume": row.get("成交量"),
             "turnover_amount": row.get("成交额"),
             "data_source": "stock_zh_a_spot",
-            "snapshot_time": normalize_snapshot_time(row.get("时间戳")),
+            "snapshot_time": snapshot_time,
         })
     return rows
 
@@ -671,14 +711,14 @@ def build_hist_tx_rows(prefixed_code, stock_name, history_df):
     return rows
 
 
-def build_qfq_rows(prefixed_code, stock_name, request_start_date, request_end_date, refresh_batch_id, qfq_df):
+def build_hfq_rows(prefixed_code, stock_name, request_start_date, request_end_date, refresh_batch_id, hfq_df):
     rows = []
     stock_code = normalize_stock_code(prefixed_code)
     normalized_prefixed_code = normalize_prefixed_code(prefixed_code)
     request_start = normalize_trade_date_text(request_start_date)
     request_end = normalize_trade_date_text(request_end_date)
     dated_rows = []
-    for _, row in qfq_df.iterrows():
+    for _, row in hfq_df.iterrows():
         trade_date = normalize_trade_date_text(row.get("date") or getattr(row, "name", None))
         if not trade_date:
             continue
@@ -704,7 +744,7 @@ def build_qfq_rows(prefixed_code, stock_name, request_start_date, request_end_da
             "turnover_amount": row.get("amount"),
             "outstanding_share": row.get("outstanding_share"),
             "turnover_rate": row.get("turnover"),
-            "data_source": "stock_zh_a_daily_qfq",
+            "data_source": "stock_zh_a_daily_hfq",
             "request_start_date": request_start,
             "request_end_date": request_end,
             "refresh_batch_id": refresh_batch_id,
@@ -779,34 +819,50 @@ async def sync_daily(selected_codes=None, db_tools=None):
             if normalize_prefixed_code(row.get("prefixed_code"))
         }
         stock_info_map = build_stock_info_map(info_rows)
-        spot_result = await asyncio.to_thread(get_stock_spot, True)
+        today_text = date.today().strftime("%Y-%m-%d")
+        spot_result = await asyncio.to_thread(get_stock_spot, True, today_text)
         spot_df = spot_result.value
         rows = build_spot_snapshot_rows(spot_df, selected_codes=target_codes, stock_info_map=stock_info_map)
+        if not rows:
+            raise ValueError("stock daily returned no spot rows for the selected universe")
+        trade_dates = sorted(
+            {
+                normalize_trade_date_text(row.get("trade_date"))
+                for row in rows
+                if normalize_trade_date_text(row.get("trade_date"))
+            }
+        )
+        if len(trade_dates) != 1:
+            raise ValueError(f"stock spot returned inconsistent trade dates: {trade_dates}")
+        derived_trade_date = trade_dates[0]
+        if derived_trade_date != today_text:
+            raise ValueError(
+                f"stock spot trade_date mismatch: expected {today_text}, got {derived_trade_date}"
+            )
         affected = await db_tools.upsert_stock_daily_data(rows)
         deleted_today = 0
         if selected_codes is None:
-            today_text = date.today().strftime("%Y-%m-%d")
-            existing_today_codes = set(await db_tools.get_stock_daily_prefixed_codes_by_date(today_text))
+            existing_today_codes = set(await db_tools.get_stock_daily_prefixed_codes_by_date(derived_trade_date))
             extra_today_codes = sorted(existing_today_codes - target_prefixed_codes)
             if extra_today_codes:
                 deleted_today = await db_tools.delete_stock_daily_data_by_trade_date_and_prefixed_codes(
-                    today_text,
+                    derived_trade_date,
                     extra_today_codes,
                 )
 
         print(
             "stock daily finished: "
-            f"rows={len(rows)}, affected={affected}, deleted_today={deleted_today}, "
-            f"target_universe={len(target_rows)}"
+            f"trade_date={derived_trade_date}, rows={len(rows)}, affected={affected}, "
+            f"deleted_today={deleted_today}, target_universe={len(target_rows)}"
         )
         quant_affected = await refresh_quant_index_dashboard_range(
             db_tools,
-            start_date=date.today().strftime("%Y-%m-%d"),
-            end_date=date.today().strftime("%Y-%m-%d"),
+            start_date=derived_trade_date,
+            end_date=derived_trade_date,
         )
         print(
             "stock daily quant-index refresh: "
-            f"start_date={date.today().strftime('%Y-%m-%d')}, end_date={date.today().strftime('%Y-%m-%d')}, affected={quant_affected}"
+            f"start_date={derived_trade_date}, end_date={derived_trade_date}, affected={quant_affected}"
         )
         return affected
     finally:
@@ -837,6 +893,47 @@ async def _backfill_single_stock(db_tools, stock_row, stock_info_map, end_date, 
         if not rows:
             raise ValueError(f"history rows could not be built for {prefixed_code}")
         return await db_tools.upsert_stock_daily_data(rows)
+
+
+async def _repair_daily_dates_single_stock(
+    db_tools,
+    stock_row,
+    stock_info_map,
+    requested_trade_dates,
+    repair_end_date,
+    scheduler_context=None,
+    semaphore=None,
+):
+    async with semaphore:
+        stock_code = stock_row["stock_code"]
+        prefixed_code = stock_row["prefixed_code"]
+        stock_name = stock_row.get("stock_name")
+        info_row = stock_info_map.get(stock_code) or stock_info_map.get(prefixed_code)
+        list_date = resolve_stock_history_start_date(stock_row, stock_info_map=stock_info_map)
+        repair_start_date = parse_trade_date(min(requested_trade_dates))
+        effective_start_date = max(list_date, repair_start_date)
+        if effective_start_date > repair_end_date:
+            return 0
+
+        history_df = await asyncio.to_thread(
+            get_stock_history_tx,
+            prefixed_code,
+            effective_start_date,
+            repair_end_date,
+            scheduler_context,
+        )
+        if history_df is None or history_df.empty:
+            raise ValueError(f"empty history returned for {prefixed_code}")
+        rows = build_hist_tx_rows(prefixed_code, stock_name or (info_row or {}).get("stock_name"), history_df)
+        if not rows:
+            raise ValueError(f"history rows could not be built for {prefixed_code}")
+        filtered_rows = [
+            row for row in rows
+            if normalize_trade_date_text(row.get("trade_date")) in requested_trade_dates
+        ]
+        if not filtered_rows:
+            raise ValueError(f"requested trade dates missing from history for {prefixed_code}")
+        return await db_tools.upsert_stock_daily_data(filtered_rows)
 
 
 async def refresh_quant_index_dashboard_range(db_tools, start_date, end_date):
@@ -993,7 +1090,84 @@ async def repair_backfill_missing_history(selected_codes=None, db_tools=None):
             await db_tools.close()
 
 
-async def collect_qfq_for_request(stock_code, start_date=None, end_date=None, db_tools=None):
+async def repair_daily_dates(trade_dates, selected_codes=None, db_tools=None):
+    requested_trade_dates = parse_required_trade_dates(trade_dates)
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
+        await db_tools.init_pool()
+    try:
+        info_rows = await sync_stock_info_all(db_tools=db_tools)
+        repair_end_date = parse_trade_date(max(requested_trade_dates))
+        target_rows = build_target_stock_rows(
+            info_rows,
+            selected_codes=selected_codes,
+            listed_on_or_before=repair_end_date,
+        )
+        if not target_rows:
+            print("stock repair-daily-dates finished: no stocks matched stock_info_all")
+            return 0
+
+        stock_info_map = build_stock_info_map(info_rows)
+        scheduler_context = SchedulerContext(workflow_name="stock_repair_daily_dates")
+        semaphore = asyncio.Semaphore(MAX_HISTORY_CONCURRENCY)
+        tasks = [
+            _repair_daily_dates_single_stock(
+                db_tools=db_tools,
+                stock_row=row,
+                stock_info_map=stock_info_map,
+                requested_trade_dates=requested_trade_dates,
+                repair_end_date=repair_end_date,
+                scheduler_context=scheduler_context,
+                semaphore=semaphore,
+            )
+            for row in target_rows
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        affected = 0
+        failed = 0
+        failed_codes = []
+        for row, result in zip(target_rows, results):
+            if isinstance(result, Exception):
+                failed += 1
+                failed_codes.append(row["prefixed_code"])
+                print(f"stock repair-daily-dates failed for {row['prefixed_code']}: {result}")
+                continue
+            affected += int(result or 0)
+
+        print(
+            "stock repair-daily-dates finished: "
+            f"trade_dates={','.join(requested_trade_dates)}, "
+            f"target_stocks={len(target_rows)}, affected={affected}, failed={failed}"
+        )
+        if failed_codes:
+            normalized_failed_codes = [normalize_prefixed_code(code) for code in failed_codes if normalize_prefixed_code(code)]
+            failed_stock_codes = [normalize_stock_code(code) for code in normalized_failed_codes if normalize_stock_code(code)]
+            print(
+                "stock repair-daily-dates failed codes: "
+                f"{','.join(normalized_failed_codes)}"
+            )
+            print(
+                "stock repair-daily-dates rerun hint: "
+                f"python run.py stock repair-daily-dates {' '.join(requested_trade_dates)} --codes {' '.join(failed_stock_codes)}"
+            )
+        quant_affected = await refresh_quant_index_dashboard_range(
+            db_tools,
+            start_date=min(requested_trade_dates),
+            end_date=max(requested_trade_dates),
+        )
+        print(
+            "stock repair-daily-dates quant-index refresh: "
+            f"start_date={min(requested_trade_dates)}, end_date={max(requested_trade_dates)}, affected={quant_affected}"
+        )
+        return affected
+    finally:
+        if own_db:
+            await db_tools.close()
+
+
+async def collect_hfq_for_request(stock_code, start_date=None, end_date=None, db_tools=None):
     normalized_code = normalize_stock_code(stock_code)
     if not normalized_code:
         raise ValueError("stock_code must be a 6-digit code")
@@ -1015,7 +1189,7 @@ async def collect_qfq_for_request(stock_code, start_date=None, end_date=None, db
         if effective_start > effective_end:
             raise ValueError("start_date can not be later than end_date")
 
-        existing_window = await db_tools.get_stock_qfq_request_window(prefixed_code)
+        existing_window = await db_tools.get_stock_hfq_request_window(prefixed_code)
         effective_start_text = effective_start.strftime("%Y-%m-%d")
         effective_end_text = effective_end.strftime("%Y-%m-%d")
         if (
@@ -1035,25 +1209,25 @@ async def collect_qfq_for_request(stock_code, start_date=None, end_date=None, db
                 "written_rows": 0,
             }
 
-        qfq_df = await asyncio.to_thread(
-            get_stock_qfq_daily,
+        hfq_df = await asyncio.to_thread(
+            get_stock_hfq_daily,
             prefixed_code,
             effective_start,
             effective_end,
         )
-        if qfq_df is None or qfq_df.empty:
-            raise ValueError(f"no qfq data returned for {prefixed_code}")
+        if hfq_df is None or hfq_df.empty:
+            raise ValueError(f"no hfq data returned for {prefixed_code}")
 
         refresh_batch_id = uuid.uuid4().hex
-        rows = build_qfq_rows(
+        rows = build_hfq_rows(
             prefixed_code=prefixed_code,
             stock_name=stock_name,
             request_start_date=effective_start_text,
             request_end_date=effective_end_text,
             refresh_batch_id=refresh_batch_id,
-            qfq_df=qfq_df,
+            hfq_df=hfq_df,
         )
-        deleted_rows, written_rows = await db_tools.replace_stock_qfq_daily_data(prefixed_code, rows)
+        deleted_rows, written_rows = await db_tools.replace_stock_hfq_daily_data(prefixed_code, rows)
         return {
             "status": "SUCCESS",
             "stock_code": normalized_code,
@@ -1072,19 +1246,27 @@ async def collect_qfq_for_request(stock_code, start_date=None, end_date=None, db
 
 async def main():
     command = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "backfill"
-    selected_codes = sys.argv[2:]
+    args = sys.argv[2:]
 
     if command == "backfill":
-        await backfill_history(selected_codes=selected_codes or None)
+        await backfill_history(selected_codes=args or None)
         return
     if command == "daily":
-        await sync_daily(selected_codes=selected_codes or None)
+        await sync_daily(selected_codes=args or None)
         return
     if command == "repair-backfill":
-        await repair_backfill_missing_history(selected_codes=selected_codes or None)
+        await repair_backfill_missing_history(selected_codes=args or None)
+        return
+    if command == "repair-daily-dates":
+        trade_dates, selected_codes = parse_repair_daily_dates_cli_args(args)
+        await repair_daily_dates(trade_dates, selected_codes=selected_codes)
         return
 
-    raise ValueError("stock supports: backfill [stock_code ...] | daily [stock_code ...] | repair-backfill [stock_code ...]")
+    raise ValueError(
+        "stock supports: backfill [stock_code ...] | daily [stock_code ...] | "
+        "repair-backfill [stock_code ...] | "
+        "repair-daily-dates <YYYY-MM-DD> [YYYY-MM-DD ...] [--codes <stock_code ...>]"
+    )
 
 
 if __name__ == "__main__":

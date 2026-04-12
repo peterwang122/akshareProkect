@@ -192,7 +192,11 @@ class SchedulerService:
         queue_entry = (
             "requeued-empty-cache"
             if job.get("_dedupe_requeued_empty_success")
-            else ("reused" if job.get("_dedupe_reused") else "new")
+            else (
+                f"requeued-{str(job.get('_dedupe_requeued_terminal_status')).strip().lower()}"
+                if job.get("_dedupe_requeued_terminal_status")
+                else ("reused" if job.get("_dedupe_reused") else "new")
+            )
         )
         log(
             "job submitted: "

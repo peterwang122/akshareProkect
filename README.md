@@ -62,7 +62,7 @@ SET time_zone = '+08:00'
 如果要运行任何依赖 AKShare 的采集任务，推荐顺序如下：
 
 1. 启动 AK 调度服务：`python ak_scheduler_service.py serve`
-2. 如需接收另一个项目的股票前复权临时采集请求，再启动：`python stock_temp_service.py serve`
+2. 如需接收另一个项目的股票后复权临时采集请求，再启动：`python stock_temp_service.py serve`
 3. 执行 `python run.py ...` 对应采集命令
 
 以下网页抓取链路不依赖 AK 调度服务：
@@ -169,7 +169,7 @@ python ak_scheduler_service.py doctor
 
 - 维护统一股票信息表
 - 维护非复权日线 / 日快照
-- 提供供外部项目调用的前复权临时采集服务
+- 提供供外部项目调用的后复权临时采集服务
 
 实际接口：
 
@@ -178,13 +178,14 @@ python ak_scheduler_service.py doctor
 - `ak.stock_info_bj_name_code`
 - `ak.stock_zh_a_spot`
 - `ak.stock_zh_a_hist_tx`
-- `ak.stock_zh_a_daily(adjust="qfq")`
+- `ak.stock_zh_a_daily(adjust="hfq")`
 
 写入表：
 
 - `stock_info_all`
 - `stock_daily_data`
-- `stock_qfq_daily_data`
+- `stock_hfq_daily_data`
+- `stock_qfq_daily_data`（历史参考，不再供 FIT 使用）
 
 股票信息表当前成分口径：
 
@@ -224,10 +225,10 @@ python ak_scheduler_service.py doctor
   - 只补缺失股票，不重刷全市场
   - 空历史结果按失败处理，不再静默跳过
 
-### 股票前复权临时采集服务
+### 股票后复权临时采集服务
 用途：
 
-- 提供给另一个项目按股票代码触发前复权数据刷新
+- 提供给另一个项目按股票代码触发后复权数据刷新
 
 服务命令：
 
@@ -255,12 +256,17 @@ HTTP 接口：
 
 - 用 `stock_code` 到 `stock_info_all` 查上市日期
 - 查不到上市日期时用 `1991-01-01`
-- 调用 `stock_zh_a_daily(adjust="qfq")`
+- 调用 `stock_zh_a_daily(adjust="hfq")`
 - 若请求区间与最近一次该股票区间完全一致，则返回 `UNCHANGED`
-- 若区间发生变化，则先删除该股票在 `stock_qfq_daily_data` 的全部旧数据，再整批重写
-- 前复权结果会在写库前按前一交易日收盘价自行计算：
+- 若区间发生变化，则先删除该股票在 `stock_hfq_daily_data` 的全部旧数据，再整批重写
+- 后复权结果会在写库前按前一交易日收盘价自行计算：
   - `price_change_amount`
   - `price_change_rate`
+
+说明：
+
+- FIT 现在读取 `stock_hfq_daily_data`
+- `stock_qfq_daily_data` 仅保留历史参考，不再作为活动读取表
 
 对接文档：
 
@@ -637,7 +643,7 @@ python run.py runner daily
 - `douyin daily`
 - `emotion-excel import`
 - `etf weekly-repair`
-- `stock_temp_service` 的临时前复权采集
+- `stock_temp_service` 的临时后复权采集
 
 失败任务统一重试入口：
 

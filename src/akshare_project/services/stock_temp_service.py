@@ -80,7 +80,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
 
         try:
             result = asyncio.run(
-                stock.collect_qfq_for_request(
+                stock.collect_hfq_for_request(
                     stock_code=payload.get("stock_code"),
                     start_date=payload.get("start_date"),
                     end_date=payload.get("end_date"),
