@@ -55,10 +55,23 @@ class DbTools:
         'total_market_value': 9999999999999999999999.99,
         'circulating_market_value': 9999999999999999999999.99,
         'emotion_value': 9999999999.9999,
+        'hs300_close': 9999999999.9999,
+        'open_value': 9999999999.9999,
+        'high_value': 9999999999.9999,
+        'low_value': 9999999999.9999,
+        'close_value': 9999999999.9999,
+        'fear_greed_value': 9999999999.9999,
+        'long_value': 99999999999999.99,
+        'short_value': 99999999999999.99,
+        'ratio_value': 9999999999.9999,
         'main_basis': 9999999999.9999,
         'month_basis': 9999999999.9999,
         'breadth_up_pct': 9999999999.9999,
     }
+    INDEX_BASIC_TABLES = {'index_basic_info', 'index_us_basic_info', 'index_hk_basic_info', 'index_qvix_basic_info'}
+    INDEX_DAILY_TABLES = {'index_daily_data', 'index_us_daily_data', 'index_hk_daily_data', 'index_qvix_daily_data'}
+    INDEX_FUTURES_CONTRACT_TABLES = {'futures_us_index_contract_info', 'futures_hk_index_contract_info'}
+    INDEX_FUTURES_DAILY_TABLES = {'futures_us_index_daily_data', 'futures_hk_index_daily_data'}
 
     def __init__(self):
         self.db_info = self.load_db_info()
@@ -217,6 +230,63 @@ class DbTools:
         sanitized['data_source'] = str(update.get('data_source', 'akshare')).strip() or 'akshare'
         return sanitized
 
+    def _sanitize_index_basic_row(self, row):
+        sanitized = dict(row)
+        sanitized['index_code'] = str(row.get('index_code', '')).strip()
+        sanitized['simple_code'] = str(row.get('simple_code', '')).strip() or None
+        sanitized['market'] = str(row.get('market', '')).strip() or None
+        sanitized['index_name'] = str(row.get('index_name', '')).strip()
+        sanitized['data_source'] = str(row.get('data_source', 'akshare')).strip() or 'akshare'
+        return sanitized
+
+    def _sanitize_index_news_sentiment_scope_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['sentiment_value'] = self._normalize_numeric('emotion_value', row.get('sentiment_value'))
+        sanitized['hs300_close'] = self._normalize_numeric('hs300_close', row.get('hs300_close'))
+        sanitized['data_source'] = str(row.get('data_source', 'index_news_sentiment_scope')).strip() or 'index_news_sentiment_scope'
+        return sanitized
+
+    def _sanitize_index_us_vix_daily_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['open_value'] = self._normalize_numeric('open_value', row.get('open_value'))
+        sanitized['high_value'] = self._normalize_numeric('high_value', row.get('high_value'))
+        sanitized['low_value'] = self._normalize_numeric('low_value', row.get('low_value'))
+        sanitized['close_value'] = self._normalize_numeric('close_value', row.get('close_value'))
+        sanitized['data_source'] = str(row.get('data_source', 'cboe_vix_history')).strip() or 'cboe_vix_history'
+        return sanitized
+
+    def _sanitize_index_us_fear_greed_daily_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['fear_greed_value'] = self._normalize_numeric('fear_greed_value', row.get('fear_greed_value'))
+        sanitized['sentiment_label'] = str(row.get('sentiment_label', '')).strip().upper() or None
+        sanitized['data_source'] = str(row.get('data_source', 'cnn_fear_greed_live')).strip() or 'cnn_fear_greed_live'
+        return sanitized
+
+    def _sanitize_index_us_hedge_fund_ls_proxy_row(self, row):
+        sanitized = dict(row)
+        report_date = row.get('report_date')
+        release_date = row.get('release_date')
+        sanitized['report_date'] = str(report_date).split(' ')[0].strip() if report_date else ''
+        sanitized['contract_scope'] = str(row.get('contract_scope', '')).strip().upper()
+        sanitized['long_value'] = self._normalize_numeric('long_value', row.get('long_value'))
+        sanitized['short_value'] = self._normalize_numeric('short_value', row.get('short_value'))
+        sanitized['ratio_value'] = self._normalize_numeric('ratio_value', row.get('ratio_value'))
+        sanitized['release_date'] = str(release_date).split(' ')[0].strip() if release_date else None
+        sanitized['data_source'] = str(row.get('data_source', 'ofr_tff')).strip() or 'ofr_tff'
+        return sanitized
+
+    def _validate_table_name(self, table_name, allowed_tables):
+        normalized_table_name = str(table_name or '').strip()
+        if normalized_table_name not in allowed_tables:
+            raise ValueError(f'unsupported table name: {normalized_table_name}')
+        return normalized_table_name
+
     def _sanitize_cffex_member_ranking(self, row):
         sanitized = dict(row)
         sanitized['product_code'] = str(row.get('product_code', '')).strip().upper()
@@ -334,6 +404,37 @@ class DbTools:
         sanitized['settle_price'] = self._normalize_numeric('settle_price', row.get('settle_price'))
         sanitized['pre_settle_price'] = self._normalize_numeric('pre_settle_price', row.get('pre_settle_price'))
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'futures_hist_em'
+        return sanitized
+
+    def _sanitize_index_futures_contract_row(self, row):
+        sanitized = dict(row)
+        sanitized['root_symbol'] = str(row.get('root_symbol', '')).strip().upper()
+        sanitized['source_contract_code'] = str(row.get('source_contract_code', '')).strip().upper()
+        sanitized['contract_name'] = str(row.get('contract_name', '')).strip() or None
+        sanitized['contract_month'] = str(row.get('contract_month', '')).split(' ')[0].strip() or None
+        sanitized['exchange'] = str(row.get('exchange', '')).strip().upper() or None
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or None
+        first_seen = row.get('first_seen_trade_date')
+        last_seen = row.get('last_seen_trade_date')
+        sanitized['first_seen_trade_date'] = str(first_seen).split(' ')[0].strip() if first_seen else None
+        sanitized['last_seen_trade_date'] = str(last_seen).split(' ')[0].strip() if last_seen else None
+        return sanitized
+
+    def _sanitize_index_futures_daily_row(self, row):
+        sanitized = dict(row)
+        sanitized['source_contract_code'] = str(row.get('source_contract_code', '')).strip().upper()
+        sanitized['root_symbol'] = str(row.get('root_symbol', '')).strip().upper()
+        sanitized['contract_name'] = str(row.get('contract_name', '')).strip() or None
+        sanitized['contract_month'] = str(row.get('contract_month', '')).split(' ')[0].strip() or None
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        for field in [
+            'open_price', 'high_price', 'low_price', 'close_price', 'volume',
+            'open_interest', 'settle_price', 'pre_settle_price'
+        ]:
+            sanitized[field] = self._normalize_numeric(field, row.get(field))
+        sanitized['closing_range_raw'] = str(row.get('closing_range_raw', '')).strip() or None
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or None
         return sanitized
 
     def _sanitize_quant_index_dashboard_row(self, row):
@@ -844,6 +945,120 @@ class DbTools:
                 rows = await cursor.fetchall()
                 return [str(row[0]).strip().lower() for row in rows if row and row[0]]
 
+    async def get_stock_daily_hist_metric_targets(self, stock_codes=None, start_date=None, end_date=None):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_codes = sorted(
+            {
+                str(stock_code).strip()
+                for stock_code in (stock_codes or [])
+                if str(stock_code).strip()
+            }
+        )
+        normalized_start_date = str(start_date or '').split(' ')[0].strip()
+        normalized_end_date = str(end_date or '').split(' ')[0].strip()
+
+        query = """
+        SELECT DISTINCT
+            stock_code,
+            prefixed_code
+        FROM stock_daily_data
+        WHERE data_source = 'stock_zh_a_hist_tx'
+        """
+        params = []
+
+        if normalized_start_date:
+            query += " AND trade_date >= %s"
+            params.append(normalized_start_date)
+        if normalized_end_date:
+            query += " AND trade_date <= %s"
+            params.append(normalized_end_date)
+        if normalized_codes:
+            placeholders = ','.join(['%s'] * len(normalized_codes))
+            query += f" AND stock_code IN ({placeholders})"
+            params.extend(normalized_codes)
+
+        query += " ORDER BY prefixed_code ASC"
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_stock_daily_hist_rows_for_metric_repair(self, prefixed_code, end_date=None):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_prefixed_code = str(prefixed_code or '').strip().lower()
+        normalized_end_date = str(end_date or '').split(' ')[0].strip()
+        if not normalized_prefixed_code:
+            return []
+
+        query = """
+        SELECT
+            stock_code,
+            prefixed_code,
+            trade_date,
+            close_price
+        FROM stock_daily_data
+        WHERE data_source = 'stock_zh_a_hist_tx'
+          AND prefixed_code = %s
+        """
+        params = [normalized_prefixed_code]
+
+        if normalized_end_date:
+            query += " AND trade_date <= %s"
+            params.append(normalized_end_date)
+
+        query += " ORDER BY trade_date ASC"
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def update_stock_daily_hist_metrics(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        values = []
+        for row in rows:
+            prefixed_code = str((row or {}).get('prefixed_code') or '').strip().lower()
+            trade_date = str((row or {}).get('trade_date') or '').split(' ')[0].strip()
+            if not prefixed_code or not trade_date:
+                continue
+
+            values.append((
+                self._normalize_numeric('pre_close_price', (row or {}).get('pre_close_price')),
+                self._normalize_numeric('price_change_amount', (row or {}).get('price_change_amount')),
+                self._normalize_numeric('price_change_rate', (row or {}).get('price_change_rate')),
+                prefixed_code,
+                trade_date,
+            ))
+
+        if not values:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                UPDATE stock_daily_data
+                SET pre_close_price = %s,
+                    price_change_amount = %s,
+                    price_change_rate = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE prefixed_code = %s
+                  AND trade_date = %s
+                  AND data_source = 'stock_zh_a_hist_tx'
+                """
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return cursor.rowcount
+
     async def delete_stock_daily_data_by_trade_date_and_prefixed_codes(self, trade_date, prefixed_codes, chunk_size=500):
         if self.pool is None:
             await self.init_pool()
@@ -1225,24 +1440,26 @@ class DbTools:
                 await conn.commit()
                 return cursor.rowcount
 
-    async def upsert_index_basic_info(self, basic_rows):
+    async def _upsert_index_basic_info_for_table(self, table_name, basic_rows):
         if not basic_rows:
             return 0
 
         if self.pool is None:
             await self.init_pool()
 
+        normalized_table_name = self._validate_table_name(table_name, self.INDEX_BASIC_TABLES)
+
         deduped_rows = {}
         for row in basic_rows:
-            index_code = str(row.get('index_code', '')).strip()
-            if not index_code:
+            sanitized = self._sanitize_index_basic_row(row)
+            if not sanitized['index_code']:
                 continue
-            deduped_rows[index_code] = (
-                index_code,
-                str(row.get('simple_code', '')).strip() or None,
-                str(row.get('market', '')).strip() or None,
-                str(row.get('index_name', '')).strip(),
-                str(row.get('data_source', 'akshare')).strip() or 'akshare',
+            deduped_rows[sanitized['index_code']] = (
+                sanitized['index_code'],
+                sanitized['simple_code'],
+                sanitized['market'],
+                sanitized['index_name'],
+                sanitized['data_source'],
             )
 
         rows_to_upsert = list(deduped_rows.values())
@@ -1251,8 +1468,8 @@ class DbTools:
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                query_upsert = """
-                INSERT INTO index_basic_info (
+                query_upsert = f"""
+                INSERT INTO {normalized_table_name} (
                     index_code,
                     simple_code,
                     market,
@@ -1270,12 +1487,26 @@ class DbTools:
                 await conn.commit()
                 return len(rows_to_upsert)
 
-    async def batch_index_daily_data(self, updates):
+    async def upsert_index_basic_info(self, basic_rows):
+        return await self._upsert_index_basic_info_for_table('index_basic_info', basic_rows)
+
+    async def upsert_index_us_basic_info(self, basic_rows):
+        return await self._upsert_index_basic_info_for_table('index_us_basic_info', basic_rows)
+
+    async def upsert_index_hk_basic_info(self, basic_rows):
+        return await self._upsert_index_basic_info_for_table('index_hk_basic_info', basic_rows)
+
+    async def upsert_index_qvix_basic_info(self, basic_rows):
+        return await self._upsert_index_basic_info_for_table('index_qvix_basic_info', basic_rows)
+
+    async def _batch_index_daily_data_for_table(self, table_name, updates):
         if not updates:
             return 0
 
         if self.pool is None:
             await self.init_pool()
+
+        normalized_table_name = self._validate_table_name(table_name, self.INDEX_DAILY_TABLES)
 
         sanitized_updates = [self._sanitize_index_daily_update(update) for update in updates]
         sanitized_updates = [
@@ -1291,7 +1522,7 @@ class DbTools:
                 trade_dates = [update['trade_date'] for update in sanitized_updates]
                 placeholders = ','.join(['%s'] * len(trade_dates))
                 query_check = (
-                    f"SELECT trade_date FROM index_daily_data WHERE index_code = %s "
+                    f"SELECT trade_date FROM {normalized_table_name} WHERE index_code = %s "
                     f"AND trade_date IN ({placeholders})"
                 )
                 await cursor.execute(query_check, [index_code, *trade_dates])
@@ -1320,8 +1551,8 @@ class DbTools:
                 if not rows_to_insert:
                     return 0
 
-                query_insert = """
-                INSERT INTO index_daily_data (
+                query_insert = f"""
+                INSERT INTO {normalized_table_name} (
                     index_code,
                     open_price,
                     close_price,
@@ -1340,6 +1571,18 @@ class DbTools:
                 await cursor.executemany(query_insert, rows_to_insert)
                 await conn.commit()
                 return len(rows_to_insert)
+
+    async def batch_index_daily_data(self, updates):
+        return await self._batch_index_daily_data_for_table('index_daily_data', updates)
+
+    async def batch_index_us_daily_data(self, updates):
+        return await self._batch_index_daily_data_for_table('index_us_daily_data', updates)
+
+    async def batch_index_hk_daily_data(self, updates):
+        return await self._batch_index_daily_data_for_table('index_hk_daily_data', updates)
+
+    async def batch_index_qvix_daily_data(self, updates):
+        return await self._batch_index_daily_data_for_table('index_qvix_daily_data', updates)
 
     async def upsert_stock_daily_snapshots(self, updates):
         if not updates:
@@ -2216,12 +2459,14 @@ class DbTools:
             for row in rows
         ]
 
-    async def upsert_index_daily_snapshots(self, updates):
+    async def _upsert_index_daily_snapshots_for_table(self, table_name, updates):
         if not updates:
             return 0
 
         if self.pool is None:
             await self.init_pool()
+
+        normalized_table_name = self._validate_table_name(table_name, self.INDEX_DAILY_TABLES)
 
         sanitized_updates = [self._sanitize_index_daily_update(update) for update in updates]
         sanitized_updates = [
@@ -2238,8 +2483,8 @@ class DbTools:
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                query_upsert = """
-                INSERT INTO index_daily_data (
+                query_upsert = f"""
+                INSERT INTO {normalized_table_name} (
                     index_code,
                     open_price,
                     close_price,
@@ -2289,6 +2534,239 @@ class DbTools:
                 await cursor.executemany(query_upsert, values)
                 await conn.commit()
                 return len(sanitized_updates)
+
+    async def upsert_index_daily_snapshots(self, updates):
+        return await self._upsert_index_daily_snapshots_for_table('index_daily_data', updates)
+
+    async def upsert_index_us_daily_snapshots(self, updates):
+        return await self._upsert_index_daily_snapshots_for_table('index_us_daily_data', updates)
+
+    async def upsert_index_hk_daily_snapshots(self, updates):
+        return await self._upsert_index_daily_snapshots_for_table('index_hk_daily_data', updates)
+
+    async def upsert_index_qvix_daily_snapshots(self, updates):
+        return await self._upsert_index_daily_snapshots_for_table('index_qvix_daily_data', updates)
+
+    async def upsert_index_news_sentiment_scope_daily(self, updates):
+        if not updates:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_updates = [self._sanitize_index_news_sentiment_scope_row(update) for update in updates]
+        sanitized_updates = [
+            update for update in sanitized_updates
+            if update['trade_date']
+        ]
+        if not sanitized_updates:
+            return 0
+
+        deduped_updates = {}
+        for update in sanitized_updates:
+            deduped_updates[update['trade_date']] = update
+        sanitized_updates = list(deduped_updates.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_news_sentiment_scope_daily (
+                    trade_date,
+                    sentiment_value,
+                    hs300_close,
+                    data_source
+                ) VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    sentiment_value = VALUES(sentiment_value),
+                    hs300_close = VALUES(hs300_close),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        update['trade_date'],
+                        update['sentiment_value'],
+                        update['hs300_close'],
+                        update['data_source'],
+                    )
+                    for update in sanitized_updates
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_updates)
+
+    async def upsert_index_us_vix_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_index_us_vix_daily_row(row) for row in rows]
+        sanitized_rows = [row for row in sanitized_rows if row['trade_date']]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[row['trade_date']] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_us_vix_daily (
+                    trade_date,
+                    open_value,
+                    high_value,
+                    low_value,
+                    close_value,
+                    data_source
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    open_value = VALUES(open_value),
+                    high_value = VALUES(high_value),
+                    low_value = VALUES(low_value),
+                    close_value = VALUES(close_value),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['trade_date'],
+                        row['open_value'],
+                        row['high_value'],
+                        row['low_value'],
+                        row['close_value'],
+                        row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def upsert_index_us_fear_greed_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_index_us_fear_greed_daily_row(row) for row in rows]
+        sanitized_rows = [row for row in sanitized_rows if row['trade_date']]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[row['trade_date']] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_us_fear_greed_daily (
+                    trade_date,
+                    fear_greed_value,
+                    sentiment_label,
+                    data_source
+                ) VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    fear_greed_value = VALUES(fear_greed_value),
+                    sentiment_label = VALUES(sentiment_label),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['trade_date'],
+                        row['fear_greed_value'],
+                        row['sentiment_label'],
+                        row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def upsert_index_us_hedge_fund_ls_proxy(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_index_us_hedge_fund_ls_proxy_row(row) for row in rows]
+        sanitized_rows = [
+            row
+            for row in sanitized_rows
+            if row['report_date'] and row['contract_scope']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[(row['report_date'], row['contract_scope'])] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_us_hedge_fund_ls_proxy (
+                    report_date,
+                    contract_scope,
+                    long_value,
+                    short_value,
+                    ratio_value,
+                    release_date,
+                    data_source
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    long_value = VALUES(long_value),
+                    short_value = VALUES(short_value),
+                    ratio_value = VALUES(ratio_value),
+                    release_date = VALUES(release_date),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['report_date'],
+                        row['contract_scope'],
+                        row['long_value'],
+                        row['short_value'],
+                        row['ratio_value'],
+                        row['release_date'],
+                        row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def get_latest_index_us_hedge_fund_ls_proxy_dates(self):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT contract_scope, MAX(report_date)
+        FROM index_us_hedge_fund_ls_proxy
+        GROUP BY contract_scope
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                rows = await cursor.fetchall()
+                return {
+                    str(contract_scope).strip().upper(): str(report_date)
+                    for contract_scope, report_date in rows
+                    if contract_scope and report_date
+                }
 
     async def get_index_codes_by_names(self, index_names):
         if self.pool is None:
@@ -2681,6 +3159,164 @@ class DbTools:
                 await cursor.executemany(query_insert, rows_to_insert)
                 await conn.commit()
                 return cursor.rowcount
+
+    async def batch_index_futures_contract_info(self, table_name, rows):
+        if not rows:
+            return 0
+        if table_name not in self.INDEX_FUTURES_CONTRACT_TABLES:
+            raise ValueError(f"unsupported index futures contract table: {table_name}")
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_index_futures_contract_row(row) for row in rows]
+        deduped_rows = {}
+        for row in sanitized_rows:
+            if not (row['root_symbol'] and row['source_contract_code']):
+                continue
+            deduped_rows[row['source_contract_code']] = row
+        sanitized_rows = list(deduped_rows.values())
+        if not sanitized_rows:
+            return 0
+
+        values = [
+            (
+                row['root_symbol'],
+                row['source_contract_code'],
+                row['contract_name'],
+                row['contract_month'],
+                row['exchange'],
+                row['data_source'],
+                row['first_seen_trade_date'],
+                row['last_seen_trade_date'],
+            )
+            for row in sanitized_rows
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query = f"""
+                INSERT INTO {table_name} (
+                    root_symbol,
+                    source_contract_code,
+                    contract_name,
+                    contract_month,
+                    exchange,
+                    data_source,
+                    first_seen_trade_date,
+                    last_seen_trade_date
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    root_symbol = VALUES(root_symbol),
+                    contract_name = VALUES(contract_name),
+                    contract_month = VALUES(contract_month),
+                    exchange = VALUES(exchange),
+                    data_source = VALUES(data_source),
+                    first_seen_trade_date = COALESCE(
+                        LEAST(first_seen_trade_date, VALUES(first_seen_trade_date)),
+                        VALUES(first_seen_trade_date),
+                        first_seen_trade_date
+                    ),
+                    last_seen_trade_date = COALESCE(
+                        GREATEST(last_seen_trade_date, VALUES(last_seen_trade_date)),
+                        VALUES(last_seen_trade_date),
+                        last_seen_trade_date
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def batch_index_futures_daily_data(self, table_name, rows):
+        if not rows:
+            return 0
+        if table_name not in self.INDEX_FUTURES_DAILY_TABLES:
+            raise ValueError(f"unsupported index futures daily table: {table_name}")
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_index_futures_daily_row(row) for row in rows]
+        deduped_rows = {}
+        for row in sanitized_rows:
+            if not (row['source_contract_code'] and row['trade_date'] and row['root_symbol']):
+                continue
+            deduped_rows[(row['source_contract_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped_rows.values())
+        if not sanitized_rows:
+            return 0
+
+        is_us_table = table_name == 'futures_us_index_daily_data'
+        if is_us_table:
+            values = [
+                (
+                    row['source_contract_code'], row['root_symbol'], row['contract_name'],
+                    row['contract_month'], row['trade_date'], row['open_price'],
+                    row['high_price'], row['low_price'], row['close_price'],
+                    row['closing_range_raw'], row['volume'], row['open_interest'],
+                    row['settle_price'], row['pre_settle_price'], row['data_source'],
+                )
+                for row in sanitized_rows
+            ]
+            query = f"""
+            INSERT INTO {table_name} (
+                source_contract_code, root_symbol, contract_name, contract_month, trade_date,
+                open_price, high_price, low_price, close_price, closing_range_raw,
+                volume, open_interest, settle_price, pre_settle_price, data_source
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                root_symbol = VALUES(root_symbol),
+                contract_name = VALUES(contract_name),
+                contract_month = VALUES(contract_month),
+                open_price = VALUES(open_price),
+                high_price = VALUES(high_price),
+                low_price = VALUES(low_price),
+                close_price = VALUES(close_price),
+                closing_range_raw = VALUES(closing_range_raw),
+                volume = VALUES(volume),
+                open_interest = VALUES(open_interest),
+                settle_price = VALUES(settle_price),
+                pre_settle_price = VALUES(pre_settle_price),
+                data_source = VALUES(data_source),
+                updated_at = CURRENT_TIMESTAMP
+            """
+        else:
+            values = [
+                (
+                    row['source_contract_code'], row['root_symbol'], row['contract_name'],
+                    row['contract_month'], row['trade_date'], row['open_price'],
+                    row['high_price'], row['low_price'], row['close_price'],
+                    row['volume'], row['open_interest'], row['settle_price'],
+                    row['pre_settle_price'], row['data_source'],
+                )
+                for row in sanitized_rows
+            ]
+            query = f"""
+            INSERT INTO {table_name} (
+                source_contract_code, root_symbol, contract_name, contract_month, trade_date,
+                open_price, high_price, low_price, close_price,
+                volume, open_interest, settle_price, pre_settle_price, data_source
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                root_symbol = VALUES(root_symbol),
+                contract_name = VALUES(contract_name),
+                contract_month = VALUES(contract_month),
+                open_price = VALUES(open_price),
+                high_price = VALUES(high_price),
+                low_price = VALUES(low_price),
+                close_price = VALUES(close_price),
+                volume = VALUES(volume),
+                open_interest = VALUES(open_interest),
+                settle_price = VALUES(settle_price),
+                pre_settle_price = VALUES(pre_settle_price),
+                data_source = VALUES(data_source),
+                updated_at = CURRENT_TIMESTAMP
+            """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
 
     async def batch_excel_emotion_data(self, rows):
         if not rows:

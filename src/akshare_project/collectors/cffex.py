@@ -15,6 +15,7 @@ from akshare_project.db.db_tool import DbTools
 BASE_URL = "http://www.cffex.com.cn/ccpm/"
 PAGE_TIMEOUT_MS = 15000
 REQUEST_SLEEP_SECONDS = 1
+QUERY_MAX_ATTEMPTS = 2
 LOGGER = get_logger("cffex")
 PROGRESS_STORE = ProgressStore("cffex")
 
@@ -372,23 +373,32 @@ async def process_trade_day(page, db_tools, product_code, target_date, processed
     if progress_key in processed:
         return 0
 
-    try:
-        rows = await query_single_trade_day(page, product_code, target_date)
-        inserted = await sync_rows(db_tools, rows)
-        save_progress(progress_key)
-        processed.add(progress_key)
-        if rows:
-            print(f"{product_code} {target_date} parsed rows: {len(rows)}, saved rows: {inserted}")
-        else:
-            print(f"{product_code} {target_date} parsed rows: 0, saved rows: 0")
-        await asyncio.sleep(REQUEST_SLEEP_SECONDS)
-        return inserted
-    except Exception as exc:
-        error_message = str(exc)
-        print(f"{product_code} {target_date} failed: {error_message}")
-        log_error(product_code, target_date, error_message)
-        await asyncio.sleep(REQUEST_SLEEP_SECONDS)
-        return 0
+    last_error = None
+    for attempt in range(1, QUERY_MAX_ATTEMPTS + 1):
+        try:
+            rows = await query_single_trade_day(page, product_code, target_date)
+            inserted = await sync_rows(db_tools, rows)
+            save_progress(progress_key)
+            processed.add(progress_key)
+            if rows:
+                print(f"{product_code} {target_date} parsed rows: {len(rows)}, saved rows: {inserted}")
+            else:
+                print(f"{product_code} {target_date} parsed rows: 0, saved rows: 0")
+            await asyncio.sleep(REQUEST_SLEEP_SECONDS)
+            return inserted
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < QUERY_MAX_ATTEMPTS:
+                print(
+                    f"{product_code} {target_date} attempt {attempt}/{QUERY_MAX_ATTEMPTS} failed, retrying: {last_error}"
+                )
+                await asyncio.sleep(REQUEST_SLEEP_SECONDS)
+                continue
+
+    print(f"{product_code} {target_date} failed: {last_error}")
+    log_error(product_code, target_date, last_error)
+    await asyncio.sleep(REQUEST_SLEEP_SECONDS)
+    return 0
 
 
 async def backfill_all_history(headless=True, end_date=None, product_codes=None):

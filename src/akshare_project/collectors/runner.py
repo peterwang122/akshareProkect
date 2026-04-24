@@ -52,6 +52,7 @@ async def main():
         tasks = [
             ('stock_daily', stock.sync_daily),
             ('index_daily', index.sync_daily_from_spot),
+            ('index_bj50_daily', index.sync_daily_special_index),
             ('cffex_daily', lambda: cffex.sync_latest_daily_data(headless=True)),
             ('forex_daily', forex.sync_daily_from_history),
             ('usd_index_once', forex.sync_usd_index_once),

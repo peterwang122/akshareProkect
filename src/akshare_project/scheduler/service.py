@@ -18,7 +18,7 @@ import pandas as pd
 from akshare_project.core.logging_utils import get_logger
 from akshare_project.core.paths import ensure_runtime_layout
 from akshare_project.scheduler.config import load_scheduler_config
-from akshare_project.scheduler.registry import get_function_spec
+from akshare_project.scheduler.registry import get_function_spec, get_registered_source_groups
 from akshare_project.scheduler.serialization import serialize_result
 from akshare_project.scheduler.store import SchedulerStore
 
@@ -92,6 +92,10 @@ def classify_exception(exc):
     lowered = text.lower()
     if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, RemoteDisconnected)):
         return "network"
+    if isinstance(exc, json.JSONDecodeError):
+        return "network"
+    if "expecting value" in lowered and "char 0" in lowered:
+        return "network"
     if "429" in lowered or "403" in lowered or "captcha" in lowered or "滑块" in text or "验证" in text:
         return "anti_bot"
     if isinstance(exc, ValueError):
@@ -115,28 +119,43 @@ def load_policy(config, source_group):
 
 
 class SchedulerRuntimeState:
-    def __init__(self):
+    def __init__(self, source_groups=None):
         self._lock = threading.Lock()
-        self.source_state = {
-            "eastmoney": {"last_dispatch_at": None, "cooldown_until": None, "consecutive_breaker_hits": 0},
-            "sina": {"last_dispatch_at": None, "cooldown_until": None, "consecutive_breaker_hits": 0},
-            "ths": {"last_dispatch_at": None, "cooldown_until": None, "consecutive_breaker_hits": 0},
-        }
+        self.source_state = {}
+        for source_group in source_groups or []:
+            self._ensure_source_group_locked(source_group)
+
+    def _ensure_source_group_locked(self, source_group):
+        key = str(source_group or "").strip()
+        if not key:
+            return
+        self.source_state.setdefault(
+            key,
+            {"last_dispatch_at": None, "cooldown_until": None, "consecutive_breaker_hits": 0},
+        )
+
+    def ensure_source_group(self, source_group):
+        with self._lock:
+            self._ensure_source_group_locked(source_group)
 
     def get_source_state(self, source_group):
         with self._lock:
+            self._ensure_source_group_locked(source_group)
             return dict(self.source_state.get(source_group, {}))
 
     def mark_dispatch(self, source_group):
         with self._lock:
+            self._ensure_source_group_locked(source_group)
             self.source_state[source_group]["last_dispatch_at"] = datetime.now()
 
     def mark_success(self, source_group):
         with self._lock:
+            self._ensure_source_group_locked(source_group)
             self.source_state[source_group]["consecutive_breaker_hits"] = 0
 
     def mark_failure(self, source_group, policy, error_category):
         with self._lock:
+            self._ensure_source_group_locked(source_group)
             state = self.source_state[source_group]
             if error_category in policy.get("breaker_categories", []):
                 state["consecutive_breaker_hits"] += 1
@@ -151,6 +170,7 @@ class SchedulerRuntimeState:
 
     def cooldown_until(self, source_group):
         with self._lock:
+            self._ensure_source_group_locked(source_group)
             return self.source_state[source_group]["cooldown_until"]
 
     def health_payload(self):
@@ -170,7 +190,11 @@ class SchedulerService:
         ensure_runtime_layout()
         self.config = load_scheduler_config()
         self.store = SchedulerStore()
-        self.state = SchedulerRuntimeState()
+        configured_groups = set((self.config.get("source_policies") or {}).keys())
+        registered_groups = set(get_registered_source_groups())
+        self.source_groups = sorted({group for group in configured_groups | registered_groups if str(group or "").strip()})
+        self.default_policy_source_groups = sorted(registered_groups - configured_groups)
+        self.state = SchedulerRuntimeState(self.source_groups)
         self.stop_event = threading.Event()
         self.threads = []
         self.started_at = None
@@ -247,7 +271,7 @@ class SchedulerService:
         }
 
     def start_background_threads(self):
-        for source_group in ("eastmoney", "sina", "ths"):
+        for source_group in self.source_groups:
             thread = threading.Thread(target=self.worker_loop, args=(source_group,), daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -567,8 +591,15 @@ def run_scheduler_service():
     SERVICE_INSTANCE.start_background_threads()
     log(
         f"AK scheduler service started at http://{host}:{port} "
-        f"build={SERVICE_BUILD}"
+        f"build={SERVICE_BUILD} "
+        f"sources={','.join(SERVICE_INSTANCE.source_groups)}"
     )
+    if SERVICE_INSTANCE.default_policy_source_groups:
+        log(
+            "source groups without explicit policy; using load_policy defaults: "
+            f"{','.join(SERVICE_INSTANCE.default_policy_source_groups)}",
+            level="warning",
+        )
     try:
         server.serve_forever()
     finally:

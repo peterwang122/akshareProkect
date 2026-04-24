@@ -20,3 +20,84 @@ CREATE TABLE IF NOT EXISTS futures_daily_data (
   KEY idx_market_trade_date (market, trade_date),
   KEY idx_variety_trade_date (variety, trade_date)
 ) COMMENT='CFFEX futures daily market data from AKShare get_futures_daily, derived continuous rows, and futures_hist_em';
+
+CREATE TABLE IF NOT EXISTS futures_us_index_contract_info (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. ES or NQ',
+  source_contract_code VARCHAR(32) NOT NULL COMMENT 'Source contract code, e.g. ES or NQ',
+  contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+  contract_month VARCHAR(16) NULL COMMENT 'Contract month or CONTINUOUS',
+  exchange VARCHAR(32) NULL COMMENT 'Quote source, e.g. SINA',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'sina_global_futures',
+  first_seen_trade_date DATE NULL,
+  last_seen_trade_date DATE NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_us_index_contract_code (source_contract_code),
+  KEY idx_us_index_root_month (root_symbol, contract_month),
+  KEY idx_us_index_seen_date (last_seen_trade_date)
+) COMMENT='US stock index futures continuous contract registry from Sina global futures';
+
+CREATE TABLE IF NOT EXISTS futures_us_index_daily_data (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  source_contract_code VARCHAR(32) NOT NULL COMMENT 'Source contract code, e.g. ES or NQ',
+  root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. ES or NQ',
+  contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+  contract_month VARCHAR(16) NULL COMMENT 'Contract month or CONTINUOUS',
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  open_price DECIMAL(18, 6) NULL COMMENT 'Open price',
+  high_price DECIMAL(18, 6) NULL COMMENT 'High price',
+  low_price DECIMAL(18, 6) NULL COMMENT 'Low price',
+  close_price DECIMAL(18, 6) NULL COMMENT 'Close price from Sina daily K line',
+  closing_range_raw VARCHAR(64) NULL COMMENT 'Unused for Sina global futures',
+  volume DECIMAL(20, 2) NULL COMMENT 'Volume',
+  open_interest DECIMAL(20, 2) NULL COMMENT 'Open interest',
+  settle_price DECIMAL(18, 6) NULL COMMENT 'Settlement price',
+  pre_settle_price DECIMAL(18, 6) NULL COMMENT 'Previous settlement price',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'sina_global_futures',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_us_index_contract_trade_date (source_contract_code, trade_date),
+  KEY idx_us_index_root_trade_date (root_symbol, trade_date),
+  KEY idx_us_index_trade_date (trade_date)
+) COMMENT='US stock index futures continuous daily data from Sina global futures';
+
+CREATE TABLE IF NOT EXISTS futures_hk_index_contract_info (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. HSI, HHI, HTI',
+  source_contract_code VARCHAR(32) NOT NULL COMMENT 'Source contract code, e.g. HSIJ26',
+  contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+  contract_month CHAR(7) NULL COMMENT 'Contract month in YYYY-MM',
+  exchange VARCHAR(32) NULL COMMENT 'Exchange, e.g. HKEX',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'hkex_daily_market_report',
+  first_seen_trade_date DATE NULL,
+  last_seen_trade_date DATE NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_hk_index_contract_code (source_contract_code),
+  KEY idx_hk_index_root_month (root_symbol, contract_month),
+  KEY idx_hk_index_seen_date (last_seen_trade_date)
+) COMMENT='Hong Kong stock index futures contract registry from HKEX daily market report';
+
+CREATE TABLE IF NOT EXISTS futures_hk_index_daily_data (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  source_contract_code VARCHAR(32) NOT NULL COMMENT 'Source contract code, e.g. HSIJ26',
+  root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. HSI, HHI, HTI',
+  contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+  contract_month CHAR(7) NULL COMMENT 'Contract month in YYYY-MM',
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  open_price DECIMAL(18, 6) NULL COMMENT 'Open price',
+  high_price DECIMAL(18, 6) NULL COMMENT 'High price',
+  low_price DECIMAL(18, 6) NULL COMMENT 'Low price',
+  close_price DECIMAL(18, 6) NULL COMMENT 'Settlement price used as close',
+  volume DECIMAL(20, 2) NULL COMMENT 'Volume',
+  open_interest DECIMAL(20, 2) NULL COMMENT 'Open interest',
+  settle_price DECIMAL(18, 6) NULL COMMENT 'Settlement price',
+  pre_settle_price DECIMAL(18, 6) NULL COMMENT 'Previous settlement price',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'hkex_daily_market_report',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_hk_index_contract_trade_date (source_contract_code, trade_date),
+  KEY idx_hk_index_root_trade_date (root_symbol, trade_date),
+  KEY idx_hk_index_trade_date (trade_date)
+) COMMENT='Hong Kong stock index futures daily data from HKEX official daily market report';

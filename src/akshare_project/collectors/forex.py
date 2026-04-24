@@ -494,6 +494,68 @@ async def sync_usd_index_once():
         await db_tools.close()
 
 
+async def collect_symbol_history_for_request(symbol_code):
+    normalized_code = normalize_symbol_code(symbol_code)
+    if not normalized_code:
+        raise ValueError('symbol_code is required')
+
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        if normalized_code == 'UDI':
+            history_df = await asyncio.to_thread(get_usd_index_history)
+            fallback_name = USD_INDEX_SYMBOL_NAME
+            basic_rows = build_usd_index_basic_rows()
+        else:
+            history_df = await asyncio.to_thread(get_forex_history, normalized_code)
+            fallback_name = normalized_code
+            basic_rows = []
+
+        if history_df is None or history_df.empty:
+            raise RuntimeError(f'No forex history data fetched for {normalized_code}')
+
+        history_rows = build_forex_daily_rows(history_df, normalized_code, fallback_name)
+        history_rows = [row for row in history_rows if row.get('trade_date')]
+        if not history_rows:
+            raise RuntimeError(f'No forex history rows parsed for {normalized_code}')
+
+        history_rows.sort(key=lambda row: row['trade_date'])
+        latest_name = history_rows[-1].get('symbol_name') or fallback_name or normalized_code
+        if not basic_rows:
+            basic_rows = [{
+                'symbol_code': normalized_code,
+                'symbol_name': latest_name,
+                'data_source': 'forex_hist_em',
+            }]
+
+        # Forex bars may be captured before the 24-hour day has fully settled, so refresh every returned row.
+        basic_upserted = await db_tools.upsert_forex_basic_info(basic_rows)
+        daily_upserted = await db_tools.upsert_forex_daily_snapshots(history_rows)
+        trade_dates = sorted({row['trade_date'] for row in history_rows if row.get('trade_date')})
+
+        print(
+            'forex symbol history collect finished, '
+            f'symbol_code: {normalized_code}, '
+            f'forex_basic_info upserted: {basic_upserted}, '
+            f'forex_daily_data upserted: {daily_upserted}, '
+            f'rows_fetched: {len(history_rows)}, '
+            f'latest_trade_date: {trade_dates[-1] if trade_dates else "NONE"}'
+        )
+        return {
+            'status': 'SUCCESS',
+            'symbol_code': normalized_code,
+            'symbol_name': latest_name,
+            'refresh_mode': 'full_history_upsert',
+            'rows_fetched': len(history_rows),
+            'upserted_rows': daily_upserted,
+            'earliest_trade_date': trade_dates[0] if trade_dates else None,
+            'latest_trade_date': trade_dates[-1] if trade_dates else None,
+        }
+    finally:
+        await db_tools.close()
+
+
 async def sync_usd_index_continuous(poll_seconds=USD_INDEX_POLL_SECONDS):
     print(f'usd index continuous sync started, interval_seconds: {poll_seconds}')
     while True:
