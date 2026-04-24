@@ -118,6 +118,146 @@ SET @stmt = (
   SELECT IF(
     EXISTS (
       SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_us_basic_info' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_us_basic_info
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_us_daily_data' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_us_daily_data
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_hk_basic_info' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_hk_basic_info
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_hk_daily_data' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_hk_daily_data
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_qvix_basic_info' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_qvix_basic_info
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_qvix_daily_data' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_qvix_daily_data
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_news_sentiment_scope_daily' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_news_sentiment_scope_daily
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_us_vix_daily' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_us_vix_daily
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_us_fear_greed_daily' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_us_fear_greed_daily
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'index_us_hedge_fund_ls_proxy' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE index_us_hedge_fund_ls_proxy
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
       WHERE table_schema = DATABASE() AND table_name = 'quant_index_dashboard_daily' AND column_name = 'created_at'
     ),
     "ALTER TABLE quant_index_dashboard_daily
@@ -163,6 +303,62 @@ SET @stmt = (
       WHERE table_schema = DATABASE() AND table_name = 'futures_daily_data' AND column_name = 'created_at'
     ),
     "ALTER TABLE futures_daily_data
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'futures_us_index_contract_info' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE futures_us_index_contract_info
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'futures_us_index_daily_data' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE futures_us_index_daily_data
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'futures_hk_index_contract_info' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE futures_hk_index_contract_info
+       MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "SELECT 1"
+  )
+);
+PREPARE stmt FROM @stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @stmt = (
+  SELECT IF(
+    EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'futures_hk_index_daily_data' AND column_name = 'created_at'
+    ),
+    "ALTER TABLE futures_hk_index_daily_data
        MODIFY created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
        MODIFY updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
     "SELECT 1"

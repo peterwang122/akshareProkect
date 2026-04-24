@@ -1,9 +1,16 @@
 import asyncio
+import csv
+import io
+import json
 import re
 import sys
+import time
+import zipfile
 from datetime import date, datetime, timedelta
+from urllib.parse import urljoin
 
 import akshare as ak
+import requests
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.progress import ProgressStore
@@ -18,6 +25,26 @@ BACKFILL_START_DATE = date(2010, 4, 16)
 CHUNK_DAYS = 90
 LOGGER = get_logger("futures")
 PROGRESS_STORE = ProgressStore("futures")
+HTTP_TIMEOUT_SECONDS = 30
+HTTP_RETRY_COUNT = 3
+HTTP_RETRY_SLEEP_SECONDS = 2
+SINA_GLOBAL_FUTURES_SOURCE = "sina_global_futures"
+HKEX_SOURCE = "hkex_daily_market_report"
+HK_TRADING_CALENDAR_SYMBOL = "HSI"
+HK_BACKFILL_PROGRESS_EVERY = 25
+SINA_GLOBAL_FUTURES_DAILY_URL = (
+    "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+    "{callback}/GlobalFuturesService.getGlobalFuturesDailyKLine"
+)
+HKEX_DAYRPT_BASE_URL = "https://www.hkex.com.hk/eng/stat/dmstat/dayrpt/"
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+}
+
 
 COL_DATE = "\u65e5\u671f"
 COL_OPEN = "\u5f00\u76d8\u4ef7"
@@ -43,6 +70,69 @@ DERIVED_CONTINUOUS_SYMBOLS = {
     "IC": {"main": "ICM", "month": "ICM0"},
     "IH": {"main": "IHM", "month": "IHM0"},
     "IM": {"main": "IMM", "month": "IMM0"},
+}
+US_INDEX_FUTURES_PRODUCTS = {
+    "ES": {
+        "contract_name": "S&P 500 Index Futures Continuous",
+        "exchange": "SINA",
+        "start_date": date(1997, 9, 9),
+    },
+    "NQ": {
+        "contract_name": "Nasdaq 100 Index Futures Continuous",
+        "exchange": "SINA",
+        "start_date": date(1999, 6, 21),
+    },
+}
+HK_INDEX_FUTURES_PRODUCTS = {
+    "HSI": {
+        "contract_name": "Hang Seng Index Futures",
+        "exchange": "HKEX",
+        "latest_page": "dmreport1.htm",
+        "zip_prefix": "hsif",
+        "start_date": date(1986, 1, 1),
+    },
+    "HHI": {
+        "contract_name": "Hang Seng China Enterprises Index Futures",
+        "exchange": "HKEX",
+        "latest_page": "dmreport3.htm",
+        "zip_prefix": "hhif",
+        "start_date": date(2003, 12, 8),
+    },
+    "HTI": {
+        "contract_name": "Hang Seng TECH Index Futures",
+        "exchange": "HKEX",
+        "latest_page": "dmreport4.htm",
+        "zip_prefix": "htif",
+        "start_date": date(2020, 11, 23),
+    },
+}
+MONTH_CODE_BY_NUMBER = {
+    1: "F",
+    2: "G",
+    3: "H",
+    4: "J",
+    5: "K",
+    6: "M",
+    7: "N",
+    8: "Q",
+    9: "U",
+    10: "V",
+    11: "X",
+    12: "Z",
+}
+MONTH_NUMBER_BY_ABBR = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
 }
 
 
@@ -93,6 +183,63 @@ def normalize_symbol(symbol):
     return str(symbol or "").strip().upper()
 
 
+def normalize_text(value):
+    return str(value or "").strip()
+
+
+def normalize_number_text(value):
+    text = normalize_text(value)
+    if not text or text in {"-", "--", "N/A", "NA"}:
+        return None
+    text = text.replace(",", "").replace("+", "")
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if number != 0 else None
+
+
+def parse_signed_number(value):
+    text = normalize_text(value)
+    if not text or text in {"-", "--", "N/A", "NA"}:
+        return None
+    text = text.replace(",", "").replace("+", "")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_month_contract(root_symbol, contract_month_text):
+    text = normalize_text(contract_month_text).upper()
+    if not text or "TOTAL" in text or "SUMMARY" in text:
+        return None
+
+    match = re.search(r"([A-Z]{3})[\s-]*(\d{2,4})", text)
+    if not match:
+        return None
+
+    month_number = MONTH_NUMBER_BY_ABBR.get(match.group(1))
+    if not month_number:
+        return None
+
+    year_value = int(match.group(2))
+    year = 2000 + year_value if year_value < 100 else year_value
+    if year < 1900 or year > 2100:
+        return None
+
+    month_code = MONTH_CODE_BY_NUMBER[month_number]
+    yy = str(year)[-2:]
+    source_contract_code = f"{normalize_symbol(root_symbol)}{month_code}{yy}"
+    return {
+        "source_contract_code": source_contract_code,
+        "contract_month": f"{year:04d}-{month_number:02d}",
+        "month_code": month_code,
+        "year": year,
+        "month": month_number,
+    }
+
+
 def parse_contract_year_month(symbol, variety):
     normalized_symbol = normalize_symbol(symbol)
     normalized_variety = normalize_symbol(variety)
@@ -129,6 +276,18 @@ def is_date_arg(value):
     return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) or re.fullmatch(r"\d{8}", text))
 
 
+def select_roots(symbols, definitions):
+    if not symbols:
+        return list(definitions.keys())
+
+    selected = []
+    for symbol in symbols:
+        root = normalize_symbol(symbol)
+        if root in definitions:
+            selected.append(root)
+    return list(dict.fromkeys(selected))
+
+
 def parse_range_and_symbols(args, default_start, default_end):
     remaining = list(args or [])
     start_date = default_start
@@ -145,6 +304,48 @@ def parse_range_and_symbols(args, default_start, default_end):
         raise ValueError("start_date cannot be greater than end_date")
 
     return start_date, end_date, remaining
+
+
+def http_get(url, *, params=None, headers=None, timeout=HTTP_TIMEOUT_SECONDS):
+    merged_headers = {**HTTP_HEADERS, **(headers or {})}
+    last_error = None
+    for attempt in range(1, HTTP_RETRY_COUNT + 1):
+        try:
+            response = requests.get(url, params=params, headers=merged_headers, timeout=timeout)
+            if response.status_code == 404:
+                return response
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < HTTP_RETRY_COUNT:
+                time.sleep(HTTP_RETRY_SLEEP_SECONDS * attempt)
+    raise last_error
+
+
+def is_http_status_error(exc, status_codes):
+    response = getattr(exc, "response", None)
+    return response is not None and response.status_code in status_codes
+
+
+def parse_hkex_report_date(value):
+    text = normalize_text(value).upper()
+    match = re.search(r"(\d{1,2}\s+[A-Z]{3}\s+\d{4})", text)
+    if not match:
+        return ""
+    try:
+        return datetime.strptime(match.group(1), "%d %b %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def row_first(row, keys):
+    for key in keys:
+        if key in row:
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+    return None
 
 
 def select_hist_symbols(symbols=None):
@@ -167,6 +368,111 @@ def build_market_date_ranges(start_date, end_date, chunk_days=CHUNK_DAYS):
         ranges.append((current, chunk_end))
         current = chunk_end + timedelta(days=1)
     return ranges
+
+
+def iter_weekdays(start_date, end_date):
+    current = start_date
+    while current <= end_date:
+        if current.weekday() < 5:
+            yield current
+        current += timedelta(days=1)
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def fetch_hk_trading_calendar_dates():
+    return fetch_with_retry(
+        ak.stock_hk_index_daily_sina,
+        symbol=HK_TRADING_CALENDAR_SYMBOL,
+        retries=3,
+        sleep_seconds=2,
+        request_key=f"stock_hk_index_daily_sina:{HK_TRADING_CALENDAR_SYMBOL}:calendar",
+    )
+
+
+def build_hk_trading_dates(start_date, end_date):
+    weekday_dates = list(iter_weekdays(start_date, end_date))
+    if not weekday_dates:
+        return [], "weekday", 0, 0
+
+    try:
+        calendar_df = fetch_hk_trading_calendar_dates()
+    except Exception as exc:
+        print(f"hk trading calendar fetch failed, fallback to weekdays: {exc}")
+        return weekday_dates, "weekday", len(weekday_dates), 0
+
+    calendar_dates = []
+    if calendar_df is not None and not calendar_df.empty and "date" in calendar_df.columns:
+        for value in calendar_df["date"].tolist():
+            normalized = normalize_trade_date(value)
+            if not normalized:
+                continue
+            parsed = parse_date_arg(normalized, start_date)
+            if start_date <= parsed <= end_date:
+                calendar_dates.append(parsed)
+
+    calendar_dates = sorted(set(calendar_dates))
+    if not calendar_dates:
+        print("hk trading calendar returned no usable dates, fallback to weekdays")
+        return weekday_dates, "weekday", len(weekday_dates), 0
+
+    calendar_min = calendar_dates[0]
+    calendar_max = calendar_dates[-1]
+    calendar_set = set(calendar_dates)
+    merged_dates = []
+    fallback_count = 0
+    calendar_count = 0
+    for current in weekday_dates:
+        if calendar_min <= current <= calendar_max:
+            if current in calendar_set:
+                merged_dates.append(current)
+                calendar_count += 1
+        else:
+            merged_dates.append(current)
+            fallback_count += 1
+
+    source = (
+        f"{HK_TRADING_CALENDAR_SYMBOL} calendar "
+        f"{calendar_min}..{calendar_max} + weekday fallback"
+    )
+    return merged_dates, source, fallback_count, calendar_count
+
+
+def build_hk_index_futures_backfill_work_items(selected_roots, trade_dates):
+    work_items = []
+    for trade_date in trade_dates:
+        for root_symbol in selected_roots:
+            if trade_date < HK_INDEX_FUTURES_PRODUCTS[root_symbol]["start_date"]:
+                continue
+            work_items.append((root_symbol, trade_date))
+    return work_items
+
+
+def should_print_hk_backfill_progress(processed_count, total_count, daily_count):
+    return (
+        processed_count == 1
+        or processed_count == total_count
+        or daily_count > 0
+        or processed_count % HK_BACKFILL_PROGRESS_EVERY == 0
+    )
+
+
+def print_hk_backfill_progress(processed_count, total_count, root_symbol, trade_date, start_ts, total_rows, saved_days, empty_days, failed_days):
+    elapsed_seconds = time.time() - start_ts
+    progress_pct = (processed_count / total_count * 100) if total_count else 100.0
+    eta_seconds = (elapsed_seconds / processed_count * (total_count - processed_count)) if processed_count else 0
+    print(
+        "hk index futures backfill progress: "
+        f"{processed_count}/{total_count} ({progress_pct:.2f}%), "
+        f"root={root_symbol}, trade_date={trade_date}, "
+        f"elapsed={format_duration(elapsed_seconds)}, eta={format_duration(eta_seconds)}, "
+        f"rows={total_rows}, saved_days={saved_days}, empty_days={empty_days}, failed_days={failed_days}"
+    )
 
 
 def get_market_daily_range(start_date, end_date):
@@ -312,6 +618,227 @@ def build_hist_rows(symbol, symbol_meta, df):
             "data_source": "futures_hist_em",
         })
     return rows
+
+
+def fetch_sina_global_futures_history(root_symbol):
+    today = datetime.now().date()
+    today_marker = f"{today.year}_{today.month}_{today.day}"
+    callback = f"var%20_S{today_marker}="
+    params = {
+        "symbol": root_symbol,
+        "_": today_marker,
+        "source": "web",
+    }
+    headers = {
+        "Referer": "https://finance.sina.com.cn/money/future/hf.html",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    response = http_get(
+        SINA_GLOBAL_FUTURES_DAILY_URL.format(callback=callback),
+        params=params,
+        headers=headers,
+    )
+    data_text = response.text
+    json_start = data_text.find("[")
+    json_end = data_text.rfind("]")
+    if json_start < 0 or json_end < json_start:
+        raise RuntimeError(f"Sina global futures returned no JSON array for {root_symbol}")
+
+    rows = json.loads(data_text[json_start:json_end + 1])
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Sina global futures returned unexpected payload for {root_symbol}")
+    return rows
+
+
+def build_sina_us_index_futures_rows(root_symbol, rows, start_date=None, end_date=None, latest_only=False):
+    product = US_INDEX_FUTURES_PRODUCTS[root_symbol]
+    daily_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        trade_date = normalize_trade_date(row_first(row, ["date", "trade_date"]))
+        if not trade_date:
+            continue
+        parsed_trade_date = parse_date_arg(trade_date, datetime.now().date())
+        if start_date and parsed_trade_date < start_date:
+            continue
+        if end_date and parsed_trade_date > end_date:
+            continue
+
+        daily_row = {
+            "root_symbol": root_symbol,
+            "source_contract_code": root_symbol,
+            "contract_name": product["contract_name"],
+            "contract_month": "CONTINUOUS",
+            "exchange": product["exchange"],
+            "data_source": SINA_GLOBAL_FUTURES_SOURCE,
+            "first_seen_trade_date": trade_date,
+            "last_seen_trade_date": trade_date,
+            "trade_date": trade_date,
+            "open_price": normalize_number_text(row_first(row, ["open"])),
+            "high_price": normalize_number_text(row_first(row, ["high"])),
+            "low_price": normalize_number_text(row_first(row, ["low"])),
+            "close_price": normalize_number_text(row_first(row, ["close"])),
+            "closing_range_raw": None,
+            "volume": normalize_number_text(row_first(row, ["volume"])),
+            "open_interest": normalize_number_text(row_first(row, ["position", "open_interest"])),
+            "settle_price": normalize_number_text(row_first(row, ["settlement", "settle"])),
+            "pre_settle_price": None,
+        }
+        if not any(daily_row.get(key) is not None for key in ("open_price", "high_price", "low_price", "close_price")):
+            continue
+        daily_rows.append(daily_row)
+
+    daily_rows.sort(key=lambda item: item["trade_date"])
+    if latest_only and daily_rows:
+        daily_rows = [daily_rows[-1]]
+    if not daily_rows:
+        return [], []
+
+    first_trade_date = daily_rows[0]["trade_date"]
+    last_trade_date = daily_rows[-1]["trade_date"]
+    contract_row = {
+        "root_symbol": root_symbol,
+        "source_contract_code": root_symbol,
+        "contract_name": product["contract_name"],
+        "contract_month": "CONTINUOUS",
+        "exchange": product["exchange"],
+        "data_source": SINA_GLOBAL_FUTURES_SOURCE,
+        "first_seen_trade_date": first_trade_date,
+        "last_seen_trade_date": last_trade_date,
+    }
+    for daily_row in daily_rows:
+        daily_row["first_seen_trade_date"] = first_trade_date
+        daily_row["last_seen_trade_date"] = last_trade_date
+    return [contract_row], daily_rows
+
+
+def fetch_hkex_latest_zip(root_symbol):
+    product = HK_INDEX_FUTURES_PRODUCTS[root_symbol]
+    page_url = urljoin(HKEX_DAYRPT_BASE_URL, product["latest_page"])
+    response = http_get(page_url, headers={"Referer": "https://www.hkex.com.hk/"})
+    if response.status_code == 404:
+        return None
+
+    match = re.search(r'href=["\']([^"\']+\.zip)["\']', response.text, flags=re.IGNORECASE)
+    if not match:
+        raise RuntimeError(f"HKEX latest zip link not found for {root_symbol}")
+    zip_url = urljoin(page_url, match.group(1))
+    zip_response = http_get(zip_url, headers={"Referer": page_url})
+    if zip_response.status_code == 404:
+        return None
+    return zip_response.content
+
+
+def fetch_hkex_archive_zip(root_symbol, trade_date):
+    product = HK_INDEX_FUTURES_PRODUCTS[root_symbol]
+    yymmdd = trade_date.strftime("%y%m%d")
+    zip_url = urljoin(HKEX_DAYRPT_BASE_URL, f"{product['zip_prefix']}{yymmdd}.zip")
+    response = http_get(zip_url, headers={"Referer": "https://www.hkex.com.hk/"})
+    if response.status_code == 404:
+        return None
+    return response.content
+
+
+def read_hkex_zip_csv_rows(zip_content):
+    if not zip_content:
+        return []
+    with zipfile.ZipFile(io.BytesIO(zip_content)) as archive:
+        csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+        if not csv_names:
+            return []
+        raw = archive.read(csv_names[0])
+
+    for encoding in ("utf-8-sig", "big5", "latin1"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            text = ""
+    if not text:
+        return []
+    return list(csv.reader(io.StringIO(text)))
+
+
+def build_hkex_index_futures_rows(root_symbol, csv_rows):
+    product = HK_INDEX_FUTURES_PRODUCTS[root_symbol]
+    trade_date = ""
+    header_index = None
+    for idx, row in enumerate(csv_rows):
+        row_text = " ".join(normalize_text(cell) for cell in row)
+        if "TRADING DAY OF THE EXCHANGE" in row_text.upper():
+            for next_row in csv_rows[idx + 1: idx + 4]:
+                candidates = [parse_hkex_report_date(cell) for cell in next_row]
+                candidates = [candidate for candidate in candidates if candidate]
+                if candidates:
+                    trade_date = candidates[-1]
+                    break
+        if row and normalize_text(row[0]).upper() == "CONTRACT MONTH":
+            header_index = idx
+            break
+
+    if not trade_date or header_index is None:
+        return [], []
+
+    contract_rows = []
+    daily_rows = []
+    for row in csv_rows[header_index + 1:]:
+        if not row or not normalize_text(row[0]):
+            if contract_rows:
+                break
+            continue
+
+        contract_month_text = normalize_text(row[0])
+        row_text = " ".join(normalize_text(cell) for cell in row).upper()
+        if any(marker in row_text for marker in ("STRATEGY", "SPREAD", "TOTAL", "TAILOR")):
+            break
+
+        contract_meta = parse_month_contract(root_symbol, contract_month_text)
+        if not contract_meta:
+            continue
+
+        source_contract_code = contract_meta["source_contract_code"]
+        contract_name = f"{product['contract_name']} {contract_meta['month_code']}{str(contract_meta['year'])[-2:]}"
+        contract_row = {
+            "root_symbol": root_symbol,
+            "source_contract_code": source_contract_code,
+            "contract_name": contract_name,
+            "contract_month": contract_meta["contract_month"],
+            "exchange": product["exchange"],
+            "data_source": HKEX_SOURCE,
+            "first_seen_trade_date": trade_date,
+            "last_seen_trade_date": trade_date,
+        }
+
+        day_open = normalize_number_text(row[6] if len(row) > 6 else None)
+        day_high = normalize_number_text(row[7] if len(row) > 7 else None)
+        day_low = normalize_number_text(row[8] if len(row) > 8 else None)
+        aht_open = normalize_number_text(row[1] if len(row) > 1 else None)
+        aht_high = normalize_number_text(row[2] if len(row) > 2 else None)
+        aht_low = normalize_number_text(row[3] if len(row) > 3 else None)
+        contract_high = normalize_number_text(row[12] if len(row) > 12 else None)
+        contract_low = normalize_number_text(row[13] if len(row) > 13 else None)
+        settle_price = normalize_number_text(row[10] if len(row) > 10 else None)
+
+        high_candidates = [value for value in (contract_high, day_high, aht_high) if value is not None]
+        low_candidates = [value for value in (contract_low, day_low, aht_low) if value is not None]
+        daily_row = {
+            **contract_row,
+            "trade_date": trade_date,
+            "open_price": day_open if day_open is not None else aht_open,
+            "high_price": max(high_candidates) if high_candidates else None,
+            "low_price": min(low_candidates) if low_candidates else None,
+            "close_price": settle_price,
+            "volume": normalize_number_text(row[14] if len(row) > 14 else None),
+            "open_interest": normalize_number_text(row[15] if len(row) > 15 else None),
+            "settle_price": settle_price,
+            "pre_settle_price": None,
+        }
+        contract_rows.append(contract_row)
+        daily_rows.append(daily_row)
+
+    return contract_rows, daily_rows
 
 
 async def ingest_market_range(db_tools, start_date, end_date):
@@ -465,6 +992,225 @@ async def sync_trade_date(trade_date):
     return await sync_today(start_date=actual_trade_date, end_date=actual_trade_date)
 
 
+async def persist_index_futures_rows(db_tools, contract_table, daily_table, contract_rows, daily_rows):
+    contract_count = await db_tools.batch_index_futures_contract_info(contract_table, contract_rows)
+    daily_count = await db_tools.batch_index_futures_daily_data(daily_table, daily_rows)
+    return contract_count, daily_count
+
+
+async def sync_us_index_futures_daily(trade_date=None, roots=None):
+    selected_roots = select_roots(roots, US_INDEX_FUTURES_PRODUCTS)
+    if not selected_roots:
+        print("No valid US index futures roots selected.")
+        return 0
+    target_date = parse_date_arg(trade_date, datetime.now().date()) if trade_date else None
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        total_contracts = 0
+        total_rows = 0
+        for root_symbol in selected_roots:
+            try:
+                history_rows = await asyncio.to_thread(fetch_sina_global_futures_history, root_symbol)
+                contract_rows, daily_rows = build_sina_us_index_futures_rows(
+                    root_symbol,
+                    history_rows,
+                    start_date=target_date,
+                    end_date=target_date,
+                    latest_only=target_date is None,
+                )
+                contract_count, daily_count = await persist_index_futures_rows(
+                    db_tools,
+                    "futures_us_index_contract_info",
+                    "futures_us_index_daily_data",
+                    contract_rows,
+                    daily_rows,
+                )
+                total_contracts += contract_count
+                total_rows += daily_count
+                print(
+                    f"us index futures {root_symbol} daily saved contracts={contract_count}, rows={daily_count}"
+                )
+            except Exception as exc:
+                print(f"us index futures {root_symbol} daily failed: {exc}")
+        print(f"us index futures daily finished, contracts={total_contracts}, rows={total_rows}")
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
+async def backfill_us_index_futures(start_date=None, end_date=None, roots=None):
+    selected_roots = select_roots(roots, US_INDEX_FUTURES_PRODUCTS)
+    if not selected_roots:
+        print("No valid US index futures roots selected.")
+        return 0
+    default_start = min(US_INDEX_FUTURES_PRODUCTS[root]["start_date"] for root in selected_roots)
+    actual_start = start_date or default_start
+    actual_end = end_date or datetime.now().date()
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        total_rows = 0
+        for root_symbol in selected_roots:
+            try:
+                history_rows = await asyncio.to_thread(fetch_sina_global_futures_history, root_symbol)
+                contract_rows, daily_rows = build_sina_us_index_futures_rows(
+                    root_symbol,
+                    history_rows,
+                    start_date=actual_start,
+                    end_date=actual_end,
+                )
+                _, daily_count = await persist_index_futures_rows(
+                    db_tools,
+                    "futures_us_index_contract_info",
+                    "futures_us_index_daily_data",
+                    contract_rows,
+                    daily_rows,
+                )
+                total_rows += daily_count
+                print(f"us index futures {root_symbol} backfill saved rows={daily_count}")
+            except Exception as exc:
+                print(f"us index futures {root_symbol} backfill failed: {exc}")
+        print(
+            "us index futures backfill finished, "
+            f"roots={','.join(selected_roots)}, start_date={actual_start}, end_date={actual_end}, rows={total_rows}"
+        )
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
+async def sync_hk_index_futures_daily(trade_date=None, roots=None):
+    selected_roots = select_roots(roots, HK_INDEX_FUTURES_PRODUCTS)
+    if not selected_roots:
+        print("No valid HK index futures roots selected.")
+        return 0
+    target_date = parse_date_arg(trade_date, datetime.now().date()) if trade_date else None
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        total_contracts = 0
+        total_rows = 0
+        for root_symbol in selected_roots:
+            try:
+                if target_date:
+                    zip_content = await asyncio.to_thread(fetch_hkex_archive_zip, root_symbol, target_date)
+                else:
+                    zip_content = await asyncio.to_thread(fetch_hkex_latest_zip, root_symbol)
+                csv_rows = read_hkex_zip_csv_rows(zip_content)
+                contract_rows, daily_rows = build_hkex_index_futures_rows(root_symbol, csv_rows)
+                contract_count, daily_count = await persist_index_futures_rows(
+                    db_tools,
+                    "futures_hk_index_contract_info",
+                    "futures_hk_index_daily_data",
+                    contract_rows,
+                    daily_rows,
+                )
+                total_contracts += contract_count
+                total_rows += daily_count
+                print(
+                    f"hk index futures {root_symbol} daily saved contracts={contract_count}, rows={daily_count}"
+                )
+            except Exception as exc:
+                print(f"hk index futures {root_symbol} daily failed: {exc}")
+        print(f"hk index futures daily finished, contracts={total_contracts}, rows={total_rows}")
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
+async def backfill_hk_index_futures(start_date=None, end_date=None, roots=None):
+    selected_roots = select_roots(roots, HK_INDEX_FUTURES_PRODUCTS)
+    if not selected_roots:
+        print("No valid HK index futures roots selected.")
+        return 0
+    default_start = min(HK_INDEX_FUTURES_PRODUCTS[root]["start_date"] for root in selected_roots)
+    actual_start = start_date or default_start
+    actual_end = end_date or datetime.now().date()
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        total_rows = 0
+        trade_dates, calendar_source, fallback_count, calendar_count = await asyncio.to_thread(
+            build_hk_trading_dates,
+            actual_start,
+            actual_end,
+        )
+        work_items = build_hk_index_futures_backfill_work_items(selected_roots, trade_dates)
+        print(
+            "hk index futures backfill prepared: "
+            f"roots={','.join(selected_roots)}, start_date={actual_start}, end_date={actual_end}, "
+            f"trade_dates={len(trade_dates)}, work_items={len(work_items)}, "
+            f"calendar_source={calendar_source}, calendar_dates={calendar_count}, "
+            f"weekday_fallback_dates={fallback_count}"
+        )
+        if not work_items:
+            print(
+                "hk index futures backfill finished, "
+                f"roots={','.join(selected_roots)}, start_date={actual_start}, end_date={actual_end}, rows=0"
+            )
+            return 0
+
+        start_ts = time.time()
+        saved_days = 0
+        empty_days = 0
+        failed_days = 0
+        total_items = len(work_items)
+        for processed_count, (root_symbol, trade_date) in enumerate(work_items, start=1):
+            daily_count = 0
+            try:
+                zip_content = await asyncio.to_thread(fetch_hkex_archive_zip, root_symbol, trade_date)
+                if zip_content:
+                    csv_rows = read_hkex_zip_csv_rows(zip_content)
+                    contract_rows, daily_rows = build_hkex_index_futures_rows(root_symbol, csv_rows)
+                    _, daily_count = await persist_index_futures_rows(
+                        db_tools,
+                        "futures_hk_index_contract_info",
+                        "futures_hk_index_daily_data",
+                        contract_rows,
+                        daily_rows,
+                    )
+                    total_rows += daily_count
+                    if daily_count:
+                        saved_days += 1
+                        print(f"hk index futures {root_symbol} {trade_date} saved rows={daily_count}")
+                    else:
+                        empty_days += 1
+                else:
+                    empty_days += 1
+            except Exception as exc:
+                if is_http_status_error(exc, {401, 403}):
+                    raise
+                failed_days += 1
+                print(f"hk index futures {root_symbol} {trade_date} skipped: {exc}")
+
+            if should_print_hk_backfill_progress(processed_count, total_items, daily_count):
+                print_hk_backfill_progress(
+                    processed_count,
+                    total_items,
+                    root_symbol,
+                    trade_date,
+                    start_ts,
+                    total_rows,
+                    saved_days,
+                    empty_days,
+                    failed_days,
+                )
+        print(
+            "hk index futures backfill finished, "
+            f"roots={','.join(selected_roots)}, start_date={actual_start}, end_date={actual_end}, "
+            f"trade_dates={len(trade_dates)}, work_items={len(work_items)}, rows={total_rows}, "
+            f"saved_days={saved_days}, empty_days={empty_days}, failed_days={failed_days}"
+        )
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
 async def main():
     mode = sys.argv[1].lower() if len(sys.argv) > 1 else "backfill"
     args = sys.argv[2:]
@@ -509,6 +1255,32 @@ async def main():
         await sync_hist_today(start_date=start_date, end_date=end_date, symbols=symbol_args)
         return
 
+    if mode == "daily-us-index":
+        today = datetime.now().date()
+        start_date, end_date, symbol_args = parse_range_and_symbols(args, today, today)
+        trade_date = start_date if args and is_date_arg(args[0]) and start_date == end_date else None
+        await sync_us_index_futures_daily(trade_date=trade_date, roots=symbol_args)
+        return
+
+    if mode == "backfill-us-index":
+        default_start = min(meta["start_date"] for meta in US_INDEX_FUTURES_PRODUCTS.values())
+        start_date, end_date, symbol_args = parse_range_and_symbols(args, default_start, default_end)
+        await backfill_us_index_futures(start_date=start_date, end_date=end_date, roots=symbol_args)
+        return
+
+    if mode == "daily-hk-index":
+        today = datetime.now().date()
+        start_date, end_date, symbol_args = parse_range_and_symbols(args, today, today)
+        trade_date = start_date if args and is_date_arg(args[0]) and start_date == end_date else None
+        await sync_hk_index_futures_daily(trade_date=trade_date, roots=symbol_args)
+        return
+
+    if mode == "backfill-hk-index":
+        default_start = min(meta["start_date"] for meta in HK_INDEX_FUTURES_PRODUCTS.values())
+        start_date, end_date, symbol_args = parse_range_and_symbols(args, default_start, default_end)
+        await backfill_hk_index_futures(start_date=start_date, end_date=end_date, roots=symbol_args)
+        return
+
     raise ValueError(
         "usage: python run.py futures backfill [start_date] [end_date] [HIST_SYMBOL ...]\n"
         "   or: python run.py futures daily [trade_date|start_date end_date] [HIST_SYMBOL ...]\n"
@@ -516,7 +1288,11 @@ async def main():
         "   or: python run.py futures market-backfill [start_date] [end_date]\n"
         "   or: python run.py futures market-daily [trade_date|start_date end_date]\n"
         "   or: python run.py futures hist-backfill [start_date] [end_date] [HIST_SYMBOL ...]\n"
-        "   or: python run.py futures hist-daily [trade_date|start_date end_date] [HIST_SYMBOL ...]"
+        "   or: python run.py futures hist-daily [trade_date|start_date end_date] [HIST_SYMBOL ...]\n"
+        "   or: python run.py futures daily-us-index [trade_date] [ES|NQ ...]\n"
+        "   or: python run.py futures backfill-us-index [start_date] [end_date] [ES|NQ ...]\n"
+        "   or: python run.py futures daily-hk-index [trade_date] [HSI|HHI|HTI ...]\n"
+        "   or: python run.py futures backfill-hk-index [start_date] [end_date] [HSI|HHI|HTI ...]"
     )
 
 

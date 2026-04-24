@@ -32,6 +32,78 @@
       "retryable_categories": ["network", "anti_bot", "unexpected"],
       "breaker_categories": ["anti_bot", "network"]
     },
+    "tencent": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 2,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "optbbs": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 2,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "chinascope": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 2,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "sse": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 2,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "szse": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 2,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
+    "bse": {
+      "min_interval_seconds": 2.0,
+      "max_attempts": 4,
+      "initial_backoff_seconds": 2,
+      "backoff_cap_seconds": 900,
+      "jitter_seconds": 5,
+      "enable_circuit_breaker": false,
+      "breaker_threshold": 3,
+      "breaker_cooldown_seconds": 300,
+      "retryable_categories": ["network", "anti_bot", "unexpected"],
+      "breaker_categories": ["anti_bot", "network"]
+    },
     "ths": {
       "min_interval_seconds": 2.0,
       "max_attempts": 4,

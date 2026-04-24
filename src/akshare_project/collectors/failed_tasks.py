@@ -21,6 +21,8 @@ async def dispatch_failed_task(failure):
         return await stock.sync_daily()
     if task_name == 'index_daily':
         return await index.sync_daily_from_spot()
+    if task_name == 'index_bj50_daily':
+        return await index.sync_daily_special_index()
     if task_name == 'cffex_daily':
         return await cffex.sync_latest_daily_data(headless=True)
     if task_name == 'forex_daily':

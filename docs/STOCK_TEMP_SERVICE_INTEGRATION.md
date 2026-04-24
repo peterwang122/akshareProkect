@@ -1,14 +1,20 @@
-# 股票后复权临时采集服务对接说明
+# 股票 HFQ 临时采集专项说明
 
-本文档给另一个项目使用，说明如何调用本项目提供的股票后复权临时采集服务。
+本文件只描述股票后复权专项接口：
 
-## 服务用途
+- `POST /collect`
 
-该服务用于按单只股票触发后复权日线采集，并把结果写入：
+如果你要对接本项目统一的日常采集 HTTP 服务，请优先阅读：
+
+- `docs/DAILY_COLLECTION_SERVICE_INTEGRATION.md`
+
+## 用途
+
+`/collect` 用于按单只股票、按指定区间触发后复权历史刷新，结果写入：
 
 - `stock_hfq_daily_data`
 
-服务是同步 HTTP 模式，适合被 Celery task 直接调用。
+这个接口保留为兼容入口，不属于统一 daily endpoint 协议。
 
 ## 启动方式
 
@@ -18,7 +24,7 @@
 python ak_scheduler_service.py serve
 ```
 
-再启动股票临时采集服务：
+再启动临时服务：
 
 ```bash
 python stock_temp_service.py serve
@@ -36,28 +42,6 @@ python stock_temp_service.py health
 
 ## HTTP 接口
 
-### 1. 健康检查
-
-请求：
-
-```http
-GET /health
-```
-
-响应示例：
-
-```json
-{
-  "status": "ok",
-  "service": "stock_temp_service",
-  "host": "127.0.0.1",
-  "port": 8786,
-  "thread": "MainThread"
-}
-```
-
-### 2. 触发采集
-
 请求：
 
 ```http
@@ -71,7 +55,7 @@ Content-Type: application/json
 {
   "stock_code": "600000",
   "start_date": "2020-01-01",
-  "end_date": "2026-04-11"
+  "end_date": "2026-04-19"
 }
 ```
 
@@ -81,34 +65,22 @@ Content-Type: application/json
 - `start_date`：可选，格式 `YYYY-MM-DD`
 - `end_date`：可选，格式 `YYYY-MM-DD`
 
-服务内部规则：
+## 服务规则
 
-- 先按 `stock_code` 查询 `stock_info_all` 的上市日期
-- 若查不到上市日期，则回退到 `1991-01-01`
+- 先用 `stock_code` 查询 `stock_info_all` 上市日期
+- 查不到上市日期时回退到 `1991-01-01`
 - `effective_start_date = max(request.start_date, 上市日期/1991-01-01)`
-- `effective_end_date = request.end_date 或 今日`
-- 使用 `stock_zh_a_daily(adjust="hfq")` 拉取从起始到结束的后复权数据
+- `effective_end_date = request.end_date 或今日`
+- 数据源为 `stock_zh_a_daily(adjust="hfq")`
 
-## 幂等规则
+幂等规则：
 
-服务会读取 `stock_hfq_daily_data` 中该股票最近一次刷新记录的：
+- 如果本次区间与该股票最近一次刷新区间完全一致，直接返回 `UNCHANGED`
+- 如果区间变化，则先删除该股票在 `stock_hfq_daily_data` 中的旧记录，再整段重写
 
-- `request_start_date`
-- `request_end_date`
+## 响应示例
 
-如果本次请求区间与上次完全一致，则：
-
-- 不会重新删除和写入数据
-- 直接返回 `UNCHANGED`
-
-如果区间不同，则：
-
-- 先删除该股票在 `stock_hfq_daily_data` 中的全部历史
-- 再全量写入新的后复权数据
-
-## 响应格式
-
-### 成功刷新
+成功刷新：
 
 ```json
 {
@@ -116,7 +88,7 @@ Content-Type: application/json
   "stock_code": "600000",
   "prefixed_code": "sh600000",
   "effective_start_date": "2020-01-01",
-  "effective_end_date": "2026-04-11",
+  "effective_end_date": "2026-04-19",
   "refreshed": true,
   "unchanged": false,
   "deleted_rows": 1200,
@@ -124,7 +96,7 @@ Content-Type: application/json
 }
 ```
 
-### 区间未变化
+区间未变化：
 
 ```json
 {
@@ -132,7 +104,7 @@ Content-Type: application/json
   "stock_code": "600000",
   "prefixed_code": "sh600000",
   "effective_start_date": "2020-01-01",
-  "effective_end_date": "2026-04-11",
+  "effective_end_date": "2026-04-19",
   "refreshed": false,
   "unchanged": true,
   "deleted_rows": 0,
@@ -140,9 +112,7 @@ Content-Type: application/json
 }
 ```
 
-### 请求错误
-
-HTTP 400：
+请求错误：
 
 ```json
 {
@@ -151,9 +121,7 @@ HTTP 400：
 }
 ```
 
-### 服务内部错误
-
-HTTP 500：
+服务内部错误：
 
 ```json
 {
@@ -162,122 +130,18 @@ HTTP 500：
 }
 ```
 
-## Celery 对接建议
+## 外部项目接入建议
 
-建议做法：
+- 每次只让一个任务对应一次 `POST /collect`
+- HTTP 200 且 `status` 为 `SUCCESS` 或 `UNCHANGED` 都视为成功
+- HTTP 5xx、网络超时、连接失败建议重试
+- HTTP 400 这类参数错误建议直接失败，不自动重试
 
-- 一个 Celery task 对应一次 `POST /collect`
-- 用 HTTP 调用，而不是直接连本项目数据库或直接调 AKShare
-- 让 Celery 只关心服务响应，不关心本项目内部的 AK 调度细节
+PowerShell 示例：
 
-### 成功判定
-
-以下情况都视为任务成功：
-
-- HTTP 200 且 `status == "SUCCESS"`
-- HTTP 200 且 `status == "UNCHANGED"`
-
-以下情况建议重试：
-
-- HTTP 5xx
-- 网络超时
-- 连接失败
-
-以下情况建议直接失败，不自动重试：
-
-- HTTP 400
-- `stock_code` 非法
-- 日期区间非法
-
-### 推荐 Celery 重试策略
-
-- `max_retries = 5`
-- `countdown = 60, 120, 300...`
-- `soft_time_limit = 1800`
-- `time_limit = 2100`
-
-### Python 调用示例
-
-```python
-import requests
-
-
-def collect_stock_hfq(stock_code: str, start_date: str | None = None, end_date: str | None = None):
-    payload = {
-        "stock_code": stock_code,
-        "start_date": start_date,
-        "end_date": end_date,
-    }
-    response = requests.post(
-        "http://127.0.0.1:8786/collect",
-        json=payload,
-        timeout=1800,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("status") not in {"SUCCESS", "UNCHANGED"}:
-        raise RuntimeError(f"unexpected service status: {data}")
-    return data
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8786/collect" `
+  -ContentType "application/json" `
+  -Body '{"stock_code":"600000","start_date":"2020-01-01","end_date":"2026-04-19"}'
 ```
-
-### Celery task 示例
-
-```python
-from celery import shared_task
-import requests
-
-
-@shared_task(
-    bind=True,
-    name="tasks.collect_stock_hfq_data",
-    autoretry_for=(requests.RequestException,),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 5},
-)
-def collect_stock_hfq_task(self, stock_code, start_date=None, end_date=None):
-    response = requests.post(
-        "http://127.0.0.1:8786/collect",
-        json={
-            "stock_code": stock_code,
-            "start_date": start_date,
-            "end_date": end_date,
-        },
-        timeout=1800,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("status") not in {"SUCCESS", "UNCHANGED"}:
-        raise RuntimeError(payload)
-    return payload
-```
-
-## 数据读取建议
-
-采集完成后，对方项目读取：
-
-- `stock_hfq_daily_data`
-
-过滤条件建议：
-
-- `prefixed_code = 'sh600000'`
-  或
-- `stock_code = '600000'`
-
-排序建议：
-
-```sql
-ORDER BY trade_date ASC
-```
-
-如果对方项目只关心最近一次刷新区间，可以同时读取：
-
-- `request_start_date`
-- `request_end_date`
-- `refresh_batch_id`
-
-## 注意事项
-
-- 服务依赖 AK scheduler，未启动时 `POST /collect` 会失败
-- 同一股票不同区间会触发整表重刷，这是为了保证后复权数据一致
-- 该服务不返回异步 job id，接口是同步的；Celery 直接等待 HTTP 结果即可
-- `stock_qfq_daily_data` 仅保留作历史参考，不再作为 FIT 活动读取表

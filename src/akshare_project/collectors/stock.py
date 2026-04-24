@@ -148,6 +148,13 @@ def calculate_price_change_metrics(previous_close, current_close):
     return price_change_amount, price_change_rate
 
 
+def round_metric_value(value, scale=4):
+    numeric_value = normalize_numeric(value)
+    if numeric_value is None:
+        return None
+    return round(float(numeric_value), scale)
+
+
 def normalize_trade_date_text(value):
     if value is None or (hasattr(pd, "isna") and pd.isna(value)):
         return None
@@ -223,6 +230,47 @@ def parse_repair_daily_dates_cli_args(args):
         date_args = args
     trade_dates = parse_required_trade_dates(date_args)
     return trade_dates, (selected_codes or None)
+
+
+def parse_cli_date_text(value, field_name="date"):
+    normalized = normalize_trade_date_text(value)
+    if not normalized or not parse_trade_date(normalized):
+        raise ValueError(f"invalid {field_name}: {value}")
+    return normalized
+
+
+def parse_hist_metric_cli_args(args):
+    args = list(args or [])
+    selected_codes = None
+    if "--codes" in args:
+        separator_index = args.index("--codes")
+        date_args = args[:separator_index]
+        code_args = args[separator_index + 1:]
+        selected_codes = [
+            normalize_stock_code(code)
+            for code in code_args
+            if normalize_stock_code(code)
+        ]
+        if code_args and not selected_codes:
+            raise ValueError("repair-hist-metrics --codes requires at least one valid stock code")
+    else:
+        date_args = args
+
+    if len(date_args) > 2:
+        raise ValueError("repair-hist-metrics accepts at most 2 date arguments")
+
+    if not date_args:
+        return None, None, (selected_codes or None)
+
+    if len(date_args) == 1:
+        single_date = parse_cli_date_text(date_args[0], "date")
+        return single_date, single_date, (selected_codes or None)
+
+    start_date = parse_cli_date_text(date_args[0], "start_date")
+    end_date = parse_cli_date_text(date_args[1], "end_date")
+    if parse_trade_date(start_date) > parse_trade_date(end_date):
+        raise ValueError("start_date can not be later than end_date")
+    return start_date, end_date, (selected_codes or None)
 
 
 def normalize_snapshot_time(value):
@@ -754,6 +802,41 @@ def build_hfq_rows(prefixed_code, stock_name, request_start_date, request_end_da
     return rows
 
 
+def build_hist_metric_update_rows(prefixed_code, history_rows, repair_start_date=None, repair_end_date=None):
+    normalized_prefixed_code = normalize_prefixed_code(prefixed_code)
+    start_boundary = parse_trade_date(repair_start_date) if repair_start_date else None
+    end_boundary = parse_trade_date(repair_end_date) if repair_end_date else None
+    updates = []
+    previous_close = None
+
+    for row in history_rows or []:
+        trade_date = normalize_trade_date_text((row or {}).get("trade_date"))
+        trade_date_obj = parse_trade_date(trade_date)
+        if not trade_date or trade_date_obj is None:
+            continue
+
+        current_close = normalize_numeric((row or {}).get("close_price"))
+        pre_close_price = round_metric_value(previous_close, scale=4)
+        price_change_amount, price_change_rate = calculate_price_change_metrics(previous_close, current_close)
+
+        if (
+            (start_boundary is None or trade_date_obj >= start_boundary)
+            and (end_boundary is None or trade_date_obj <= end_boundary)
+        ):
+            updates.append({
+                "prefixed_code": normalized_prefixed_code,
+                "trade_date": trade_date,
+                "pre_close_price": pre_close_price,
+                "price_change_amount": round_metric_value(price_change_amount, scale=4),
+                "price_change_rate": round_metric_value(price_change_rate, scale=4),
+            })
+
+        if current_close is not None:
+            previous_close = current_close
+
+    return updates
+
+
 async def sync_stock_info_all(db_tools=None, force=False):
     own_db = db_tools is None
     db_tools = db_tools or DbTools()
@@ -1167,6 +1250,79 @@ async def repair_daily_dates(trade_dates, selected_codes=None, db_tools=None):
             await db_tools.close()
 
 
+async def repair_hist_metrics(start_date=None, end_date=None, selected_codes=None, db_tools=None):
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
+        await db_tools.init_pool()
+    try:
+        target_rows = await db_tools.get_stock_daily_hist_metric_targets(
+            stock_codes=selected_codes,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if not target_rows:
+            print("stock repair-hist-metrics finished: no stock_zh_a_hist_tx rows matched")
+            return 0
+
+        processed_rows = 0
+        affected_rows = 0
+        failed = 0
+        failed_codes = []
+        total_targets = len(target_rows)
+
+        for index, target_row in enumerate(target_rows, start=1):
+            prefixed_code = normalize_prefixed_code((target_row or {}).get("prefixed_code"))
+            stock_code = normalize_stock_code((target_row or {}).get("stock_code"))
+            try:
+                history_rows = await db_tools.get_stock_daily_hist_rows_for_metric_repair(
+                    prefixed_code=prefixed_code,
+                    end_date=end_date,
+                )
+                if not history_rows:
+                    continue
+
+                update_rows = build_hist_metric_update_rows(
+                    prefixed_code=prefixed_code,
+                    history_rows=history_rows,
+                    repair_start_date=start_date,
+                    repair_end_date=end_date,
+                )
+                if not update_rows:
+                    continue
+
+                processed_rows += len(update_rows)
+                affected_rows += await db_tools.update_stock_daily_hist_metrics(update_rows)
+            except Exception as exc:
+                failed += 1
+                failed_codes.append(prefixed_code or stock_code)
+                print(f"stock repair-hist-metrics failed for {prefixed_code or stock_code}: {exc}")
+                continue
+
+            if index % 200 == 0 or index == total_targets:
+                print(
+                    "stock repair-hist-metrics progress: "
+                    f"stocks={index}/{total_targets}, processed_rows={processed_rows}, "
+                    f"affected_rows={affected_rows}, failed={failed}"
+                )
+
+        print(
+            "stock repair-hist-metrics finished: "
+            f"start_date={start_date or '-'}, end_date={end_date or '-'}, "
+            f"target_stocks={total_targets}, processed_rows={processed_rows}, "
+            f"affected_rows={affected_rows}, failed={failed}"
+        )
+        if failed_codes:
+            print(
+                "stock repair-hist-metrics failed codes: "
+                f"{','.join(code for code in failed_codes if code)}"
+            )
+        return affected_rows
+    finally:
+        if own_db:
+            await db_tools.close()
+
+
 async def collect_hfq_for_request(stock_code, start_date=None, end_date=None, db_tools=None):
     normalized_code = normalize_stock_code(stock_code)
     if not normalized_code:
@@ -1261,11 +1417,16 @@ async def main():
         trade_dates, selected_codes = parse_repair_daily_dates_cli_args(args)
         await repair_daily_dates(trade_dates, selected_codes=selected_codes)
         return
+    if command == "repair-hist-metrics":
+        start_date, end_date, selected_codes = parse_hist_metric_cli_args(args)
+        await repair_hist_metrics(start_date=start_date, end_date=end_date, selected_codes=selected_codes)
+        return
 
     raise ValueError(
         "stock supports: backfill [stock_code ...] | daily [stock_code ...] | "
         "repair-backfill [stock_code ...] | "
-        "repair-daily-dates <YYYY-MM-DD> [YYYY-MM-DD ...] [--codes <stock_code ...>]"
+        "repair-daily-dates <YYYY-MM-DD> [YYYY-MM-DD ...] [--codes <stock_code ...>] | "
+        "repair-hist-metrics [start_date] [end_date] [--codes <stock_code ...>]"
     )
 
 
