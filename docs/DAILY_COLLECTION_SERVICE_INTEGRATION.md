@@ -139,7 +139,7 @@ HTTP 400：
 - `/collect-futures-daily`：中金所期货日更，等价于 `futures.sync_today`
 - `/collect-etf-daily`：ETF 日更，等价于 `etf.sync_daily`
 - `/collect-option-daily`：中金所期权日更，等价于 `option.sync_daily(headless=True)`
-- `/collect-quant-index-daily`：量化指数看板日更，等价于 `quant_index.sync_daily`
+- `/collect-quant-index-daily`：量化指数看板日更，等价于 `quant_index.sync_daily`，会刷新 A 股、港股、美股最近看板行
 
 固定顺序说明：
 
@@ -148,7 +148,13 @@ HTTP 400：
 
 ### 可独立调度的日更
 
-这些接口当前不反向影响 `quant_index_dashboard_daily`，可以按需单独调用，也可以与主链并行：
+这些接口可以按需单独调用，也可以与主链并行。与港/美股指数量化期现差相关的期货接口完成后，会自动刷新对应市场上一交易日看板数据：
+
+- `/collect-hk-index-futures-daily` 会采集港股上一交易日归档，并刷新该交易日 `quant_index_dashboard_daily`
+- `/collect-us-index-futures-daily` 会采集美股上一交易日数据，并刷新该交易日 `quant_index_dashboard_daily`
+- `/collect-us-index-futures-official-daily` 会采集美股上一交易日 CME 官方逐合约结算数据，写入 `futures_us_index_official_contract_info` / `futures_us_index_official_daily_data`，不刷新现有期现差看板
+- `/collect-index-hk-daily`、`/collect-index-us-daily` 只采集指数行情，不自动刷新期现差看板
+- `/collect-index-qvix-daily`、`/collect-index-news-sentiment-daily` 仍只更新各自独立数据，不触发港/美期现差刷新
 
 - `POST /collect-index-us-daily`
 - `POST /collect-index-hk-daily`
@@ -157,7 +163,11 @@ HTTP 400：
 - `POST /collect-index-us-vix-daily`
 - `POST /collect-index-us-fear-greed-daily`
 - `POST /collect-index-us-hedge-proxy-daily`
+- `POST /collect-index-us-put-call-ratio-daily`
+- `POST /collect-index-us-treasury-yield-daily`
+- `POST /collect-index-us-credit-spread-daily`
 - `POST /collect-us-index-futures-daily`
+- `POST /collect-us-index-futures-official-daily`
 - `POST /collect-hk-index-futures-daily`
 
 任务含义：
@@ -170,7 +180,14 @@ HTTP 400：
 - `/collect-index-us-fear-greed-daily`：美股恐贪指数最新值
 - `/collect-index-us-hedge-proxy-daily`：ES / NQ 两条对冲基金多空代理最新可得报告
 - `/collect-us-index-futures-daily`：美股股指期货日更，维护 `ES` / `NQ` 连续/品种级日线，数据源为新浪外盘期货
+- `/collect-us-index-futures-official-daily`：美股股指期货官方合约日更，维护 `ES` / `NQ` 的 CME 官方逐合约结算数据，第一版不参与 FIT 美股期现差计算
 - `/collect-hk-index-futures-daily`：港股股指期货日更，维护 `HSI` / `HHI` / `HTI` 具体月份合约，数据源为 HKEX 官方源
+
+新增美股辅助指标日更：
+
+- `/collect-index-us-put-call-ratio-daily`：采集 Cboe 官方 Put/Call Ratio，写入 `index_us_put_call_ratio_daily`。历史 CSV 覆盖到 2019-10-04；2019-10-05 之后改读 Cboe Daily Market Statistics 官方 JSON，可补齐 `Total / Index / Equity / ETF` 四类 Put/Call。若最新 JSON 暂未发布，日更会回退到 Current Market Statistics 页面。
+- `/collect-index-us-treasury-yield-daily`：采集 FRED 美债 3M / 2Y / 10Y 收益率并计算 `10Y-2Y`、`10Y-3M`，写入 `index_us_treasury_yield_daily`
+- `/collect-index-us-credit-spread-daily`：采集 FRED 高收益债 `HY OAS`，写入 `index_us_credit_spread_daily`
 
 ## 可复制调用示例
 

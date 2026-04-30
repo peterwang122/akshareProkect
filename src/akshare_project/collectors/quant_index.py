@@ -15,18 +15,42 @@ INDEX_NAME_ORDER = [
     "中证1000",
 ]
 CORE_INDEX_NAMES = INDEX_NAME_ORDER[1:]
+HK_INDEX_NAME_ORDER = [
+    "恒生指数",
+    "恒生中国企业指数",
+    "恒生科技指数",
+]
+US_INDEX_NAME_ORDER = [
+    "标普500指数",
+    "纳斯达克100指数",
+]
+ALL_INDEX_NAME_ORDER = [*INDEX_NAME_ORDER, *HK_INDEX_NAME_ORDER, *US_INDEX_NAME_ORDER]
 INDEX_CODE_FALLBACKS = {
     "上证指数": "sh000001",
     "上证50": "sh000016",
     "沪深300": "sh000300",
     "中证500": "sh000905",
     "中证1000": "sh000852",
+    "恒生指数": "HSI",
+    "恒生中国企业指数": "HSCEI",
+    "恒生科技指数": "HSTECH",
+    "标普500指数": ".INX",
+    "纳斯达克100指数": ".NDX",
 }
 INDEX_FUTURES_SYMBOLS = {
     "上证50": {"main_symbol": "IHM", "month_symbol": "IHM0"},
     "沪深300": {"main_symbol": "IFM", "month_symbol": "IFM0"},
     "中证500": {"main_symbol": "ICM", "month_symbol": "ICM0"},
     "中证1000": {"main_symbol": "IMM", "month_symbol": "IMM0"},
+}
+HK_INDEX_FUTURES_SYMBOLS = {
+    "恒生指数": "HSI",
+    "恒生中国企业指数": "HHI",
+    "恒生科技指数": "HTI",
+}
+US_INDEX_FUTURES_SYMBOLS = {
+    "标普500指数": "ES",
+    "纳斯达克100指数": "NQ",
 }
 FUTURES_SOURCE_PRIORITY = {
     "get_futures_daily_derived": 0,
@@ -151,6 +175,65 @@ def build_futures_close_map(rows):
     }
 
 
+def month_sort_value(value):
+    text = str(value or "").strip()
+    if not text:
+        return "9999-99"
+    return text[:7]
+
+
+def build_hk_futures_basis_map(rows):
+    grouped = {}
+    for row in rows:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        root_symbol = str(row.get("root_symbol", "")).strip().upper()
+        close_price = to_float(row.get("close_price"))
+        if not trade_date or not root_symbol or close_price is None:
+            continue
+        grouped.setdefault((trade_date, root_symbol), []).append(
+            {
+                "close_price": close_price,
+                "contract_month": month_sort_value(row.get("contract_month")),
+                "source_contract_code": str(row.get("source_contract_code", "")).strip().upper(),
+                "volume": to_float(row.get("volume")),
+                "open_interest": to_float(row.get("open_interest")),
+            }
+        )
+
+    result = {}
+    for row_key, candidates in grouped.items():
+        month_contract = sorted(
+            candidates,
+            key=lambda item: (item["contract_month"], item["source_contract_code"]),
+        )[0]
+        main_contract = sorted(
+            candidates,
+            key=lambda item: (
+                -(item["open_interest"] if item["open_interest"] is not None else -1),
+                -(item["volume"] if item["volume"] is not None else -1),
+                item["contract_month"],
+                item["source_contract_code"],
+            ),
+        )[0]
+        result[row_key] = {
+            "main_close": main_contract["close_price"],
+            "month_close": month_contract["close_price"],
+        }
+    return result
+
+
+def build_us_futures_close_map(rows):
+    result = {}
+    for row in rows:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        root_symbol = str(row.get("root_symbol", "")).strip().upper()
+        close_price = to_float(row.get("close_price"))
+        if not trade_date or not root_symbol or close_price is None:
+            continue
+        result[(trade_date, root_symbol)] = close_price
+    return result
+
+
 def build_breadth_map(rows):
     result = {}
     for row in rows:
@@ -171,10 +254,15 @@ def build_breadth_map(rows):
 
 async def resolve_index_codes(db_tools):
     code_map = dict(INDEX_CODE_FALLBACKS)
-    db_code_map = await db_tools.get_index_codes_by_names(INDEX_NAME_ORDER)
-    for index_name, index_code in db_code_map.items():
-        if index_code:
-            code_map[index_name] = index_code
+    for market, index_names in [
+        ("cn", INDEX_NAME_ORDER),
+        ("hk", HK_INDEX_NAME_ORDER),
+        ("us", US_INDEX_NAME_ORDER),
+    ]:
+        db_code_map = await db_tools.get_index_codes_by_names_for_market(index_names, market=market)
+        for index_name, index_code in db_code_map.items():
+            if index_code:
+                code_map[index_name] = index_code
     return code_map
 
 
@@ -242,18 +330,77 @@ def build_dashboard_rows(trade_dates, index_code_map, emotion_map, index_close_m
     return rows
 
 
+def build_hk_dashboard_rows(trade_dates, index_code_map, index_close_map, futures_basis_map):
+    rows = []
+    for trade_date in trade_dates:
+        for index_name in HK_INDEX_NAME_ORDER:
+            root_symbol = HK_INDEX_FUTURES_SYMBOLS[index_name]
+            index_close = index_close_map.get((trade_date, index_name))
+            futures_basis = futures_basis_map.get((trade_date, root_symbol), {})
+            main_close = futures_basis.get("main_close")
+            month_close = futures_basis.get("month_close")
+            main_basis = (main_close - index_close) if main_close is not None and index_close is not None else 0
+            month_basis = (month_close - index_close) if month_close is not None and index_close is not None else 0
+            rows.append({
+                "trade_date": trade_date,
+                "index_code": index_code_map.get(index_name) or INDEX_CODE_FALLBACKS[index_name],
+                "index_name": index_name,
+                "emotion_value": 50,
+                "main_basis": main_basis,
+                "month_basis": month_basis,
+                "breadth_up_count": 0,
+                "breadth_total_count": 0,
+                "breadth_up_pct": 0,
+            })
+    return rows
+
+
+def build_us_dashboard_rows(trade_dates, index_code_map, index_close_map, futures_close_map):
+    rows = []
+    for trade_date in trade_dates:
+        for index_name in US_INDEX_NAME_ORDER:
+            root_symbol = US_INDEX_FUTURES_SYMBOLS[index_name]
+            index_close = index_close_map.get((trade_date, index_name))
+            futures_close = futures_close_map.get((trade_date, root_symbol))
+            main_basis = (futures_close - index_close) if futures_close is not None and index_close is not None else 0
+            rows.append({
+                "trade_date": trade_date,
+                "index_code": index_code_map.get(index_name) or INDEX_CODE_FALLBACKS[index_name],
+                "index_name": index_name,
+                "emotion_value": 50,
+                "main_basis": main_basis,
+                "month_basis": 0,
+                "breadth_up_count": 0,
+                "breadth_total_count": 0,
+                "breadth_up_pct": 0,
+            })
+    return rows
+
+
 async def compute_and_upsert_range(db_tools, start_date, end_date):
-    trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(
+    cn_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(
         INDEX_NAME_ORDER,
         start_date=start_date,
         end_date=end_date,
     )
-    if not trade_dates:
+    hk_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(
+        HK_INDEX_NAME_ORDER,
+        market="hk",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    us_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(
+        US_INDEX_NAME_ORDER,
+        market="us",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if not cn_trade_dates and not hk_trade_dates and not us_trade_dates:
         print(f"quant index dashboard: no trade dates found for {start_date} -> {end_date}")
         return 0
 
     index_code_map = await resolve_index_codes(db_tools)
-    index_close_rows = await db_tools.get_quant_index_dashboard_index_closes(
+    cn_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes(
         INDEX_NAME_ORDER,
         start_date,
         end_date,
@@ -271,17 +418,59 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
     breadth_rows = await db_tools.get_quant_index_dashboard_breadth(start_date, end_date)
 
     rows = build_dashboard_rows(
-        trade_dates=trade_dates,
+        trade_dates=cn_trade_dates,
         index_code_map=index_code_map,
         emotion_map=build_emotion_map(emotion_rows),
-        index_close_map=build_index_close_map(index_close_rows),
+        index_close_map=build_index_close_map(cn_index_close_rows),
         futures_close_map=build_futures_close_map(futures_rows),
         breadth_map=build_breadth_map(breadth_rows),
     )
+    if hk_trade_dates:
+        hk_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(
+            HK_INDEX_NAME_ORDER,
+            "hk",
+            start_date,
+            end_date,
+        )
+        hk_futures_rows = await db_tools.get_quant_index_dashboard_hk_index_futures_closes(
+            HK_INDEX_FUTURES_SYMBOLS.values(),
+            start_date,
+            end_date,
+        )
+        rows.extend(
+            build_hk_dashboard_rows(
+                trade_dates=hk_trade_dates,
+                index_code_map=index_code_map,
+                index_close_map=build_index_close_map(hk_index_close_rows),
+                futures_basis_map=build_hk_futures_basis_map(hk_futures_rows),
+            )
+        )
+    if us_trade_dates:
+        us_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(
+            US_INDEX_NAME_ORDER,
+            "us",
+            start_date,
+            end_date,
+        )
+        us_futures_rows = await db_tools.get_quant_index_dashboard_us_index_futures_closes(
+            US_INDEX_FUTURES_SYMBOLS.values(),
+            start_date,
+            end_date,
+        )
+        rows.extend(
+            build_us_dashboard_rows(
+                trade_dates=us_trade_dates,
+                index_code_map=index_code_map,
+                index_close_map=build_index_close_map(us_index_close_rows),
+                futures_close_map=build_us_futures_close_map(us_futures_rows),
+            )
+        )
     affected = await db_tools.upsert_quant_index_dashboard_daily(rows)
     print(
         "quant index dashboard sync finished: "
-        f"start_date={start_date}, end_date={end_date}, trade_dates={len(trade_dates)}, affected={affected}"
+        f"start_date={start_date}, end_date={end_date}, "
+        f"cn_trade_dates={len(cn_trade_dates)}, hk_trade_dates={len(hk_trade_dates)}, "
+        f"us_trade_dates={len(us_trade_dates)}, affected={affected}"
     )
     return affected
 
@@ -328,12 +517,112 @@ async def refresh_trade_dates(db_tools, trade_dates):
     return total_affected
 
 
+async def get_recent_trade_dates_for_market(db_tools, market, trade_day_count=10):
+    if market == "cn":
+        return await db_tools.get_latest_quant_index_trade_dates(INDEX_NAME_ORDER, limit=trade_day_count)
+    if market == "hk":
+        dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(HK_INDEX_NAME_ORDER, market="hk")
+        return dates[-trade_day_count:]
+    if market == "us":
+        dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(US_INDEX_NAME_ORDER, market="us")
+        return dates[-trade_day_count:]
+    return []
+
+
+async def get_previous_trade_date_for_market(db_tools, market, reference_date=None):
+    if reference_date is None:
+        parsed_reference_date = datetime.now().date()
+    elif hasattr(reference_date, "date"):
+        parsed_reference_date = reference_date.date()
+    elif hasattr(reference_date, "strftime"):
+        parsed_reference_date = reference_date
+    else:
+        parsed_reference_date = datetime.strptime(parse_date_arg(reference_date), "%Y-%m-%d").date()
+
+    end_date = (parsed_reference_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    if market == "cn":
+        dates = await db_tools.get_quant_index_dashboard_trade_dates(
+            INDEX_NAME_ORDER,
+            end_date=end_date,
+        )
+    elif market == "hk":
+        dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(
+            HK_INDEX_NAME_ORDER,
+            market="hk",
+            end_date=end_date,
+        )
+    elif market == "us":
+        dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(
+            US_INDEX_NAME_ORDER,
+            market="us",
+            end_date=end_date,
+        )
+    else:
+        dates = []
+    return dates[-1] if dates else None
+
+
+async def repair_market_recent(market, trade_day_count=10):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        recent_trade_dates = await get_recent_trade_dates_for_market(db_tools, market, trade_day_count)
+        if not recent_trade_dates:
+            print(f"quant index dashboard repair market recent finished: market={market}, no trade dates found")
+            return 0
+
+        affected = await refresh_trade_dates(db_tools, recent_trade_dates)
+        print(
+            "quant index dashboard repair market recent finished: "
+            f"market={market}, trade_day_count={trade_day_count}, "
+            f"trade_dates={len(recent_trade_dates)}, "
+            f"start_date={min(recent_trade_dates)}, end_date={max(recent_trade_dates)}, affected={affected}"
+        )
+        return affected
+    finally:
+        await db_tools.close()
+
+
+async def repair_market_previous_trade_day(market, reference_date=None):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        previous_trade_date = await get_previous_trade_date_for_market(db_tools, market, reference_date=reference_date)
+        if not previous_trade_date:
+            print(f"quant index dashboard repair previous trade day finished: market={market}, no trade date found")
+            return 0
+
+        affected = await compute_and_upsert_range(db_tools, previous_trade_date, previous_trade_date)
+        print(
+            "quant index dashboard repair previous trade day finished: "
+            f"market={market}, trade_date={previous_trade_date}, affected={affected}"
+        )
+        return affected
+    finally:
+        await db_tools.close()
+
+
+async def resolve_market_previous_trade_date(market, reference_date=None):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        return await get_previous_trade_date_for_market(db_tools, market, reference_date=reference_date)
+    finally:
+        await db_tools.close()
+
+
 async def backfill_history(start_date=None, end_date=None):
     db_tools = DbTools()
     await db_tools.init_pool()
     try:
         if start_date is None or end_date is None:
-            trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(INDEX_NAME_ORDER)
+            trade_dates = sorted(
+                set(
+                    await db_tools.get_quant_index_dashboard_trade_dates(INDEX_NAME_ORDER)
+                    + await db_tools.get_quant_index_dashboard_trade_dates_for_market(HK_INDEX_NAME_ORDER, market="hk")
+                    + await db_tools.get_quant_index_dashboard_trade_dates_for_market(US_INDEX_NAME_ORDER, market="us")
+                )
+            )
             if not trade_dates:
                 print("quant index dashboard backfill finished: no index trade dates found")
                 return 0
@@ -351,11 +640,20 @@ async def sync_daily(target_date=None):
     db_tools = DbTools()
     await db_tools.init_pool()
     try:
-        actual_date = target_date or await db_tools.get_latest_quant_index_trade_date(INDEX_NAME_ORDER)
-        if not actual_date:
+        if target_date:
+            return await compute_and_upsert_range(db_tools, target_date, target_date)
+
+        recent_trade_dates = sorted(
+            set(
+                await get_recent_trade_dates_for_market(db_tools, "cn", 10)
+                + await get_recent_trade_dates_for_market(db_tools, "hk", 10)
+                + await get_recent_trade_dates_for_market(db_tools, "us", 10)
+            )
+        )
+        if not recent_trade_dates:
             print("quant index dashboard daily finished: no latest trade date found")
             return 0
-        return await compute_and_upsert_range(db_tools, actual_date, actual_date)
+        return await refresh_trade_dates(db_tools, recent_trade_dates)
     finally:
         await db_tools.close()
 
@@ -364,9 +662,12 @@ async def repair_recent(trade_day_count=10):
     db_tools = DbTools()
     await db_tools.init_pool()
     try:
-        recent_trade_dates = await db_tools.get_latest_quant_index_trade_dates(
-            INDEX_NAME_ORDER,
-            limit=trade_day_count,
+        recent_trade_dates = sorted(
+            set(
+                await get_recent_trade_dates_for_market(db_tools, "cn", trade_day_count)
+                + await get_recent_trade_dates_for_market(db_tools, "hk", trade_day_count)
+                + await get_recent_trade_dates_for_market(db_tools, "us", trade_day_count)
+            )
         )
         if not recent_trade_dates:
             print("quant index dashboard repair recent finished: no trade dates found")
@@ -390,7 +691,13 @@ async def refresh_breadth_data(start_date=None, end_date=None):
     await db_tools.init_pool()
     try:
         if start_date is None or end_date is None:
-            trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(INDEX_NAME_ORDER)
+            trade_dates = sorted(
+                set(
+                    await db_tools.get_quant_index_dashboard_trade_dates(INDEX_NAME_ORDER)
+                    + await db_tools.get_quant_index_dashboard_trade_dates_for_market(HK_INDEX_NAME_ORDER, market="hk")
+                    + await db_tools.get_quant_index_dashboard_trade_dates_for_market(US_INDEX_NAME_ORDER, market="us")
+                )
+            )
             if not trade_dates:
                 print("quant index breadth refresh finished: no index trade dates found")
                 return 0
@@ -432,11 +739,22 @@ async def main():
         trade_day_count = parse_trade_day_count_arg(args[0]) if args else 10
         await repair_recent(trade_day_count=trade_day_count)
         return
+    if command == "repair-market-recent":
+        market = str(args[0]).strip().lower() if args else "cn"
+        trade_day_count = parse_trade_day_count_arg(args[1], 10) if len(args) > 1 else 10
+        await repair_market_recent(market, trade_day_count=trade_day_count)
+        return
+    if command == "repair-market-previous":
+        market = str(args[0]).strip().lower() if args else "cn"
+        reference_date = parse_date_arg(args[1]) if len(args) > 1 else None
+        await repair_market_previous_trade_day(market, reference_date=reference_date)
+        return
 
     raise ValueError(
         "quant-index supports: backfill [start_date] [end_date] | "
         "daily [trade_date] | refresh-breadth [start_date] [end_date] | "
-        "repair-recent [trade_day_count]"
+        "repair-recent [trade_day_count] | repair-market-recent [cn|hk|us] [trade_day_count] | "
+        "repair-market-previous [cn|hk|us] [reference_date]"
     )
 
 

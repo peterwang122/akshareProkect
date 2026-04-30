@@ -195,3 +195,43 @@ CREATE TABLE IF NOT EXISTS index_us_hedge_fund_ls_proxy (
   KEY idx_index_us_hedge_fund_ls_proxy_report_date (report_date),
   KEY idx_index_us_hedge_fund_ls_proxy_contract_scope (contract_scope)
 ) COMMENT='US hedge fund long short proxy data from OFR TFF';
+
+CREATE TABLE IF NOT EXISTS index_us_put_call_ratio_daily (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  total_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'Total put call ratio',
+  index_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'Index options put call ratio',
+  equity_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'Equity options put call ratio',
+  etf_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'ETF options put call ratio',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'cboe_market_statistics' COMMENT 'Data source',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_index_us_put_call_ratio_trade_date (trade_date),
+  KEY idx_index_us_put_call_ratio_trade_date (trade_date)
+) COMMENT='Daily US options put call ratio from Cboe';
+
+CREATE TABLE IF NOT EXISTS index_us_treasury_yield_daily (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  yield_3m DECIMAL(10, 4) NULL COMMENT 'US Treasury 3 month yield',
+  yield_2y DECIMAL(10, 4) NULL COMMENT 'US Treasury 2 year yield',
+  yield_10y DECIMAL(10, 4) NULL COMMENT 'US Treasury 10 year yield',
+  spread_10y_2y DECIMAL(10, 4) NULL COMMENT '10Y minus 2Y spread',
+  spread_10y_3m DECIMAL(10, 4) NULL COMMENT '10Y minus 3M spread',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_index_us_treasury_yield_trade_date (trade_date),
+  KEY idx_index_us_treasury_yield_trade_date (trade_date)
+) COMMENT='Daily US Treasury yield and spread data from FRED';
+
+CREATE TABLE IF NOT EXISTS index_us_credit_spread_daily (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  high_yield_oas DECIMAL(10, 4) NULL COMMENT 'US high yield option-adjusted spread',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_index_us_credit_spread_trade_date (trade_date),
+  KEY idx_index_us_credit_spread_trade_date (trade_date)
+) COMMENT='Daily US high yield credit spread data from FRED';

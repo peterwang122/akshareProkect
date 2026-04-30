@@ -169,7 +169,8 @@
   - `turnover_rate`
   - `data_source`
 - 说明：
-  - 当前量化看板 `quant_index_dashboard_daily` 只读取这张 A 股指数表
+  - A 股指数行情仍由这张表提供
+  - 量化看板 `quant_index_dashboard_daily` 同时会读取 A 股、港股、美股指数行情，用于预计算各市场可用的期现差等指标
 
 ### `index_us_basic_info`
 - 用途：美股指数基础信息。
@@ -321,12 +322,19 @@
 
 ### `quant_index_dashboard_daily`
 - 用途：给 FIT 指数量化页直接读取的预计算表。
-- 每个交易日固定 5 行：
+- A 股每个交易日固定 5 行：
   - 上证指数
   - 上证50
   - 沪深300
   - 中证500
   - 中证1000
+- 港股在有行情和期货映射时写入：
+  - 恒生指数
+  - 恒生中国企业指数
+  - 恒生科技指数
+- 美股在有行情和期货映射时写入：
+  - 标普500指数
+  - 纳斯达克100指数
 - 核心字段：
   - `trade_date`
   - `index_code`
@@ -338,12 +346,16 @@
   - `breadth_total_count`
   - `breadth_up_pct`
 - 口径说明：
-  - 情绪值来自 `excel_index_emotion_daily`
-  - 期现差来自 `futures_daily_data` 与 `index_daily_data`
-  - 涨跌家数来自 `stock_daily_data`
+  - A 股情绪值来自 `excel_index_emotion_daily`
+  - A 股期现差来自 `futures_daily_data` 与 `index_daily_data`
+  - A 股涨跌家数来自 `stock_daily_data`
   - 上证指数的情绪值和期现差按四大核心指数同日平均计算
   - 5 个指数在同一天共用同一份涨跌家数数据
+  - 港股期现差来自 `futures_hk_index_daily_data` 与 `index_hk_daily_data`，`main_basis` 为主连期现差，`month_basis` 为月连期现差
+  - 美股期现差来自 `futures_us_index_daily_data` 与 `index_us_daily_data`，`main_basis` 为连续期现差，`month_basis` 固定写 0
   - 若股票数据补录或修正后需要整体重算，可执行 `python run.py quant-index refresh-breadth [start_date] [end_date]`
+  - 若只需刷新某个市场最近看板，可执行 `python run.py quant-index repair-market-recent [cn|hk|us] [trade_day_count]`
+  - 若港/美股指期货日更后只需刷新上一市场交易日，可执行 `python run.py quant-index repair-market-previous [hk|us] [reference_date]`
 
 ## CFFEX 会员排名
 ### `cffex_member_rankings`
@@ -461,6 +473,23 @@
 - `closing_range_raw`：新浪口径不使用，保持 `NULL`。
 - `data_source`：`sina_global_futures`。
 
+### `futures_us_index_official_contract_info`
+- 用途：CME 官方美股股指期货逐合约注册表。
+- 覆盖品种：`ES`、`NQ`。
+- 数据源：CME 官方 settlements。
+- `source_contract_code`：具体月份合约，例如 `ESM26`、`NQU26`。
+- `contract_month`：具体合约月份，格式 `YYYY-MM`。
+- 唯一键：`source_contract_code`。
+
+### `futures_us_index_official_daily_data`
+- 用途：CME 官方美股股指期货逐合约日线/结算数据。
+- 唯一键：`source_contract_code + trade_date`。
+- 核心字段：`open_price`、`high_price`、`low_price`、`last_price`、`close_price`、`settle_price`、`price_change`、`volume`、`open_interest`。
+- `close_price` 口径：优先使用 CME settlement，缺失时使用 last price。
+- `raw_payload_json`：保留 CME 原始行，便于后续排查官方字段变化。
+- `data_source`：`cme_settlements`。
+- 说明：该表与新浪连续表并存，第一版不参与 FIT 美股期现差计算。
+
 ### `futures_hk_index_contract_info`
 - 用途：港股股指期货具体月份合约注册表。
 - 覆盖品种：`HSI`、`HHI`、`HTI`。
@@ -473,7 +502,7 @@
 - `close_price` 口径：使用 HKEX 报告中的 `Settlement Price`。
 - `data_source`：`hkex_daily_market_report`。
 - 回补说明：`backfill-hk-index` 会先按港股交易日生成待采集日期，并在执行中输出进度、耗时、ETA 和累计写入行数。
-- 日更调度：FIT 任务中心使用 `us_index_futures_daily` 和 `hk_index_futures_daily` 两个独立采集项，分别调用 `POST /collect-us-index-futures-daily`、`POST /collect-hk-index-futures-daily`。
+- 日更调度：FIT 任务中心使用 `us_index_futures_daily`、`us_index_futures_official_daily` 和 `hk_index_futures_daily` 独立采集项，分别调用 `POST /collect-us-index-futures-daily`、`POST /collect-us-index-futures-official-daily`、`POST /collect-hk-index-futures-daily`。
 
 ## 中金所期权
 ### `option_cffex_rtj_daily_data`
@@ -580,3 +609,9 @@
   - `python run.py quant-index refresh-breadth [start_date] [end_date]`
 - `excel_index_emotion_daily` now uses upsert semantics on `emotion_date + index_name`
 - after `python run.py emotion-excel import [xlsx_path]`, the project automatically refreshes `quant_index_dashboard_daily` only for the affected trade dates
+
+## US Auxiliary Indicator Tables
+
+- `index_us_put_call_ratio_daily`：美股 Put/Call Ratio，唯一键 `trade_date`，字段包含 `total_put_call_ratio`、`index_put_call_ratio`、`equity_put_call_ratio`、`etf_put_call_ratio`
+- `index_us_treasury_yield_daily`：美债收益率/利差，唯一键 `trade_date`，字段包含 `yield_3m`、`yield_2y`、`yield_10y`、`spread_10y_2y`、`spread_10y_3m`
+- `index_us_credit_spread_daily`：美股高收益债利差，唯一键 `trade_date`，字段包含 `high_yield_oas`

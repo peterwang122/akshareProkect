@@ -29,6 +29,7 @@ class DbTools:
         'amplitude': 99999999999999.99,
         'price_change_rate': 99999999999999.99,
         'price_change_amount': 999999.99,
+        'price_change': 999999.99,
         'turnover_rate': 99999999999999.99,
         'pre_close_price': 999999.99,
         'iopv_realtime': 999999.99,
@@ -70,7 +71,11 @@ class DbTools:
     }
     INDEX_BASIC_TABLES = {'index_basic_info', 'index_us_basic_info', 'index_hk_basic_info', 'index_qvix_basic_info'}
     INDEX_DAILY_TABLES = {'index_daily_data', 'index_us_daily_data', 'index_hk_daily_data', 'index_qvix_daily_data'}
-    INDEX_FUTURES_CONTRACT_TABLES = {'futures_us_index_contract_info', 'futures_hk_index_contract_info'}
+    INDEX_FUTURES_CONTRACT_TABLES = {
+        'futures_us_index_contract_info',
+        'futures_us_index_official_contract_info',
+        'futures_hk_index_contract_info',
+    }
     INDEX_FUTURES_DAILY_TABLES = {'futures_us_index_daily_data', 'futures_hk_index_daily_data'}
 
     def __init__(self):
@@ -281,6 +286,49 @@ class DbTools:
         sanitized['data_source'] = str(row.get('data_source', 'ofr_tff')).strip() or 'ofr_tff'
         return sanitized
 
+    def _sanitize_index_us_put_call_ratio_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['total_put_call_ratio'] = self._normalize_numeric(
+            'total_put_call_ratio',
+            row.get('total_put_call_ratio'),
+        )
+        sanitized['index_put_call_ratio'] = self._normalize_numeric(
+            'index_put_call_ratio',
+            row.get('index_put_call_ratio'),
+        )
+        sanitized['equity_put_call_ratio'] = self._normalize_numeric(
+            'equity_put_call_ratio',
+            row.get('equity_put_call_ratio'),
+        )
+        sanitized['etf_put_call_ratio'] = self._normalize_numeric(
+            'etf_put_call_ratio',
+            row.get('etf_put_call_ratio'),
+        )
+        sanitized['data_source'] = str(row.get('data_source', 'cboe_market_statistics')).strip() or 'cboe_market_statistics'
+        return sanitized
+
+    def _sanitize_index_us_treasury_yield_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['yield_3m'] = self._normalize_numeric('yield_3m', row.get('yield_3m'))
+        sanitized['yield_2y'] = self._normalize_numeric('yield_2y', row.get('yield_2y'))
+        sanitized['yield_10y'] = self._normalize_numeric('yield_10y', row.get('yield_10y'))
+        sanitized['spread_10y_2y'] = self._normalize_numeric('spread_10y_2y', row.get('spread_10y_2y'))
+        sanitized['spread_10y_3m'] = self._normalize_numeric('spread_10y_3m', row.get('spread_10y_3m'))
+        sanitized['data_source'] = str(row.get('data_source', 'fred_public_csv')).strip() or 'fred_public_csv'
+        return sanitized
+
+    def _sanitize_index_us_credit_spread_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['high_yield_oas'] = self._normalize_numeric('high_yield_oas', row.get('high_yield_oas'))
+        sanitized['data_source'] = str(row.get('data_source', 'fred_public_csv')).strip() or 'fred_public_csv'
+        return sanitized
+
     def _validate_table_name(self, table_name, allowed_tables):
         normalized_table_name = str(table_name or '').strip()
         if normalized_table_name not in allowed_tables:
@@ -435,6 +483,13 @@ class DbTools:
             sanitized[field] = self._normalize_numeric(field, row.get(field))
         sanitized['closing_range_raw'] = str(row.get('closing_range_raw', '')).strip() or None
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or None
+        return sanitized
+
+    def _sanitize_us_index_official_futures_daily_row(self, row):
+        sanitized = self._sanitize_index_futures_daily_row(row)
+        sanitized['last_price'] = self._normalize_numeric('close_price', row.get('last_price'))
+        sanitized['price_change'] = self._normalize_numeric('price_change', row.get('price_change'))
+        sanitized['raw_payload_json'] = self._serialize_json_field(row.get('raw_payload_json'))
         return sanitized
 
     def _sanitize_quant_index_dashboard_row(self, row):
@@ -2768,6 +2823,212 @@ class DbTools:
                     if contract_scope and report_date
                 }
 
+    async def ensure_index_us_macro_auxiliary_tables(self):
+        if self.pool is None:
+            await self.init_pool()
+
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS index_us_put_call_ratio_daily (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              trade_date DATE NOT NULL COMMENT 'Trading date',
+              total_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'Total put call ratio',
+              index_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'Index options put call ratio',
+              equity_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'Equity options put call ratio',
+              etf_put_call_ratio DECIMAL(10, 4) NULL COMMENT 'ETF options put call ratio',
+              data_source VARCHAR(64) NOT NULL DEFAULT 'cboe_market_statistics' COMMENT 'Data source',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_index_us_put_call_ratio_trade_date (trade_date),
+              KEY idx_index_us_put_call_ratio_trade_date (trade_date)
+            ) COMMENT='Daily US options put call ratio from Cboe'
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS index_us_treasury_yield_daily (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              trade_date DATE NOT NULL COMMENT 'Trading date',
+              yield_3m DECIMAL(10, 4) NULL COMMENT 'US Treasury 3 month yield',
+              yield_2y DECIMAL(10, 4) NULL COMMENT 'US Treasury 2 year yield',
+              yield_10y DECIMAL(10, 4) NULL COMMENT 'US Treasury 10 year yield',
+              spread_10y_2y DECIMAL(10, 4) NULL COMMENT '10Y minus 2Y spread',
+              spread_10y_3m DECIMAL(10, 4) NULL COMMENT '10Y minus 3M spread',
+              data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_index_us_treasury_yield_trade_date (trade_date),
+              KEY idx_index_us_treasury_yield_trade_date (trade_date)
+            ) COMMENT='Daily US Treasury yield and spread data from FRED'
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS index_us_credit_spread_daily (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              trade_date DATE NOT NULL COMMENT 'Trading date',
+              high_yield_oas DECIMAL(10, 4) NULL COMMENT 'US high yield option-adjusted spread',
+              data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_index_us_credit_spread_trade_date (trade_date),
+              KEY idx_index_us_credit_spread_trade_date (trade_date)
+            ) COMMENT='Daily US high yield credit spread data from FRED'
+            """,
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for statement in statements:
+                    await cursor.execute(statement)
+                await conn.commit()
+
+    async def upsert_index_us_put_call_ratio_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+
+        sanitized_rows = [self._sanitize_index_us_put_call_ratio_row(row) for row in rows]
+        sanitized_rows = [row for row in sanitized_rows if row['trade_date']]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[row['trade_date']] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_us_put_call_ratio_daily (
+                    trade_date,
+                    total_put_call_ratio,
+                    index_put_call_ratio,
+                    equity_put_call_ratio,
+                    etf_put_call_ratio,
+                    data_source
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    total_put_call_ratio = VALUES(total_put_call_ratio),
+                    index_put_call_ratio = VALUES(index_put_call_ratio),
+                    equity_put_call_ratio = VALUES(equity_put_call_ratio),
+                    etf_put_call_ratio = VALUES(etf_put_call_ratio),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['trade_date'],
+                        row['total_put_call_ratio'],
+                        row['index_put_call_ratio'],
+                        row['equity_put_call_ratio'],
+                        row['etf_put_call_ratio'],
+                        row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def upsert_index_us_treasury_yield_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+
+        sanitized_rows = [self._sanitize_index_us_treasury_yield_row(row) for row in rows]
+        sanitized_rows = [row for row in sanitized_rows if row['trade_date']]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[row['trade_date']] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_us_treasury_yield_daily (
+                    trade_date,
+                    yield_3m,
+                    yield_2y,
+                    yield_10y,
+                    spread_10y_2y,
+                    spread_10y_3m,
+                    data_source
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    yield_3m = VALUES(yield_3m),
+                    yield_2y = VALUES(yield_2y),
+                    yield_10y = VALUES(yield_10y),
+                    spread_10y_2y = VALUES(spread_10y_2y),
+                    spread_10y_3m = VALUES(spread_10y_3m),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['trade_date'],
+                        row['yield_3m'],
+                        row['yield_2y'],
+                        row['yield_10y'],
+                        row['spread_10y_2y'],
+                        row['spread_10y_3m'],
+                        row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def upsert_index_us_credit_spread_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+
+        sanitized_rows = [self._sanitize_index_us_credit_spread_row(row) for row in rows]
+        sanitized_rows = [row for row in sanitized_rows if row['trade_date']]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {}
+        for row in sanitized_rows:
+            deduped_rows[row['trade_date']] = row
+        sanitized_rows = list(deduped_rows.values())
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query_upsert = """
+                INSERT INTO index_us_credit_spread_daily (
+                    trade_date,
+                    high_yield_oas,
+                    data_source
+                ) VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    high_yield_oas = VALUES(high_yield_oas),
+                    data_source = VALUES(data_source),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                values = [
+                    (
+                        row['trade_date'],
+                        row['high_yield_oas'],
+                        row['data_source'],
+                    )
+                    for row in sanitized_rows
+                ]
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
     async def get_index_codes_by_names(self, index_names):
         if self.pool is None:
             await self.init_pool()
@@ -2784,6 +3045,47 @@ class DbTools:
         query = (
             f"SELECT index_name, index_code "
             f"FROM index_basic_info "
+            f"WHERE index_name IN ({placeholders}) "
+            f"ORDER BY id ASC"
+        )
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, normalized_names)
+                rows = await cursor.fetchall()
+
+        code_by_name = {}
+        for index_name, index_code in rows:
+            normalized_name = str(index_name or '').strip()
+            normalized_code = str(index_code or '').strip()
+            if normalized_name and normalized_code and normalized_name not in code_by_name:
+                code_by_name[normalized_name] = normalized_code
+        return code_by_name
+
+    async def get_index_codes_by_names_for_market(self, index_names, market='cn'):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return {}
+
+        normalized_market = str(market or 'cn').strip().lower()
+        table_by_market = {
+            'cn': 'index_basic_info',
+            'hk': 'index_hk_basic_info',
+            'us': 'index_us_basic_info',
+        }
+        table_name = table_by_market.get(normalized_market, 'index_basic_info')
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT index_name, index_code "
+            f"FROM {table_name} "
             f"WHERE index_name IN ({placeholders}) "
             f"ORDER BY id ASC"
         )
@@ -2929,6 +3231,86 @@ class DbTools:
                 await cursor.execute(query, params)
                 return list(await cursor.fetchall())
 
+    async def get_quant_index_dashboard_trade_dates_for_market(self, index_names, market='cn', start_date=None, end_date=None):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return []
+
+        normalized_market = str(market or 'cn').strip().lower()
+        table_by_market = {
+            'cn': ('index_daily_data', 'index_basic_info'),
+            'hk': ('index_hk_daily_data', 'index_hk_basic_info'),
+            'us': ('index_us_daily_data', 'index_us_basic_info'),
+        }
+        daily_table, basic_table = table_by_market.get(normalized_market, table_by_market['cn'])
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT DISTINCT d.trade_date "
+            f"FROM {daily_table} d "
+            f"INNER JOIN {basic_table} b ON b.index_code = d.index_code "
+            f"WHERE b.index_name IN ({placeholders})"
+        )
+        params = [*normalized_names]
+        if start_date:
+            query += " AND d.trade_date >= %s"
+            params.append(str(start_date))
+        if end_date:
+            query += " AND d.trade_date <= %s"
+            params.append(str(end_date))
+        query += " ORDER BY d.trade_date ASC"
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, params)
+                rows = await cursor.fetchall()
+
+        return [str(row[0]).split(' ')[0] for row in rows if row and row[0] is not None]
+
+    async def get_quant_index_dashboard_index_closes_for_market(self, index_names, market, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_names = [
+            str(index_name).strip()
+            for index_name in (index_names or [])
+            if str(index_name).strip()
+        ]
+        if not normalized_names:
+            return []
+
+        normalized_market = str(market or 'cn').strip().lower()
+        table_by_market = {
+            'cn': ('index_daily_data', 'index_basic_info'),
+            'hk': ('index_hk_daily_data', 'index_hk_basic_info'),
+            'us': ('index_us_daily_data', 'index_us_basic_info'),
+        }
+        daily_table, basic_table = table_by_market.get(normalized_market, table_by_market['cn'])
+
+        placeholders = ','.join(['%s'] * len(normalized_names))
+        query = (
+            f"SELECT b.index_name, d.trade_date, d.close_price "
+            f"FROM {daily_table} d "
+            f"INNER JOIN {basic_table} b ON b.index_code = d.index_code "
+            f"WHERE b.index_name IN ({placeholders}) "
+            f"AND d.trade_date BETWEEN %s AND %s "
+            f"AND d.close_price IS NOT NULL "
+            f"ORDER BY d.trade_date ASC, b.index_name ASC"
+        )
+        params = [*normalized_names, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
     async def get_quant_index_dashboard_emotions(self, index_names, start_date, end_date):
         if self.pool is None:
             await self.init_pool()
@@ -2978,6 +3360,63 @@ class DbTools:
             f"AND data_source IN ('get_futures_daily_derived', 'futures_hist_em') "
             f"AND close_price IS NOT NULL "
             f"ORDER BY trade_date ASC, symbol ASC"
+        )
+        params = [*normalized_symbols, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_us_index_futures_closes(self, root_symbols, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_symbols = [
+            str(symbol).strip().upper()
+            for symbol in (root_symbols or [])
+            if str(symbol).strip()
+        ]
+        if not normalized_symbols:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_symbols))
+        query = (
+            f"SELECT trade_date, root_symbol, source_contract_code, close_price "
+            f"FROM futures_us_index_daily_data "
+            f"WHERE root_symbol IN ({placeholders}) "
+            f"AND trade_date BETWEEN %s AND %s "
+            f"AND close_price IS NOT NULL "
+            f"ORDER BY trade_date ASC, root_symbol ASC"
+        )
+        params = [*normalized_symbols, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_hk_index_futures_closes(self, root_symbols, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_symbols = [
+            str(symbol).strip().upper()
+            for symbol in (root_symbols or [])
+            if str(symbol).strip()
+        ]
+        if not normalized_symbols:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_symbols))
+        query = (
+            f"SELECT trade_date, root_symbol, source_contract_code, contract_month, "
+            f"close_price, volume, open_interest "
+            f"FROM futures_hk_index_daily_data "
+            f"WHERE root_symbol IN ({placeholders}) "
+            f"AND trade_date BETWEEN %s AND %s "
+            f"AND close_price IS NOT NULL "
+            f"ORDER BY trade_date ASC, root_symbol ASC, contract_month ASC"
         )
         params = [*normalized_symbols, str(start_date), str(end_date)]
 
@@ -3311,6 +3750,120 @@ class DbTools:
                 data_source = VALUES(data_source),
                 updated_at = CURRENT_TIMESTAMP
             """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def ensure_us_index_official_futures_tables(self):
+        if self.pool is None:
+            await self.init_pool()
+
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS futures_us_index_official_contract_info (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. ES or NQ',
+              source_contract_code VARCHAR(32) NOT NULL COMMENT 'Official contract code, e.g. ESM26',
+              contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+              contract_month VARCHAR(16) NULL COMMENT 'Contract month in YYYY-MM',
+              exchange VARCHAR(32) NULL COMMENT 'Exchange, e.g. CME',
+              data_source VARCHAR(64) NOT NULL DEFAULT 'cme_settlements',
+              first_seen_trade_date DATE NULL,
+              last_seen_trade_date DATE NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_us_index_official_contract_code (source_contract_code),
+              KEY idx_us_index_official_root_month (root_symbol, contract_month),
+              KEY idx_us_index_official_seen_date (last_seen_trade_date)
+            ) COMMENT='Official CME US stock index futures contract registry'
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS futures_us_index_official_daily_data (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              source_contract_code VARCHAR(32) NOT NULL COMMENT 'Official contract code, e.g. ESM26',
+              root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. ES or NQ',
+              contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+              contract_month VARCHAR(16) NULL COMMENT 'Contract month in YYYY-MM',
+              trade_date DATE NOT NULL COMMENT 'Trading date',
+              open_price DECIMAL(18, 6) NULL COMMENT 'Open price',
+              high_price DECIMAL(18, 6) NULL COMMENT 'High price',
+              low_price DECIMAL(18, 6) NULL COMMENT 'Low price',
+              last_price DECIMAL(18, 6) NULL COMMENT 'Last price from CME settlements payload',
+              close_price DECIMAL(18, 6) NULL COMMENT 'Close price, using settlement when available',
+              settle_price DECIMAL(18, 6) NULL COMMENT 'Settlement price',
+              price_change DECIMAL(18, 6) NULL COMMENT 'Daily settlement change',
+              volume DECIMAL(20, 2) NULL COMMENT 'Volume',
+              open_interest DECIMAL(20, 2) NULL COMMENT 'Open interest',
+              data_source VARCHAR(64) NOT NULL DEFAULT 'cme_settlements',
+              raw_payload_json JSON NULL COMMENT 'Original CME row payload',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_us_index_official_contract_trade_date (source_contract_code, trade_date),
+              KEY idx_us_index_official_root_trade_date (root_symbol, trade_date),
+              KEY idx_us_index_official_trade_date (trade_date)
+            ) COMMENT='Official CME US stock index futures contract-level daily settlement data'
+            """,
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for statement in statements:
+                    await cursor.execute(statement)
+                await conn.commit()
+
+    async def batch_us_index_official_futures_daily_data(self, rows):
+        if not rows:
+            return 0
+        if self.pool is None:
+            await self.init_pool()
+
+        await self.ensure_us_index_official_futures_tables()
+        sanitized_rows = [self._sanitize_us_index_official_futures_daily_row(row) for row in rows]
+        deduped_rows = {}
+        for row in sanitized_rows:
+            if not (row['source_contract_code'] and row['trade_date'] and row['root_symbol']):
+                continue
+            deduped_rows[(row['source_contract_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped_rows.values())
+        if not sanitized_rows:
+            return 0
+
+        values = [
+            (
+                row['source_contract_code'], row['root_symbol'], row['contract_name'],
+                row['contract_month'], row['trade_date'], row['open_price'],
+                row['high_price'], row['low_price'], row['last_price'], row['close_price'],
+                row['settle_price'], row['price_change'], row['volume'], row['open_interest'],
+                row['data_source'], row['raw_payload_json'],
+            )
+            for row in sanitized_rows
+        ]
+        query = """
+        INSERT INTO futures_us_index_official_daily_data (
+            source_contract_code, root_symbol, contract_name, contract_month, trade_date,
+            open_price, high_price, low_price, last_price, close_price, settle_price,
+            price_change, volume, open_interest, data_source, raw_payload_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            root_symbol = VALUES(root_symbol),
+            contract_name = VALUES(contract_name),
+            contract_month = VALUES(contract_month),
+            open_price = VALUES(open_price),
+            high_price = VALUES(high_price),
+            low_price = VALUES(low_price),
+            last_price = VALUES(last_price),
+            close_price = VALUES(close_price),
+            settle_price = VALUES(settle_price),
+            price_change = VALUES(price_change),
+            volume = VALUES(volume),
+            open_interest = VALUES(open_interest),
+            data_source = VALUES(data_source),
+            raw_payload_json = VALUES(raw_payload_json),
+            updated_at = CURRENT_TIMESTAMP
+        """
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:

@@ -62,6 +62,48 @@ CREATE TABLE IF NOT EXISTS futures_us_index_daily_data (
   KEY idx_us_index_trade_date (trade_date)
 ) COMMENT='US stock index futures continuous daily data from Sina global futures';
 
+CREATE TABLE IF NOT EXISTS futures_us_index_official_contract_info (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. ES or NQ',
+  source_contract_code VARCHAR(32) NOT NULL COMMENT 'Official contract code, e.g. ESM26',
+  contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+  contract_month VARCHAR(16) NULL COMMENT 'Contract month in YYYY-MM',
+  exchange VARCHAR(32) NULL COMMENT 'Exchange, e.g. CME',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'cme_settlements',
+  first_seen_trade_date DATE NULL,
+  last_seen_trade_date DATE NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_us_index_official_contract_code (source_contract_code),
+  KEY idx_us_index_official_root_month (root_symbol, contract_month),
+  KEY idx_us_index_official_seen_date (last_seen_trade_date)
+) COMMENT='Official CME US stock index futures contract registry';
+
+CREATE TABLE IF NOT EXISTS futures_us_index_official_daily_data (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  source_contract_code VARCHAR(32) NOT NULL COMMENT 'Official contract code, e.g. ESM26',
+  root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. ES or NQ',
+  contract_name VARCHAR(128) NULL COMMENT 'Contract display name',
+  contract_month VARCHAR(16) NULL COMMENT 'Contract month in YYYY-MM',
+  trade_date DATE NOT NULL COMMENT 'Trading date',
+  open_price DECIMAL(18, 6) NULL COMMENT 'Open price',
+  high_price DECIMAL(18, 6) NULL COMMENT 'High price',
+  low_price DECIMAL(18, 6) NULL COMMENT 'Low price',
+  last_price DECIMAL(18, 6) NULL COMMENT 'Last price from CME settlements payload',
+  close_price DECIMAL(18, 6) NULL COMMENT 'Close price, using settlement when available',
+  settle_price DECIMAL(18, 6) NULL COMMENT 'Settlement price',
+  price_change DECIMAL(18, 6) NULL COMMENT 'Daily settlement change',
+  volume DECIMAL(20, 2) NULL COMMENT 'Volume',
+  open_interest DECIMAL(20, 2) NULL COMMENT 'Open interest',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'cme_settlements',
+  raw_payload_json JSON NULL COMMENT 'Original CME row payload',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_us_index_official_contract_trade_date (source_contract_code, trade_date),
+  KEY idx_us_index_official_root_trade_date (root_symbol, trade_date),
+  KEY idx_us_index_official_trade_date (trade_date)
+) COMMENT='Official CME US stock index futures contract-level daily settlement data';
+
 CREATE TABLE IF NOT EXISTS futures_hk_index_contract_info (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   root_symbol VARCHAR(16) NOT NULL COMMENT 'Root symbol, e.g. HSI, HHI, HTI',

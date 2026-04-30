@@ -765,8 +765,10 @@ python run.py futures trade-date 2026-04-10
 python run.py futures market-daily 2026-04-10
 python run.py futures hist-daily 2026-04-10 IFM IFM0
 python run.py futures daily-us-index
+python run.py futures daily-us-index-official
 python run.py futures daily-hk-index
 python run.py futures backfill-us-index 2026-04-01 2026-04-20
+python run.py futures backfill-us-index-official 2026-04-01 2026-04-20
 python run.py futures backfill-hk-index 2026-04-01 2026-04-20
 ```
 
@@ -775,10 +777,11 @@ python run.py futures backfill-hk-index 2026-04-01 2026-04-20
 - 美股股指期货单独维护 `ES`、`NQ` 的连续/品种级日线，数据源为新浪外盘期货，不走 AK / 东方财富 / 原官方接口。
 - 美股 `source_contract_code` 写入 `ES` / `NQ`，`contract_month` 固定写入 `CONTINUOUS`，不再表示具体月份合约。
 - 美股 `open_price`、`high_price`、`low_price`、`close_price` 使用新浪日 K；新浪返回为 `0` 的 `volume`、`open_interest`、`settle_price`、`pre_settle_price` 按 `NULL` 写入。
+- `daily-us-index-official` / `backfill-us-index-official` 额外维护 CME 官方 `ES` / `NQ` 逐合约结算数据，写入 `futures_us_index_official_*`，不替代现有新浪连续表。
 - 港股股指期货单独维护 `HSI`、`HHI`、`HTI` 的具体月份合约，数据源为 HKEX 官方 Daily Market Report。
 - 港股股指期货历史回补会先生成港股交易日列表，再按交易日请求 HKEX archive；进度会输出当前请求数、百分比、耗时、ETA、累计写入行数。
 - 外盘股指期货写入 `futures_us_index_*` 和 `futures_hk_index_*`，不会混入 `futures_daily_data`。
-- 日更可通过统一日常采集服务调用：`POST /collect-us-index-futures-daily`、`POST /collect-hk-index-futures-daily`。
+- 日更可通过统一日常采集服务调用：`POST /collect-us-index-futures-daily`、`POST /collect-us-index-futures-official-daily`、`POST /collect-hk-index-futures-daily`。
 - FIT 任务中心对应两个独立采集项：`us_index_futures_daily`（美股交易日）和 `hk_index_futures_daily`（港股交易日）。
 - 如果库里已经存在旧版 `futures_us_index_*` 表，先执行 `sql/fix_us_index_futures_sina_source.sql`，把 `contract_month` 放宽到可写入 `CONTINUOUS`。
 
@@ -979,19 +982,21 @@ python run.py runner retry-failures etf_daily 50
   - `python ak_scheduler_service.py health`
   - `python ak_scheduler_service.py doctor`
 
-## 缁熶竴鏃ュ父閲囬泦鏈嶅姟
+## 统一日常采集服务
 
-褰撳墠 `python stock_temp_service.py serve` 宸茬粡鍙互缁熶竴鎺ユ敹鏃ュ父閲囬泦 HTTP 璇锋眰銆?
+当前 `python stock_temp_service.py serve` 已经可以统一接收日常采集 HTTP 请求。
 
-涓昏 daily endpoint 鍖呮嫭锛?
+主要 daily endpoint 包括：
 
 - `POST /collect-stock-daily`
 - `POST /collect-index-cn-daily`
+- `POST /collect-index-bj50-daily`
 - `POST /collect-cffex-daily`
 - `POST /collect-forex-daily`
 - `POST /collect-usd-index-daily`
 - `POST /collect-futures-daily`
 - `POST /collect-us-index-futures-daily`
+- `POST /collect-us-index-futures-official-daily`
 - `POST /collect-hk-index-futures-daily`
 - `POST /collect-etf-daily`
 - `POST /collect-option-daily`
@@ -1004,16 +1009,16 @@ python run.py runner retry-failures etf_daily 50
 - `POST /collect-index-us-fear-greed-daily`
 - `POST /collect-index-us-hedge-proxy-daily`
 
-缁熶竴瀵规帴鏂囨。锛?
+统一对接文档：
 
 - `docs/DAILY_COLLECTION_SERVICE_INTEGRATION.md`
 
-涓撻」鏂囨。锛?
+专项文档：
 
 - `docs/STOCK_TEMP_SERVICE_INTEGRATION.md`
 - `docs/INDEX_TEMP_SERVICE_INTEGRATION.md`
 
-涓昏渚濊禆閾惧缓璁寜浠ヤ笅椤哄簭琚彟涓€涓」鐩皟鐢細
+主要依赖链建议由另一个项目按以下顺序调用：
 
 1. `POST /collect-stock-daily`
 2. `POST /collect-index-cn-daily`
@@ -1025,16 +1030,16 @@ python run.py runner retry-failures etf_daily 50
 8. `POST /collect-option-daily`
 9. `POST /collect-quant-index-daily`
 
-璇存槑锛?
+说明：
 
-- `quant_index_daily` 渚濊禆鑲＄エ銆丄 鑲℃寚鏁般€佹湡璐х瓑涓婚摼鏁版嵁锛屽簲濮嬬粓鏀惧湪涓婚摼鏈€鍚?
-- US/HK/QVIX/鏂伴椈鎯呯华/缇庤偂椋庨櫓鎯呯华杩欏嚑缁勭洰鍓嶄笉鍙嶅悜褰卞搷 `quant_index_dashboard_daily`锛屽彲鐙珛璋冨害
-- 鎵€鏈?daily endpoint v1 閮藉彧鎺ュ彈绌篔JSON`锛歚{}`
+- `quant_index_daily` 依赖股票、A 股指数、期货等主链数据，应始终放在主链最后。
+- 北证 50、US/HK/QVIX、新闻情绪、美股风险情绪等独立链路目前不反向影响 `quant_index_dashboard_daily`，可独立调度。
+- 所有 daily endpoint v1 都只接受空 JSON：`{}`。
 
-## 閲忓寲鎸囨暟琛ュ厖璇存槑
+## 量化指数补充说明
 
 - `python run.py quant-index repair-recent [trade_day_count]`
-  - 榛樿閲嶇畻 `quant_index_dashboard_daily` 鏈€杩?10 涓氦鏄撴棩
+  - 默认重算 `quant_index_dashboard_daily` 最近 10 个交易日
 - `python run.py emotion-excel import [xlsx_path]`
-  - 褰撳墠鎸?`emotion_date + index_name` 瀵?`excel_index_emotion_daily` 鎵ц upsert
-  - 瀵煎叆瀹屾垚鍚庯紝浼氳嚜鍔ㄥ彧鍒锋柊鍙楀奖鍝嶇殑 `quant_index_dashboard_daily` 鏃ユ湡
+  - 当前按 `emotion_date + index_name` 对 `excel_index_emotion_daily` 执行 upsert
+  - 导入完成后，会自动只刷新受影响的 `quant_index_dashboard_daily` 日期
