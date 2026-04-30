@@ -55,6 +55,30 @@ def build_health_payload():
     }
 
 
+async def run_index_futures_handler_for_previous_trade_day(handler, market: str):
+    previous_trade_date = await quant_index.resolve_market_previous_trade_date(market)
+    if not previous_trade_date:
+        raise RuntimeError(f"no previous trade date found for market={market}")
+    result = await handler(trade_date=previous_trade_date)
+    refresh_result = await quant_index.repair_market_previous_trade_day(market)
+    return {
+        "trade_date": previous_trade_date,
+        "collection": result,
+        "quant_index_refresh": refresh_result,
+    }
+
+
+async def run_handler_for_previous_trade_day(handler, market: str):
+    previous_trade_date = await quant_index.resolve_market_previous_trade_date(market)
+    if not previous_trade_date:
+        raise RuntimeError(f"no previous trade date found for market={market}")
+    result = await handler(trade_date=previous_trade_date)
+    return {
+        "trade_date": previous_trade_date,
+        "collection": result,
+    }
+
+
 def build_daily_routes() -> Dict[str, DailyRoute]:
     return {
         "/collect-index-us-daily": DailyRoute(
@@ -105,12 +129,20 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
         "/collect-us-index-futures-daily": DailyRoute(
             path="/collect-us-index-futures-daily",
             task_name="us_index_futures_daily",
-            handler=futures.sync_us_index_futures_daily,
+            handler=lambda: run_index_futures_handler_for_previous_trade_day(futures.sync_us_index_futures_daily, "us"),
+        ),
+        "/collect-us-index-futures-official-daily": DailyRoute(
+            path="/collect-us-index-futures-official-daily",
+            task_name="us_index_futures_official_daily",
+            handler=lambda: run_handler_for_previous_trade_day(
+                futures.sync_us_index_futures_official_daily,
+                "us",
+            ),
         ),
         "/collect-hk-index-futures-daily": DailyRoute(
             path="/collect-hk-index-futures-daily",
             task_name="hk_index_futures_daily",
-            handler=futures.sync_hk_index_futures_daily,
+            handler=lambda: run_index_futures_handler_for_previous_trade_day(futures.sync_hk_index_futures_daily, "hk"),
         ),
         "/collect-etf-daily": DailyRoute(
             path="/collect-etf-daily",
@@ -151,6 +183,21 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             path="/collect-index-us-hedge-proxy-daily",
             task_name="index_us_hedge_proxy_daily",
             handler=index.sync_daily_us_hedge_proxy,
+        ),
+        "/collect-index-us-put-call-ratio-daily": DailyRoute(
+            path="/collect-index-us-put-call-ratio-daily",
+            task_name="index_us_put_call_ratio_daily",
+            handler=index.sync_daily_us_put_call_ratio_only,
+        ),
+        "/collect-index-us-treasury-yield-daily": DailyRoute(
+            path="/collect-index-us-treasury-yield-daily",
+            task_name="index_us_treasury_yield_daily",
+            handler=index.sync_daily_us_treasury_yield_only,
+        ),
+        "/collect-index-us-credit-spread-daily": DailyRoute(
+            path="/collect-index-us-credit-spread-daily",
+            task_name="index_us_credit_spread_daily",
+            handler=index.sync_daily_us_credit_spread_only,
         ),
     }
 

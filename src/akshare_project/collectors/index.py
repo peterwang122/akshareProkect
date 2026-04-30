@@ -2,6 +2,7 @@ import asyncio
 import csv
 import io
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -37,8 +38,22 @@ US_FEAR_GREED_LIVE_SOURCE = 'cnn_fear_greed_live'
 US_FEAR_GREED_HISTORY_SOURCE = 'cnn_fear_greed_history'
 US_FEAR_GREED_MIRROR_SOURCE = 'fear_greed_history_mirror'
 US_HEDGE_PROXY_SOURCE = 'ofr_tff'
+US_PUT_CALL_SOURCE = 'cboe_market_statistics'
+US_TREASURY_YIELD_SOURCE = 'fred_public_csv'
+US_CREDIT_SPREAD_SOURCE = 'fred_public_csv'
 
 US_VIX_HISTORY_URL = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'
+US_PUT_CALL_HISTORY_URLS = {
+    'total_put_call_ratio': 'https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv',
+    'index_put_call_ratio': 'https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/indexpc.csv',
+    'equity_put_call_ratio': 'https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv',
+    'etf_put_call_ratio': 'https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/etppc.csv',
+}
+US_PUT_CALL_MARKET_STATS_URL = 'https://www.cboe.com/us/options/market_statistics/market/'
+US_PUT_CALL_DAILY_JSON_URL_TEMPLATE = (
+    'https://cdn.cboe.com/data/us/options/market_statistics/daily/{trade_date}_daily_options'
+)
+US_PUT_CALL_DAILY_JSON_START_DATE = '2019-10-05'
 US_FEAR_GREED_CNN_URL = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata'
 US_FEAR_GREED_HISTORY_START_DATE = '2020-09-19'
 US_FEAR_GREED_MIRROR_URLS = [
@@ -48,6 +63,13 @@ US_FEAR_GREED_MIRROR_URLS = [
     ),
 ]
 OFR_API_BASE_URL = 'https://data.financialresearch.gov/hf/v1'
+FRED_CSV_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv'
+FRED_TREASURY_SERIES = {
+    'yield_3m': 'DGS3MO',
+    'yield_2y': 'DGS2',
+    'yield_10y': 'DGS10',
+}
+FRED_HIGH_YIELD_OAS_SERIES = 'BAMLH0A0HYM2'
 DEFAULT_HTTP_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -353,6 +375,64 @@ def fetch_us_vix_history_csv():
     return http_get_text(US_VIX_HISTORY_URL)
 
 
+def fetch_us_put_call_history_csv(url):
+    return http_get_text(url)
+
+
+def fetch_us_put_call_market_stats_html():
+    return http_get_text(US_PUT_CALL_MARKET_STATS_URL)
+
+
+def fetch_us_put_call_daily_options_json(trade_date):
+    normalized_trade_date = normalize_trade_date(trade_date)
+    if not normalized_trade_date:
+        return None
+    url = US_PUT_CALL_DAILY_JSON_URL_TEMPLATE.format(trade_date=normalized_trade_date)
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, timeout=30, headers=DEFAULT_HTTP_HEADERS)
+            if response.status_code in {403, 404}:
+                return None
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(API_RETRY_SLEEP_SECONDS)
+    raise last_error
+
+
+def fetch_fred_series_csv(series_id):
+    try:
+        return http_get(FRED_CSV_URL, params={'id': series_id}).text
+    except Exception as exc:
+        print(f'fred requests fetch failed for {series_id}, fallback to curl: {exc}')
+        return fetch_fred_series_csv_with_curl(series_id)
+
+
+def fetch_fred_series_csv_with_curl(series_id):
+    url = f'{FRED_CSV_URL}?id={series_id}'
+    completed = subprocess.run(
+        ['curl.exe', '-L', '--silent', '--show-error', '--max-time', '120', url],
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f'curl failed for FRED series {series_id}: {completed.stderr.strip()}'
+        )
+    text = completed.stdout or ''
+    if 'observation_date' not in text[:200]:
+        raise RuntimeError(
+            f'curl returned unexpected FRED payload for {series_id}: {text[:200]}'
+        )
+    return text
+
+
 def fetch_us_fear_greed_current_payload():
     return http_get_json(US_FEAR_GREED_CNN_URL, headers=CNN_HTTP_HEADERS)
 
@@ -615,6 +695,303 @@ def build_us_vix_daily_rows(csv_text):
             'data_source': US_VIX_SOURCE,
         })
     return rows
+
+
+def normalize_flexible_date(value):
+    normalized_value = str(value or '').strip()
+    if not normalized_value:
+        return ''
+
+    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y', '%Y/%m/%d', '%b %d, %Y', '%B %d, %Y'):
+        try:
+            return datetime.strptime(normalized_value, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return ''
+
+
+def normalize_csv_column(value):
+    return re.sub(r'[^a-z0-9]+', '', str(value or '').strip().lower())
+
+
+def find_csv_date_value(row):
+    for key, value in (row or {}).items():
+        if 'date' in normalize_csv_column(key):
+            trade_date = normalize_flexible_date(value)
+            if trade_date:
+                return trade_date
+    return ''
+
+
+def find_put_call_ratio_value(row):
+    ratio_candidates = []
+    for key, value in (row or {}).items():
+        normalized_key = normalize_csv_column(key)
+        if not normalized_key:
+            continue
+        if 'ratio' in normalized_key or normalized_key in {'pc', 'pcratio', 'putcall'}:
+            ratio_candidates.append(value)
+
+    for value in ratio_candidates:
+        numeric_value = to_float(value)
+        if numeric_value is not None:
+            return numeric_value
+    return None
+
+
+def build_us_put_call_ratio_rows_from_history_csv(csv_text, ratio_key):
+    rows = []
+    raw_lines = [line for line in str(csv_text or '').splitlines() if line.strip()]
+    header_index = 0
+    for index, line in enumerate(raw_lines):
+        normalized_line = normalize_csv_column(line)
+        if 'date' in normalized_line and ('pcratio' in normalized_line or 'putcall' in normalized_line):
+            header_index = index
+            break
+    csv_reader = csv.DictReader(io.StringIO('\n'.join(raw_lines[header_index:])))
+    for row in csv_reader:
+        trade_date = find_csv_date_value(row)
+        ratio_value = find_put_call_ratio_value(row)
+        if not trade_date or ratio_value is None:
+            continue
+        rows.append({
+            'trade_date': trade_date,
+            ratio_key: ratio_value,
+            'data_source': US_PUT_CALL_SOURCE,
+        })
+    return rows
+
+
+def merge_us_put_call_ratio_rows(*row_groups):
+    merged_rows = {}
+    for rows in row_groups:
+        for row in rows or []:
+            trade_date = normalize_trade_date((row or {}).get('trade_date'))
+            if not trade_date:
+                continue
+            target = merged_rows.setdefault(
+                trade_date,
+                {
+                    'trade_date': trade_date,
+                    'total_put_call_ratio': None,
+                    'index_put_call_ratio': None,
+                    'equity_put_call_ratio': None,
+                    'etf_put_call_ratio': None,
+                    'data_source': US_PUT_CALL_SOURCE,
+                },
+            )
+            for key in (
+                'total_put_call_ratio',
+                'index_put_call_ratio',
+                'equity_put_call_ratio',
+                'etf_put_call_ratio',
+            ):
+                if key in row and row.get(key) is not None:
+                    target[key] = row.get(key)
+            if row.get('data_source'):
+                target['data_source'] = row['data_source']
+    return [merged_rows[trade_date] for trade_date in sorted(merged_rows)]
+
+
+def build_us_put_call_ratio_row_from_daily_options_json(payload, trade_date):
+    normalized_trade_date = normalize_trade_date(trade_date)
+    if not normalized_trade_date:
+        return None
+    ratios = {
+        'total_put_call_ratio': None,
+        'index_put_call_ratio': None,
+        'equity_put_call_ratio': None,
+        'etf_put_call_ratio': None,
+    }
+    for item in (payload or {}).get('ratios', []) or []:
+        name = normalize_csv_column((item or {}).get('name'))
+        value = to_float((item or {}).get('value'))
+        if value is None:
+            continue
+        if name == 'totalputcallratio':
+            ratios['total_put_call_ratio'] = value
+        elif name == 'indexputcallratio':
+            ratios['index_put_call_ratio'] = value
+        elif name == 'equityputcallratio':
+            ratios['equity_put_call_ratio'] = value
+        elif name == 'exchangetradedproductsputcallratio':
+            ratios['etf_put_call_ratio'] = value
+
+    if not any(value is not None for value in ratios.values()):
+        return None
+    return {
+        'trade_date': normalized_trade_date,
+        **ratios,
+        'data_source': US_PUT_CALL_SOURCE,
+    }
+
+
+def build_weekday_date_strings(start_date, end_date):
+    start = datetime.strptime(normalize_trade_date(start_date), '%Y-%m-%d').date()
+    end = datetime.strptime(normalize_trade_date(end_date), '%Y-%m-%d').date()
+    dates = []
+    current = start
+    while current <= end:
+        if current.weekday() < 5:
+            dates.append(current.strftime('%Y-%m-%d'))
+        current += timedelta(days=1)
+    return dates
+
+
+def extract_current_put_call_ratio_from_html(html_text):
+    if not html_text:
+        return None
+
+    date_match = re.search(
+        r'Market Statistics for\s+[A-Za-z]+,\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})',
+        html_text,
+        flags=re.IGNORECASE,
+    )
+    trade_date = normalize_flexible_date(date_match.group(1)) if date_match else datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        tables = pd.read_html(io.StringIO(html_text))
+    except Exception:
+        tables = []
+
+    ratios = {
+        'total_put_call_ratio': None,
+        'index_put_call_ratio': None,
+        'equity_put_call_ratio': None,
+        'etf_put_call_ratio': None,
+    }
+
+    section_blocks = re.findall(
+        r'<h3>\s*([^<]+?)\s*</h3>\s*(<table\b.*?</table>)',
+        html_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for raw_heading, table_html in section_blocks:
+        heading = normalize_csv_column(raw_heading)
+        if heading not in {'total', 'indexoptions', 'equityoptions'}:
+            continue
+        try:
+            section_tables = pd.read_html(io.StringIO(table_html))
+        except Exception:
+            continue
+        if not section_tables:
+            continue
+        table = section_tables[0]
+        ratio_value = find_last_table_ratio_value(table)
+        if ratio_value is None:
+            continue
+        if heading == 'total':
+            ratios['total_put_call_ratio'] = ratio_value
+        elif heading == 'indexoptions':
+            ratios['index_put_call_ratio'] = ratio_value
+        elif heading == 'equityoptions':
+            ratios['equity_put_call_ratio'] = ratio_value
+
+    for table in tables:
+        if table is None or table.empty:
+            continue
+        table_columns = [normalize_csv_column(column) for column in table.columns]
+        ratio_columns = [
+            index
+            for index, column_name in enumerate(table_columns)
+            if 'putcall' in column_name or 'pcratio' in column_name or 'ratio' == column_name
+        ]
+        if not ratio_columns:
+            continue
+
+        for _, raw_row in table.iterrows():
+            row_values = [str(value or '').strip() for value in raw_row.tolist()]
+            row_text = ' '.join(row_values).lower()
+            ratio_value = None
+            for column_index in ratio_columns:
+                if column_index < len(row_values):
+                    ratio_value = to_float(row_values[column_index])
+                    if ratio_value is not None:
+                        break
+            if ratio_value is None:
+                continue
+            if 'equity' in row_text and ratios['equity_put_call_ratio'] is None:
+                ratios['equity_put_call_ratio'] = ratio_value
+            elif ('index' in row_text or 'idx' in row_text) and ratios['index_put_call_ratio'] is None:
+                ratios['index_put_call_ratio'] = ratio_value
+            elif ('etf' in row_text or 'etp' in row_text) and ratios['etf_put_call_ratio'] is None:
+                ratios['etf_put_call_ratio'] = ratio_value
+            elif 'total' in row_text and ratios['total_put_call_ratio'] is None:
+                ratios['total_put_call_ratio'] = ratio_value
+
+    if not any(value is not None for value in ratios.values()):
+        return None
+    return {
+        'trade_date': trade_date,
+        **ratios,
+        'data_source': US_PUT_CALL_SOURCE,
+    }
+
+
+def find_last_table_ratio_value(table):
+    if table is None or table.empty:
+        return None
+    ratio_column = None
+    for column in table.columns:
+        normalized_column = normalize_csv_column(column)
+        if 'pcratio' in normalized_column or 'putcallratio' in normalized_column:
+            ratio_column = column
+            break
+    if ratio_column is None:
+        return None
+    for value in reversed(table[ratio_column].tolist()):
+        ratio_value = to_float(value)
+        if ratio_value is not None:
+            return ratio_value
+    return None
+
+
+def build_fred_series_points(csv_text, series_id):
+    points = {}
+    csv_reader = csv.DictReader(io.StringIO(csv_text or ''))
+    for row in csv_reader:
+        trade_date = normalize_flexible_date(row.get('observation_date') or row.get('DATE') or row.get('date'))
+        value = to_float(row.get(series_id) or row.get('value') or row.get('VALUE'))
+        if not trade_date:
+            continue
+        points[trade_date] = value
+    return points
+
+
+def build_us_treasury_yield_rows(series_maps):
+    dates = sorted(set().union(*(set(points.keys()) for points in series_maps.values())))
+    rows = []
+    for trade_date in dates:
+        yield_3m = series_maps.get('yield_3m', {}).get(trade_date)
+        yield_2y = series_maps.get('yield_2y', {}).get(trade_date)
+        yield_10y = series_maps.get('yield_10y', {}).get(trade_date)
+        spread_10y_2y = round(yield_10y - yield_2y, 4) if yield_10y is not None and yield_2y is not None else None
+        spread_10y_3m = round(yield_10y - yield_3m, 4) if yield_10y is not None and yield_3m is not None else None
+        if yield_3m is None and yield_2y is None and yield_10y is None:
+            continue
+        rows.append({
+            'trade_date': trade_date,
+            'yield_3m': yield_3m,
+            'yield_2y': yield_2y,
+            'yield_10y': yield_10y,
+            'spread_10y_2y': spread_10y_2y,
+            'spread_10y_3m': spread_10y_3m,
+            'data_source': US_TREASURY_YIELD_SOURCE,
+        })
+    return rows
+
+
+def build_us_credit_spread_rows(csv_text):
+    points = build_fred_series_points(csv_text, FRED_HIGH_YIELD_OAS_SERIES)
+    return [
+        {
+            'trade_date': trade_date,
+            'high_yield_oas': value,
+            'data_source': US_CREDIT_SPREAD_SOURCE,
+        }
+        for trade_date, value in sorted(points.items())
+        if value is not None
+    ]
 
 
 def build_us_fear_greed_rows_from_mirror(csv_text):
@@ -1402,6 +1779,209 @@ async def sync_daily_us_hedge_fund_ls_proxy(db_tools):
     return upserted
 
 
+async def fetch_us_put_call_daily_json_rows(start_date, end_date, concurrency=8):
+    candidate_dates = build_weekday_date_strings(start_date, end_date)
+    semaphore = asyncio.Semaphore(concurrency)
+    rows = []
+    skipped = 0
+    failures = []
+
+    async def fetch_one(trade_date):
+        async with semaphore:
+            try:
+                payload = await asyncio.to_thread(fetch_us_put_call_daily_options_json, trade_date)
+                if not payload:
+                    return None, True, None
+                row = build_us_put_call_ratio_row_from_daily_options_json(payload, trade_date)
+                return row, row is None, None
+            except Exception as exc:
+                return None, False, f'{trade_date}: {exc}'
+
+    results = await asyncio.gather(*(fetch_one(trade_date) for trade_date in candidate_dates))
+    for row, was_skipped, failure in results:
+        if row:
+            rows.append(row)
+        if was_skipped:
+            skipped += 1
+        if failure:
+            failures.append(failure)
+
+    return rows, skipped, failures
+
+
+async def backfill_us_put_call_ratio(db_tools):
+    row_groups = []
+    failures = []
+    for ratio_key, url in US_PUT_CALL_HISTORY_URLS.items():
+        try:
+            csv_text = await asyncio.to_thread(fetch_us_put_call_history_csv, url)
+            rows = build_us_put_call_ratio_rows_from_history_csv(csv_text, ratio_key)
+            row_groups.append(rows)
+        except Exception as exc:
+            failures.append(f'{ratio_key}: {exc}')
+            print(f'index us put call backfill failed for {ratio_key}: {exc}')
+
+    try:
+        html_text = await asyncio.to_thread(fetch_us_put_call_market_stats_html)
+        current_row = extract_current_put_call_ratio_from_html(html_text)
+        if current_row:
+            row_groups.append([current_row])
+    except Exception as exc:
+        failures.append(f'current: {exc}')
+        print(f'index us put call current fetch failed: {exc}')
+
+    try:
+        daily_rows, skipped_daily, daily_failures = await fetch_us_put_call_daily_json_rows(
+            US_PUT_CALL_DAILY_JSON_START_DATE,
+            datetime.now().strftime('%Y-%m-%d'),
+        )
+        if daily_rows:
+            row_groups.append(daily_rows)
+        if daily_failures:
+            failures.extend(daily_failures)
+        print(
+            'index us put call daily-json backfill scanned, '
+            f'valid_rows: {len(daily_rows)}, skipped_dates: {skipped_daily}, '
+            f'failed_dates: {len(daily_failures)}'
+        )
+    except Exception as exc:
+        failures.append(f'daily-json: {exc}')
+        print(f'index us put call daily-json backfill failed: {exc}')
+
+    rows = merge_us_put_call_ratio_rows(*row_groups)
+    if not rows:
+        raise ValueError(
+            'No valid Cboe Put/Call rows built. '
+            f'failures: {"; ".join(failures) if failures else "-"}'
+        )
+
+    upserted = await db_tools.upsert_index_us_put_call_ratio_daily(rows)
+    print(
+        'index us put call ratio backfill finished, '
+        f'index_us_put_call_ratio_daily upserted: {upserted}, '
+        f'range: {rows[0]["trade_date"]} -> {rows[-1]["trade_date"]}, '
+        f'failed_sources: {len(failures)}'
+    )
+    return upserted
+
+
+async def sync_daily_us_put_call_ratio(db_tools):
+    rows = []
+    try:
+        daily_rows, _, daily_failures = await fetch_us_put_call_daily_json_rows(
+            (datetime.now().date() - timedelta(days=14)).strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d'),
+            concurrency=4,
+        )
+        rows.extend(daily_rows[-1:] if daily_rows else [])
+        if daily_failures:
+            print(f'index us put call daily-json recent failures: {len(daily_failures)}')
+    except Exception as exc:
+        print(f'index us put call daily-json fetch failed, fallback to current page: {exc}')
+
+    if not rows:
+        try:
+            html_text = await asyncio.to_thread(fetch_us_put_call_market_stats_html)
+            current_row = extract_current_put_call_ratio_from_html(html_text)
+            if current_row:
+                rows.append(current_row)
+        except Exception as exc:
+            print(f'index us put call current fetch failed, fallback to history csv: {exc}')
+
+    if not rows:
+        history_groups = []
+        for ratio_key, url in US_PUT_CALL_HISTORY_URLS.items():
+            csv_text = await asyncio.to_thread(fetch_us_put_call_history_csv, url)
+            history_groups.append(build_us_put_call_ratio_rows_from_history_csv(csv_text, ratio_key))
+        merged_rows = merge_us_put_call_ratio_rows(*history_groups)
+        rows = merged_rows[-1:] if merged_rows else []
+
+    if not rows:
+        raise ValueError('No valid Cboe Put/Call daily row built.')
+
+    latest_row = rows[-1]
+    latest_date = datetime.strptime(latest_row['trade_date'], '%Y-%m-%d').date()
+    if latest_date < (datetime.now().date() - timedelta(days=14)):
+        raise ValueError(f'Cboe Put/Call daily row is stale: {latest_row["trade_date"]}')
+    upserted = await db_tools.upsert_index_us_put_call_ratio_daily([latest_row])
+    print(
+        'index us put call ratio daily finished, '
+        f'index_us_put_call_ratio_daily upserted: {upserted}, '
+        f'trade_date: {latest_row["trade_date"]}'
+    )
+    return upserted
+
+
+async def backfill_us_treasury_yield(db_tools):
+    series_maps = {}
+    for field_name, series_id in FRED_TREASURY_SERIES.items():
+        csv_text = await asyncio.to_thread(fetch_fred_series_csv, series_id)
+        series_maps[field_name] = build_fred_series_points(csv_text, series_id)
+
+    rows = build_us_treasury_yield_rows(series_maps)
+    if not rows:
+        raise ValueError('No valid FRED US Treasury yield rows built.')
+
+    upserted = await db_tools.upsert_index_us_treasury_yield_daily(rows)
+    print(
+        'index us treasury yield backfill finished, '
+        f'index_us_treasury_yield_daily upserted: {upserted}, '
+        f'range: {rows[0]["trade_date"]} -> {rows[-1]["trade_date"]}'
+    )
+    return upserted
+
+
+async def sync_daily_us_treasury_yield(db_tools):
+    series_maps = {}
+    for field_name, series_id in FRED_TREASURY_SERIES.items():
+        csv_text = await asyncio.to_thread(fetch_fred_series_csv, series_id)
+        series_maps[field_name] = build_fred_series_points(csv_text, series_id)
+
+    rows = build_us_treasury_yield_rows(series_maps)
+    if not rows:
+        raise ValueError('No valid FRED US Treasury yield rows built.')
+
+    latest_row = rows[-1]
+    upserted = await db_tools.upsert_index_us_treasury_yield_daily([latest_row])
+    print(
+        'index us treasury yield daily finished, '
+        f'index_us_treasury_yield_daily upserted: {upserted}, '
+        f'trade_date: {latest_row["trade_date"]}'
+    )
+    return upserted
+
+
+async def backfill_us_credit_spread(db_tools):
+    csv_text = await asyncio.to_thread(fetch_fred_series_csv, FRED_HIGH_YIELD_OAS_SERIES)
+    rows = build_us_credit_spread_rows(csv_text)
+    if not rows:
+        raise ValueError('No valid FRED US high yield credit spread rows built.')
+
+    upserted = await db_tools.upsert_index_us_credit_spread_daily(rows)
+    print(
+        'index us credit spread backfill finished, '
+        f'index_us_credit_spread_daily upserted: {upserted}, '
+        f'range: {rows[0]["trade_date"]} -> {rows[-1]["trade_date"]}'
+    )
+    return upserted
+
+
+async def sync_daily_us_credit_spread(db_tools):
+    csv_text = await asyncio.to_thread(fetch_fred_series_csv, FRED_HIGH_YIELD_OAS_SERIES)
+    rows = build_us_credit_spread_rows(csv_text)
+    if not rows:
+        raise ValueError('No valid FRED US high yield credit spread rows built.')
+
+    latest_row = rows[-1]
+    upserted = await db_tools.upsert_index_us_credit_spread_daily([latest_row])
+    print(
+        'index us credit spread daily finished, '
+        f'index_us_credit_spread_daily upserted: {upserted}, '
+        f'trade_date: {latest_row["trade_date"]}'
+    )
+    return upserted
+
+
 async def backfill_us_market_sentiment():
     db_tools = DbTools()
     await db_tools.init_pool()
@@ -1532,6 +2112,66 @@ async def sync_daily_us_hedge_proxy():
 
     try:
         return await sync_daily_us_hedge_fund_ls_proxy(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def backfill_us_put_call_ratio_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await backfill_us_put_call_ratio(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_us_put_call_ratio_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await sync_daily_us_put_call_ratio(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def backfill_us_treasury_yield_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await backfill_us_treasury_yield(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_us_treasury_yield_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await sync_daily_us_treasury_yield(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def backfill_us_credit_spread_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await backfill_us_credit_spread(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_us_credit_spread_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await sync_daily_us_credit_spread(db_tools)
     finally:
         await db_tools.close()
 
@@ -1692,6 +2332,24 @@ async def main():
     if command == 'daily-us-hedge-proxy':
         await sync_daily_us_hedge_proxy()
         return
+    if command == 'backfill-us-put-call-ratio':
+        await backfill_us_put_call_ratio_only()
+        return
+    if command == 'daily-us-put-call-ratio':
+        await sync_daily_us_put_call_ratio_only()
+        return
+    if command == 'backfill-us-treasury-yield':
+        await backfill_us_treasury_yield_only()
+        return
+    if command == 'daily-us-treasury-yield':
+        await sync_daily_us_treasury_yield_only()
+        return
+    if command == 'backfill-us-credit-spread':
+        await backfill_us_credit_spread_only()
+        return
+    if command == 'daily-us-credit-spread':
+        await sync_daily_us_credit_spread_only()
+        return
     if command == 'backfill-us-market-sentiment':
         await backfill_us_market_sentiment()
         return
@@ -1708,6 +2366,9 @@ async def main():
         'backfill-qvix, daily-qvix, backfill-news-sentiment, daily-news-sentiment, '
         'backfill-us-vix, daily-us-vix, backfill-us-fear-greed, daily-us-fear-greed, '
         'backfill-us-hedge-proxy, daily-us-hedge-proxy, '
+        'backfill-us-put-call-ratio, daily-us-put-call-ratio, '
+        'backfill-us-treasury-yield, daily-us-treasury-yield, '
+        'backfill-us-credit-spread, daily-us-credit-spread, '
         'backfill-us-market-sentiment, daily-us-market-sentiment, daily'
     )
 

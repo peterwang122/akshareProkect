@@ -29,6 +29,7 @@ HTTP_TIMEOUT_SECONDS = 30
 HTTP_RETRY_COUNT = 3
 HTTP_RETRY_SLEEP_SECONDS = 2
 SINA_GLOBAL_FUTURES_SOURCE = "sina_global_futures"
+CME_SETTLEMENTS_SOURCE = "cme_settlements"
 HKEX_SOURCE = "hkex_daily_market_report"
 HK_TRADING_CALENDAR_SYMBOL = "HSI"
 HK_BACKFILL_PROGRESS_EVERY = 25
@@ -36,6 +37,7 @@ SINA_GLOBAL_FUTURES_DAILY_URL = (
     "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
     "{callback}/GlobalFuturesService.getGlobalFuturesDailyKLine"
 )
+CME_SETTLEMENTS_URL = "https://www.cmegroup.com/CmeWS/mvc/Settlements/Futures/Settlements/{product_id}/FUT"
 HKEX_DAYRPT_BASE_URL = "https://www.hkex.com.hk/eng/stat/dmstat/dayrpt/"
 HTTP_HEADERS = {
     "User-Agent": (
@@ -43,7 +45,17 @@ HTTP_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
     ),
     "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
+CME_BROWSER_HEADERS = {
+    "User-Agent": HTTP_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": HTTP_HEADERS["Accept-Language"],
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "X-Requested-With": "XMLHttpRequest",
+}
+CME_BLOCKED_STATUS_CODES = {403, 429}
 
 
 COL_DATE = "\u65e5\u671f"
@@ -81,6 +93,22 @@ US_INDEX_FUTURES_PRODUCTS = {
         "contract_name": "Nasdaq 100 Index Futures Continuous",
         "exchange": "SINA",
         "start_date": date(1999, 6, 21),
+    },
+}
+US_INDEX_FUTURES_OFFICIAL_PRODUCTS = {
+    "ES": {
+        "product_id": "138",
+        "contract_name": "E-mini S&P 500 Futures",
+        "exchange": "CME",
+        "start_date": date(1997, 9, 9),
+        "referer": "https://www.cmegroup.com/markets/equities/sp/e-mini-sandp500.settlements.html",
+    },
+    "NQ": {
+        "product_id": "146",
+        "contract_name": "E-mini Nasdaq-100 Futures",
+        "exchange": "CME",
+        "start_date": date(1999, 6, 21),
+        "referer": "https://www.cmegroup.com/markets/equities/nasdaq/e-mini-nasdaq-100.settlements.html",
     },
 }
 HK_INDEX_FUTURES_PRODUCTS = {
@@ -321,6 +349,73 @@ def http_get(url, *, params=None, headers=None, timeout=HTTP_TIMEOUT_SECONDS):
             if attempt < HTTP_RETRY_COUNT:
                 time.sleep(HTTP_RETRY_SLEEP_SECONDS * attempt)
     raise last_error
+
+
+def create_cme_session(product):
+    session = requests.Session()
+    session.headers.update(
+        {
+            **HTTP_HEADERS,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.cmegroup.com/",
+            "Connection": "keep-alive",
+        }
+    )
+    try:
+        response = session.get(product["referer"], timeout=HTTP_TIMEOUT_SECONDS)
+        if response.status_code in CME_BLOCKED_STATUS_CODES:
+            LOGGER.warning("CME settlement page warmup returned HTTP %s for %s", response.status_code, product["referer"])
+    except requests.RequestException as exc:
+        LOGGER.warning("CME settlement page warmup failed for %s: %s", product["referer"], exc)
+    return session
+
+
+def cme_get_json(session, endpoint, product, params):
+    headers = {
+        **CME_BROWSER_HEADERS,
+        "Referer": product["referer"],
+        "Origin": "https://www.cmegroup.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    last_error = None
+    for attempt in range(1, HTTP_RETRY_COUNT + 1):
+        try:
+            response = session.get(endpoint, params=params, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
+            if response.status_code == 404:
+                return {}
+            if response.status_code in CME_BLOCKED_STATUS_CODES and attempt < HTTP_RETRY_COUNT:
+                LOGGER.warning(
+                    "CME settlements API returned HTTP %s, warming session and retrying (%s/%s)",
+                    response.status_code,
+                    attempt,
+                    HTTP_RETRY_COUNT,
+                )
+                try:
+                    session.get(product["referer"], headers={**HTTP_HEADERS, "Referer": "https://www.cmegroup.com/"}, timeout=HTTP_TIMEOUT_SECONDS)
+                except requests.RequestException:
+                    pass
+                time.sleep(HTTP_RETRY_SLEEP_SECONDS * attempt)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < HTTP_RETRY_COUNT:
+                time.sleep(HTTP_RETRY_SLEEP_SECONDS * attempt)
+                continue
+        except ValueError as exc:
+            raise RuntimeError(f"CME settlements returned non-JSON response for {endpoint}") from exc
+    if last_error is not None:
+        response = getattr(last_error, "response", None)
+        if response is not None and response.status_code in CME_BLOCKED_STATUS_CODES:
+            raise RuntimeError(
+                "CME settlements official API blocked the request "
+                f"(HTTP {response.status_code}); retry later or run from a network allowed by CME."
+            ) from last_error
+        raise last_error
+    raise RuntimeError("CME settlements request failed without response")
 
 
 def is_http_status_error(exc, status_codes):
@@ -648,6 +743,148 @@ def fetch_sina_global_futures_history(root_symbol):
     if not isinstance(rows, list):
         raise RuntimeError(f"Sina global futures returned unexpected payload for {root_symbol}")
     return rows
+
+
+def format_cme_trade_date(trade_date):
+    parsed_trade_date = parse_date_arg(trade_date, datetime.now().date())
+    return parsed_trade_date.strftime("%m/%d/%Y")
+
+
+def normalize_cme_number_text(value):
+    text = normalize_text(value)
+    if not text or text in {"-", "--", "N/A", "NA"}:
+        return None
+    text = text.replace(",", "").replace("+", "").strip()
+    # CME sometimes appends settlement markers. Keep the numeric portion only.
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        number = float(match.group(0))
+    except ValueError:
+        return None
+    return number
+
+
+def normalize_cme_change_text(value):
+    text = normalize_text(value).upper()
+    if not text:
+        return None
+    if text in {"UNCH", "UNCHANGED"}:
+        return 0.0
+    return normalize_cme_number_text(text)
+
+
+def extract_cme_settlement_rows(payload):
+    if not isinstance(payload, dict):
+        return []
+    for key in ("settlements", "settlement", "data", "rows"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return rows
+    return []
+
+
+def fetch_cme_us_index_futures_settlements(root_symbol, trade_date):
+    product = US_INDEX_FUTURES_OFFICIAL_PRODUCTS[root_symbol]
+    trade_date_text = format_cme_trade_date(trade_date)
+    endpoint = CME_SETTLEMENTS_URL.format(product_id=product["product_id"])
+    params = {
+        "tradeDate": trade_date_text,
+        "strategy": "DEFAULT",
+        "pageSize": 500,
+    }
+    session = create_cme_session(product)
+
+    all_rows = []
+    page_number = 1
+    total_pages = 1
+    while page_number <= total_pages:
+        page_params = {**params, "pageNumber": page_number}
+        payload = cme_get_json(session, endpoint, product, page_params)
+        if not payload:
+            break
+        rows = extract_cme_settlement_rows(payload)
+        all_rows.extend(row for row in rows if isinstance(row, dict))
+
+        total_pages_value = payload.get("totalPages") or payload.get("total_pages")
+        try:
+            total_pages = max(1, int(total_pages_value or 1))
+        except (TypeError, ValueError):
+            total_pages = 1
+        page_number += 1
+
+    return all_rows
+
+
+def build_cme_us_index_futures_rows(root_symbol, trade_date, rows):
+    product = US_INDEX_FUTURES_OFFICIAL_PRODUCTS[root_symbol]
+    trade_date_text = parse_date_arg(trade_date, datetime.now().date()).strftime("%Y-%m-%d")
+    contract_rows = []
+    daily_rows = []
+    seen_contracts = set()
+
+    for row in rows:
+        month_text = row_first(
+            row,
+            [
+                "month",
+                "expirationMonth",
+                "expiration_month",
+                "contractMonth",
+                "contract_month",
+            ],
+        )
+        month_text = normalize_text(month_text)
+        if not month_text or month_text.upper() in {"TOTAL", "SUMMARY"}:
+            continue
+
+        contract_meta = parse_month_contract(root_symbol, month_text)
+        if not contract_meta:
+            continue
+
+        source_contract_code = contract_meta["source_contract_code"]
+        contract_name = f"{product['contract_name']} {contract_meta['month_code']}{str(contract_meta['year'])[-2:]}"
+        contract_row = {
+            "root_symbol": root_symbol,
+            "source_contract_code": source_contract_code,
+            "contract_name": contract_name,
+            "contract_month": contract_meta["contract_month"],
+            "exchange": product["exchange"],
+            "data_source": CME_SETTLEMENTS_SOURCE,
+            "first_seen_trade_date": trade_date_text,
+            "last_seen_trade_date": trade_date_text,
+        }
+
+        last_price = normalize_cme_number_text(row_first(row, ["last", "lastPrice", "last_price"]))
+        settle_price = normalize_cme_number_text(row_first(row, ["settle", "settlement", "settlePrice", "settle_price"]))
+        close_price = settle_price if settle_price is not None else last_price
+        daily_row = {
+            **contract_row,
+            "trade_date": trade_date_text,
+            "open_price": normalize_cme_number_text(row_first(row, ["open", "openPrice", "open_price"])),
+            "high_price": normalize_cme_number_text(row_first(row, ["high", "highPrice", "high_price"])),
+            "low_price": normalize_cme_number_text(row_first(row, ["low", "lowPrice", "low_price"])),
+            "last_price": last_price,
+            "close_price": close_price,
+            "settle_price": settle_price,
+            "price_change": normalize_cme_change_text(row_first(row, ["change", "priceChange", "price_change"])),
+            "volume": normalize_cme_number_text(row_first(row, ["volume", "tradeVolume", "trade_volume"])),
+            "open_interest": normalize_cme_number_text(
+                row_first(row, ["openInterest", "open_interest", "openInterestQty"])
+            ),
+            "raw_payload_json": row,
+            "data_source": CME_SETTLEMENTS_SOURCE,
+        }
+        if not any(daily_row.get(key) is not None for key in ("close_price", "settle_price", "last_price")):
+            continue
+
+        if source_contract_code not in seen_contracts:
+            contract_rows.append(contract_row)
+            seen_contracts.add(source_contract_code)
+        daily_rows.append(daily_row)
+
+    return contract_rows, daily_rows
 
 
 def build_sina_us_index_futures_rows(root_symbol, rows, start_date=None, end_date=None, latest_only=False):
@@ -998,6 +1235,16 @@ async def persist_index_futures_rows(db_tools, contract_table, daily_table, cont
     return contract_count, daily_count
 
 
+async def persist_us_index_official_futures_rows(db_tools, contract_rows, daily_rows):
+    await db_tools.ensure_us_index_official_futures_tables()
+    contract_count = await db_tools.batch_index_futures_contract_info(
+        "futures_us_index_official_contract_info",
+        contract_rows,
+    )
+    daily_count = await db_tools.batch_us_index_official_futures_daily_data(daily_rows)
+    return contract_count, daily_count
+
+
 async def sync_us_index_futures_daily(trade_date=None, roots=None):
     selected_roots = select_roots(roots, US_INDEX_FUTURES_PRODUCTS)
     if not selected_roots:
@@ -1076,6 +1323,103 @@ async def backfill_us_index_futures(start_date=None, end_date=None, roots=None):
         print(
             "us index futures backfill finished, "
             f"roots={','.join(selected_roots)}, start_date={actual_start}, end_date={actual_end}, rows={total_rows}"
+        )
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
+async def sync_us_index_futures_official_daily(trade_date=None, roots=None):
+    selected_roots = select_roots(roots, US_INDEX_FUTURES_OFFICIAL_PRODUCTS)
+    if not selected_roots:
+        print("No valid official US index futures roots selected.")
+        return 0
+    target_date = parse_date_arg(trade_date, datetime.now().date()) if trade_date else datetime.now().date()
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        total_contracts = 0
+        total_rows = 0
+        for root_symbol in selected_roots:
+            rows = await asyncio.to_thread(fetch_cme_us_index_futures_settlements, root_symbol, target_date)
+            contract_rows, daily_rows = build_cme_us_index_futures_rows(root_symbol, target_date, rows)
+            contract_count, daily_count = await persist_us_index_official_futures_rows(
+                db_tools,
+                contract_rows,
+                daily_rows,
+            )
+            total_contracts += contract_count
+            total_rows += daily_count
+            print(
+                "official us index futures "
+                f"{root_symbol} {target_date} saved contracts={contract_count}, rows={daily_count}"
+            )
+
+        if total_rows <= 0:
+            raise RuntimeError(
+                "CME official settlements returned no contract rows for "
+                f"roots={','.join(selected_roots)}, trade_date={target_date}"
+            )
+        print(f"official us index futures daily finished, contracts={total_contracts}, rows={total_rows}")
+        return total_rows
+    finally:
+        await db_tools.close()
+
+
+async def backfill_us_index_futures_official(start_date=None, end_date=None, roots=None):
+    selected_roots = select_roots(roots, US_INDEX_FUTURES_OFFICIAL_PRODUCTS)
+    if not selected_roots:
+        print("No valid official US index futures roots selected.")
+        return 0
+    default_start = min(US_INDEX_FUTURES_OFFICIAL_PRODUCTS[root]["start_date"] for root in selected_roots)
+    actual_start = start_date or default_start
+    actual_end = end_date or datetime.now().date()
+    if actual_start > actual_end:
+        raise ValueError("start_date cannot be greater than end_date")
+
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        total_rows = 0
+        saved_days = 0
+        empty_days = 0
+        failed_days = 0
+        current_date = actual_start
+        while current_date <= actual_end:
+            if current_date.weekday() >= 5:
+                current_date += timedelta(days=1)
+                continue
+
+            day_rows = 0
+            for root_symbol in selected_roots:
+                try:
+                    rows = await asyncio.to_thread(fetch_cme_us_index_futures_settlements, root_symbol, current_date)
+                    contract_rows, daily_rows = build_cme_us_index_futures_rows(root_symbol, current_date, rows)
+                    _, daily_count = await persist_us_index_official_futures_rows(
+                        db_tools,
+                        contract_rows,
+                        daily_rows,
+                    )
+                    day_rows += daily_count
+                    total_rows += daily_count
+                except Exception as exc:
+                    failed_days += 1
+                    print(f"official us index futures {root_symbol} {current_date} failed: {exc}")
+
+            if day_rows:
+                saved_days += 1
+                print(f"official us index futures {current_date} saved rows={day_rows}")
+            else:
+                empty_days += 1
+
+            current_date += timedelta(days=1)
+
+        print(
+            "official us index futures backfill finished, "
+            f"roots={','.join(selected_roots)}, start_date={actual_start}, end_date={actual_end}, "
+            f"rows={total_rows}, saved_days={saved_days}, empty_days={empty_days}, failed_days={failed_days}"
         )
         return total_rows
     finally:
@@ -1268,6 +1612,19 @@ async def main():
         await backfill_us_index_futures(start_date=start_date, end_date=end_date, roots=symbol_args)
         return
 
+    if mode == "daily-us-index-official":
+        today = datetime.now().date()
+        start_date, end_date, symbol_args = parse_range_and_symbols(args, today, today)
+        trade_date = start_date if args and is_date_arg(args[0]) and start_date == end_date else None
+        await sync_us_index_futures_official_daily(trade_date=trade_date, roots=symbol_args)
+        return
+
+    if mode == "backfill-us-index-official":
+        default_start = min(meta["start_date"] for meta in US_INDEX_FUTURES_OFFICIAL_PRODUCTS.values())
+        start_date, end_date, symbol_args = parse_range_and_symbols(args, default_start, default_end)
+        await backfill_us_index_futures_official(start_date=start_date, end_date=end_date, roots=symbol_args)
+        return
+
     if mode == "daily-hk-index":
         today = datetime.now().date()
         start_date, end_date, symbol_args = parse_range_and_symbols(args, today, today)
@@ -1291,6 +1648,8 @@ async def main():
         "   or: python run.py futures hist-daily [trade_date|start_date end_date] [HIST_SYMBOL ...]\n"
         "   or: python run.py futures daily-us-index [trade_date] [ES|NQ ...]\n"
         "   or: python run.py futures backfill-us-index [start_date] [end_date] [ES|NQ ...]\n"
+        "   or: python run.py futures daily-us-index-official [trade_date] [ES|NQ ...]\n"
+        "   or: python run.py futures backfill-us-index-official [start_date] [end_date] [ES|NQ ...]\n"
         "   or: python run.py futures daily-hk-index [trade_date] [HSI|HHI|HTI ...]\n"
         "   or: python run.py futures backfill-hk-index [start_date] [end_date] [HSI|HHI|HTI ...]"
     )
