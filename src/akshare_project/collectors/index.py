@@ -414,7 +414,7 @@ def fetch_fred_series_csv(series_id):
 def fetch_fred_series_csv_with_curl(series_id):
     url = f'{FRED_CSV_URL}?id={series_id}'
     completed = subprocess.run(
-        ['curl.exe', '-L', '--silent', '--show-error', '--max-time', '120', url],
+        ['curl', '-L', '--silent', '--show-error', '--max-time', '120', url],
         capture_output=True,
         text=True,
         encoding='utf-8',
@@ -1588,7 +1588,8 @@ async def sync_daily_qvix():
         daily_upserted = await db_tools.upsert_index_qvix_daily_snapshots(latest_rows)
         latest_trade_date = max(trade_dates) if trade_dates else ''
         today = datetime.now().strftime('%Y-%m-%d')
-        if latest_trade_date and latest_trade_date < today:
+        source_is_behind = bool(latest_trade_date and latest_trade_date < today)
+        if source_is_behind:
             print(
                 'index qvix daily source is behind local date, '
                 f'latest_source_trade_date={latest_trade_date}, local_date={today}'
@@ -1599,7 +1600,13 @@ async def sync_daily_qvix():
             f'index_qvix_daily_data upserted: {daily_upserted}, '
             f'trade_dates: {",".join(sorted(trade_dates))}'
         )
-        return daily_upserted
+        return {
+            'upserted': daily_upserted,
+            'latest_source_trade_date': latest_trade_date,
+            'trade_dates': sorted(trade_dates),
+            'local_date': today,
+            'source_is_behind': source_is_behind,
+        }
     finally:
         await db_tools.close()
 

@@ -6,19 +6,15 @@ from datetime import datetime, timedelta
 import pymysql
 from pymysql.cursors import DictCursor
 
-from akshare_project.core.paths import get_config_dir
-
-
-def load_db_info():
-    config_path = get_config_dir() / "db_info.json"
-    with open(config_path, "r", encoding="utf-8") as file:
-        return json.load(file)
+from akshare_project.core.paths import get_repo_root
+from akshare_project.db.config import load_db_info
 
 
 class SchedulerStore:
     def __init__(self):
         self.db_info = load_db_info()
         self.session_time_zone = str(self.db_info.get("timezone", "+08:00")).strip() or "+08:00"
+        self.ensure_schema()
 
     @staticmethod
     def is_lock_contention_error(exc):
@@ -65,6 +61,13 @@ class SchedulerStore:
             raise
         finally:
             conn.close()
+
+    def ensure_schema(self):
+        schema_path = get_repo_root() / "sql" / "ak_scheduler_tables.sql"
+        schema_sql = schema_path.read_text(encoding="utf-8").strip().rstrip(";")
+        with self.connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(schema_sql)
 
     def run_with_lock_retry(self, operation, max_attempts=5, base_sleep_seconds=0.05):
         for attempt in range(1, int(max_attempts) + 1):

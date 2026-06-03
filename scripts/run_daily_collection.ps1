@@ -1,6 +1,6 @@
 param(
-    [string]$RepoRoot = "C:\Users\Administrator\PycharmProjects\akshareProkect",
-    [string]$PythonExe = "C:\Users\Administrator\miniconda3\envs\akshareProkect\python.exe",
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [string]$PythonExe = "python",
     [string]$SchedulerUrl = "http://127.0.0.1:8765/health",
     [int]$SchedulerWaitSeconds = 60
 )

@@ -43,6 +43,73 @@ INDEX_FUTURES_SYMBOLS = {
     "中证500": {"main_symbol": "ICM", "month_symbol": "ICM0"},
     "中证1000": {"main_symbol": "IMM", "month_symbol": "IMM0"},
 }
+CFFEX_NET_SHORT_PRODUCTS_BY_INDEX_NAME = {
+    "上证指数": ["IH", "IF", "IC", "IM"],
+    "上证50": ["IH"],
+    "沪深300": ["IF"],
+    "中证500": ["IC"],
+    "中证1000": ["IM"],
+}
+CFFEX_NET_SHORT_DELTA_WINDOWS = (5, 7, 14, 20, 30, 60, 120)
+CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS = 300
+CFFEX_NET_SHORT_DELTA_SOURCES = (
+    ("top20", "top20_institutions"),
+    ("citic", "citic_customer"),
+)
+CFFEX_NET_SHORT_DELTA_FIELDS = tuple(
+    (f"cffex_{field_prefix}_net_short_delta_{window}d", source_key, window)
+    for field_prefix, source_key in CFFEX_NET_SHORT_DELTA_SOURCES
+    for window in CFFEX_NET_SHORT_DELTA_WINDOWS
+)
+BASIS_DELTA_WINDOWS = CFFEX_NET_SHORT_DELTA_WINDOWS
+BASIS_DELTA_FIELDS = tuple(
+    (f"basis_{basis_kind}_delta_{window}d", basis_kind, window)
+    for basis_kind in ("main", "month")
+    for window in BASIS_DELTA_WINDOWS
+)
+INDEX_OPTION_PRODUCTS = {
+    "上证50": "HO",
+    "沪深300": "IO",
+    "中证1000": "MO",
+}
+INDEX_NAME_BY_OPTION_PRODUCT = {
+    product_prefix: index_name
+    for index_name, product_prefix in INDEX_OPTION_PRODUCTS.items()
+}
+OPTION_PC_INDEX_CLOSE_OVERRIDES = {
+    ("2024-09-30", "MO"): 5700.0,
+    ("2025-04-07", "MO"): 5500.0,
+}
+OPTION_PC_BUCKETS = [
+    {
+        "key": "current_month",
+        "ratio_field": "option_pc_current_month",
+        "month_field": "option_pc_current_month_contract_month",
+        "special_flag_field": "option_pc_current_month_special_flag",
+        "special_note_field": "option_pc_current_month_special_note",
+    },
+    {
+        "key": "next_month",
+        "ratio_field": "option_pc_next_month",
+        "month_field": "option_pc_next_month_contract_month",
+        "special_flag_field": "option_pc_next_month_special_flag",
+        "special_note_field": "option_pc_next_month_special_note",
+    },
+    {
+        "key": "quarter_1",
+        "ratio_field": "option_pc_quarter_1",
+        "month_field": "option_pc_quarter_1_contract_month",
+        "special_flag_field": "option_pc_quarter_1_special_flag",
+        "special_note_field": "option_pc_quarter_1_special_note",
+    },
+    {
+        "key": "quarter_2",
+        "ratio_field": "option_pc_quarter_2",
+        "month_field": "option_pc_quarter_2_contract_month",
+        "special_flag_field": "option_pc_quarter_2_special_flag",
+        "special_note_field": "option_pc_quarter_2_special_note",
+    },
+]
 HK_INDEX_FUTURES_SYMBOLS = {
     "恒生指数": "HSI",
     "恒生中国企业指数": "HHI",
@@ -98,6 +165,13 @@ def parse_trade_day_count_arg(value, default_value=10):
     return parsed_value
 
 
+def shift_date_text(value, days):
+    parsed_date = parse_normalized_date(value)
+    if parsed_date is None:
+        return value
+    return (parsed_date + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def to_float(value):
     if value is None:
         return None
@@ -124,6 +198,448 @@ def average_or_default(values, default_value):
     if not valid_values:
         return default_value
     return sum(valid_values) / len(valid_values)
+
+
+def average_or_none(values):
+    valid_values = [float(value) for value in values if value is not None]
+    if not valid_values:
+        return None
+    return sum(valid_values) / len(valid_values)
+
+
+def empty_option_pc_payload():
+    payload = {}
+    for bucket in OPTION_PC_BUCKETS:
+        payload[bucket["ratio_field"]] = None
+        payload[bucket["month_field"]] = None
+        payload[bucket["special_flag_field"]] = 0
+        payload[bucket["special_note_field"]] = None
+    return payload
+
+
+def empty_option_flow_pc_payload():
+    return {
+        "option_volume_pc_ratio": None,
+        "option_turnover_pc_ratio": None,
+    }
+
+
+def empty_cffex_net_short_delta_payload():
+    return {field_name: None for field_name, _source_key, _window in CFFEX_NET_SHORT_DELTA_FIELDS}
+
+
+def empty_basis_delta_payload():
+    return {field_name: None for field_name, _basis_kind, _window in BASIS_DELTA_FIELDS}
+
+
+def normalize_contract_month(value):
+    text = str(value or "").strip()
+    return text if len(text) == 4 and text.isdigit() else ""
+
+
+def contract_month_sort_key(value):
+    text = normalize_contract_month(value)
+    if not text:
+        return (9999, 99)
+    return (2000 + int(text[:2]), int(text[2:]))
+
+
+def parse_normalized_date(value):
+    text = normalize_date_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def third_friday_of_contract_month(contract_month):
+    text = normalize_contract_month(contract_month)
+    if not text:
+        return None
+
+    year, month = contract_month_sort_key(text)
+    first_day = datetime(year, month, 1).date()
+    days_until_friday = (4 - first_day.weekday()) % 7
+    first_friday = first_day + timedelta(days=days_until_friday)
+    return first_friday + timedelta(days=14)
+
+
+def is_contract_month_expired_for_trade_date(contract_month, trade_date):
+    trade_day = parse_normalized_date(trade_date)
+    expiry_day = third_friday_of_contract_month(contract_month)
+    return bool(trade_day and expiry_day and trade_day >= expiry_day)
+
+
+def is_quarter_contract_month(value):
+    text = normalize_contract_month(value)
+    return bool(text) and int(text[2:]) in {3, 6, 9, 12}
+
+
+def select_option_pc_contract_months(contract_months, trade_date=None):
+    sorted_months = sorted(
+        {
+            normalize_contract_month(contract_month)
+            for contract_month in (contract_months or [])
+            if normalize_contract_month(contract_month)
+        },
+        key=contract_month_sort_key,
+    )
+    if trade_date is not None:
+        sorted_months = [
+            contract_month
+            for contract_month in sorted_months
+            if not is_contract_month_expired_for_trade_date(contract_month, trade_date)
+        ]
+    selected = {
+        "current_month": sorted_months[0] if len(sorted_months) >= 1 else None,
+        "next_month": sorted_months[1] if len(sorted_months) >= 2 else None,
+        "quarter_1": None,
+        "quarter_2": None,
+    }
+    regular_months = {selected["current_month"], selected["next_month"]}
+    quarter_months = [
+        contract_month
+        for contract_month in sorted_months
+        if contract_month not in regular_months and is_quarter_contract_month(contract_month)
+    ]
+    selected["quarter_1"] = quarter_months[0] if len(quarter_months) >= 1 else None
+    selected["quarter_2"] = quarter_months[1] if len(quarter_months) >= 2 else None
+    return selected
+
+
+def interpolate_option_price(points, target_price):
+    target = to_float(target_price)
+    if target is None:
+        return None
+
+    normalized_points = []
+    for strike_price, option_price in (points or {}).items():
+        strike = to_float(strike_price)
+        price = to_float(option_price)
+        if strike is None or price is None or price < 0:
+            continue
+        normalized_points.append((strike, price))
+    if not normalized_points:
+        return None
+
+    normalized_points.sort(key=lambda item: item[0])
+    for strike, price in normalized_points:
+        if abs(strike - target) < 1e-9:
+            return price
+
+    lower = None
+    upper = None
+    for strike, price in normalized_points:
+        if strike < target:
+            lower = (strike, price)
+        elif strike > target:
+            upper = (strike, price)
+            break
+    if lower is None or upper is None:
+        return None
+
+    lower_strike, lower_price = lower
+    upper_strike, upper_price = upper
+    if upper_strike == lower_strike:
+        return None
+    return lower_price + (upper_price - lower_price) / (upper_strike - lower_strike) * (target - lower_strike)
+
+
+def resolve_option_pc_index_close(trade_date, product_prefix, index_close):
+    normalized_trade_date = normalize_date_text(trade_date)
+    normalized_product_prefix = str(product_prefix or "").strip().upper()
+    override_value = OPTION_PC_INDEX_CLOSE_OVERRIDES.get((normalized_trade_date, normalized_product_prefix))
+    if override_value is not None:
+        return override_value, True
+    return index_close, False
+
+
+def build_option_pc_special_note(index_name, product_prefix, contract_month, effective_index_close):
+    normalized_index_name = str(index_name or INDEX_NAME_BY_OPTION_PRODUCT.get(product_prefix, "")).strip()
+    normalized_product_prefix = str(product_prefix or "").strip().upper()
+    normalized_contract_month = normalize_contract_month(contract_month)
+    point_value = to_float(effective_index_close)
+    point_text = f"{point_value:g}" if point_value is not None else str(effective_index_close or "").strip()
+    return f"{normalized_index_name} {normalized_product_prefix}{normalized_contract_month} 使用特殊点位 {point_text} 计算"
+
+
+def build_option_pc_payload_for_product(trade_date, product_prefix, index_close, product_rows):
+    normalized_product_prefix = str(product_prefix or "").strip().upper()
+    index_name = INDEX_NAME_BY_OPTION_PRODUCT.get(normalized_product_prefix, "")
+    grouped_by_month_type = {}
+    for row in product_rows or []:
+        contract_month = normalize_contract_month(row.get("contract_month"))
+        option_type = str(row.get("option_type") or "").strip().upper()
+        strike_price = to_float(row.get("strike_price"))
+        close_price = to_float(row.get("close_price"))
+        if not contract_month or option_type not in {"CALL", "PUT"} or strike_price is None or close_price is None:
+            continue
+        grouped_by_month_type.setdefault((contract_month, option_type), {})[strike_price] = close_price
+
+    selected_months = select_option_pc_contract_months(
+        (
+            contract_month
+            for contract_month, option_type in grouped_by_month_type
+            if option_type in {"CALL", "PUT"}
+        ),
+        trade_date=trade_date,
+    )
+    payload = empty_option_pc_payload()
+    effective_index_close, used_special_close = resolve_option_pc_index_close(trade_date, product_prefix, index_close)
+    for bucket in OPTION_PC_BUCKETS:
+        contract_month = selected_months.get(bucket["key"])
+        if not contract_month:
+            continue
+
+        put_price = interpolate_option_price(grouped_by_month_type.get((contract_month, "PUT"), {}), effective_index_close)
+        call_price = interpolate_option_price(grouped_by_month_type.get((contract_month, "CALL"), {}), effective_index_close)
+        payload[bucket["month_field"]] = contract_month
+        if put_price is None or call_price is None or call_price <= 0:
+            continue
+        payload[bucket["ratio_field"]] = put_price / call_price
+        if used_special_close:
+            payload[bucket["special_flag_field"]] = 1
+            payload[bucket["special_note_field"]] = build_option_pc_special_note(
+                index_name,
+                normalized_product_prefix,
+                contract_month,
+                effective_index_close,
+            )
+    return payload
+
+
+def build_index_option_pc_map(option_rows, index_close_map):
+    rows_by_trade_product = {}
+    for row in option_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        product_prefix = str(row.get("product_prefix") or "").strip().upper()
+        if not trade_date or product_prefix not in INDEX_NAME_BY_OPTION_PRODUCT:
+            continue
+        rows_by_trade_product.setdefault((trade_date, product_prefix), []).append(row)
+
+    result = {}
+    all_trade_dates = sorted({trade_date for trade_date, _product_prefix in rows_by_trade_product})
+    for trade_date in all_trade_dates:
+        core_payloads = {}
+        for index_name, product_prefix in INDEX_OPTION_PRODUCTS.items():
+            index_close = index_close_map.get((trade_date, index_name))
+            if index_close is None:
+                continue
+            product_rows = rows_by_trade_product.get((trade_date, product_prefix), [])
+            payload = build_option_pc_payload_for_product(trade_date, product_prefix, index_close, product_rows)
+            result[(trade_date, index_name)] = payload
+            core_payloads[index_name] = payload
+
+        shanghai_payload = empty_option_pc_payload()
+        for bucket in OPTION_PC_BUCKETS:
+            values = [
+                payload.get(bucket["ratio_field"])
+                for payload in core_payloads.values()
+                if payload.get(bucket["ratio_field"]) is not None
+            ]
+            contract_months = [
+                str(payload.get(bucket["month_field"]) or "").strip()
+                for payload in core_payloads.values()
+                if payload.get(bucket["ratio_field"]) is not None and str(payload.get(bucket["month_field"]) or "").strip()
+            ]
+            shanghai_payload[bucket["ratio_field"]] = average_or_none(values)
+            unique_contract_months = sorted(set(contract_months), key=contract_month_sort_key)
+            shanghai_payload[bucket["month_field"]] = "/".join(unique_contract_months) if unique_contract_months else None
+            special_notes = [
+                str(payload.get(bucket["special_note_field"]) or "").strip()
+                for payload in core_payloads.values()
+                if payload.get(bucket["ratio_field"]) is not None
+                and payload.get(bucket["special_flag_field"])
+                and str(payload.get(bucket["special_note_field"]) or "").strip()
+            ]
+            unique_special_notes = sorted(set(special_notes))
+            shanghai_payload[bucket["special_flag_field"]] = 1 if unique_special_notes else 0
+            shanghai_payload[bucket["special_note_field"]] = "；".join(unique_special_notes) if unique_special_notes else None
+        result[(trade_date, "上证指数")] = shanghai_payload
+
+    return result
+
+
+def build_option_flow_pc_payload_for_product(trade_date, product_prefix, product_rows):
+    totals = {
+        "CALL": {"volume": 0.0, "turnover": 0.0, "volume_seen": False, "turnover_seen": False},
+        "PUT": {"volume": 0.0, "turnover": 0.0, "volume_seen": False, "turnover_seen": False},
+    }
+    for row in product_rows or []:
+        contract_month = normalize_contract_month(row.get("contract_month"))
+        option_type = str(row.get("option_type") or "").strip().upper()
+        if not contract_month or option_type not in totals:
+            continue
+        if is_contract_month_expired_for_trade_date(contract_month, trade_date):
+            continue
+
+        volume = to_float(row.get("volume"))
+        turnover = to_float(row.get("turnover"))
+        if volume is not None and volume >= 0:
+            totals[option_type]["volume"] += volume
+            totals[option_type]["volume_seen"] = True
+        if turnover is not None and turnover >= 0:
+            totals[option_type]["turnover"] += turnover
+            totals[option_type]["turnover_seen"] = True
+
+    payload = empty_option_flow_pc_payload()
+    if totals["CALL"]["volume_seen"] and totals["CALL"]["volume"] > 0:
+        payload["option_volume_pc_ratio"] = totals["PUT"]["volume"] / totals["CALL"]["volume"]
+    if totals["CALL"]["turnover_seen"] and totals["CALL"]["turnover"] > 0:
+        payload["option_turnover_pc_ratio"] = totals["PUT"]["turnover"] / totals["CALL"]["turnover"]
+    return payload
+
+
+def build_index_option_flow_pc_map(option_rows):
+    rows_by_trade_product = {}
+    for row in option_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        product_prefix = str(row.get("product_prefix") or "").strip().upper()
+        if not trade_date or product_prefix not in INDEX_NAME_BY_OPTION_PRODUCT:
+            continue
+        rows_by_trade_product.setdefault((trade_date, product_prefix), []).append(row)
+
+    result = {}
+    all_trade_dates = sorted({trade_date for trade_date, _product_prefix in rows_by_trade_product})
+    for trade_date in all_trade_dates:
+        core_payloads = {}
+        for index_name, product_prefix in INDEX_OPTION_PRODUCTS.items():
+            product_rows = rows_by_trade_product.get((trade_date, product_prefix), [])
+            payload = build_option_flow_pc_payload_for_product(trade_date, product_prefix, product_rows)
+            result[(trade_date, index_name)] = payload
+            core_payloads[index_name] = payload
+
+        shanghai_payload = empty_option_flow_pc_payload()
+        for field in shanghai_payload:
+            values = [
+                payload.get(field)
+                for payload in core_payloads.values()
+                if payload.get(field) is not None
+            ]
+            shanghai_payload[field] = average_or_none(values)
+        result[(trade_date, "上证指数")] = shanghai_payload
+
+    return result
+
+
+def build_index_cffex_net_short_delta_map(position_rows, start_date=None, end_date=None):
+    series = {}
+    for row in position_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        source_key = str(row.get("source_key") or "").strip()
+        product_code = str(row.get("product_code") or "").strip().upper()
+        short_position = to_float(row.get("short_position"))
+        long_position = to_float(row.get("long_position"))
+        if not trade_date or source_key not in {"top20_institutions", "citic_customer"}:
+            continue
+        if product_code not in {"IH", "IF", "IC", "IM"} or short_position is None or long_position is None:
+            continue
+        series.setdefault(source_key, {}).setdefault(product_code, []).append(
+            {
+                "trade_date": trade_date,
+                "net_position": short_position - long_position,
+            }
+        )
+
+    product_delta_maps = {}
+    for field_name, source_key, window in CFFEX_NET_SHORT_DELTA_FIELDS:
+        product_delta_maps[field_name] = {}
+        for product_code, points in series.get(source_key, {}).items():
+            sorted_points = sorted(points, key=lambda item: item["trade_date"])
+            product_delta_maps[field_name][product_code] = {}
+            for index, point in enumerate(sorted_points):
+                previous_point = sorted_points[index - window] if index >= window else None
+                product_delta_maps[field_name][product_code][point["trade_date"]] = (
+                    point["net_position"] - previous_point["net_position"]
+                    if previous_point is not None
+                    else None
+                )
+
+    all_trade_dates = sorted({
+        trade_date
+        for product_maps in product_delta_maps.values()
+        for trade_date_map in product_maps.values()
+        for trade_date in trade_date_map
+    })
+    start_text = normalize_date_text(start_date)
+    end_text = normalize_date_text(end_date)
+    if start_text:
+        all_trade_dates = [trade_date for trade_date in all_trade_dates if trade_date >= start_text]
+    if end_text:
+        all_trade_dates = [trade_date for trade_date in all_trade_dates if trade_date <= end_text]
+
+    result = {}
+    for trade_date in all_trade_dates:
+        for index_name, product_codes in CFFEX_NET_SHORT_PRODUCTS_BY_INDEX_NAME.items():
+            payload = empty_cffex_net_short_delta_payload()
+            for field_name, _source_key, _window in CFFEX_NET_SHORT_DELTA_FIELDS:
+                values = [
+                    product_delta_maps.get(field_name, {}).get(product_code, {}).get(trade_date)
+                    for product_code in product_codes
+                ]
+                valid_values = [value for value in values if value is not None]
+                payload[field_name] = sum(valid_values) if valid_values else None
+            result[(trade_date, index_name)] = payload
+    return result
+
+
+def build_raw_core_basis_by_date(trade_dates, index_close_map, futures_close_map):
+    result = {}
+    for trade_date in trade_dates:
+        result[trade_date] = {}
+        for index_name in CORE_INDEX_NAMES:
+            index_close = index_close_map.get((trade_date, index_name))
+            symbol_meta = INDEX_FUTURES_SYMBOLS[index_name]
+            main_close = futures_close_map.get((trade_date, symbol_meta["main_symbol"]))
+            month_close = futures_close_map.get((trade_date, symbol_meta["month_symbol"]))
+            result[trade_date][index_name] = {
+                "main": (main_close - index_close) if main_close is not None and index_close is not None else None,
+                "month": (month_close - index_close) if month_close is not None and index_close is not None else None,
+            }
+    return result
+
+
+def build_index_basis_delta_map(raw_core_basis_by_date, trade_dates):
+    sorted_trade_dates = sorted(normalize_date_text(trade_date) for trade_date in trade_dates if normalize_date_text(trade_date))
+    product_delta_maps = {}
+    for field_name, basis_kind, window in BASIS_DELTA_FIELDS:
+        product_delta_maps[field_name] = {}
+        for index_name in CORE_INDEX_NAMES:
+            points = [
+                {
+                    "trade_date": trade_date,
+                    "basis": (raw_core_basis_by_date.get(trade_date, {}).get(index_name) or {}).get(basis_kind),
+                }
+                for trade_date in sorted_trade_dates
+            ]
+            product_delta_maps[field_name][index_name] = {}
+            for index, point in enumerate(points):
+                current_value = point["basis"]
+                previous_value = points[index - window]["basis"] if index >= window else None
+                product_delta_maps[field_name][index_name][point["trade_date"]] = (
+                    current_value - previous_value
+                    if current_value is not None and previous_value is not None
+                    else None
+                )
+
+    result = {}
+    for trade_date in sorted_trade_dates:
+        for index_name in INDEX_NAME_ORDER:
+            payload = empty_basis_delta_payload()
+            for field_name, _basis_kind, _window in BASIS_DELTA_FIELDS:
+                if index_name == "上证指数":
+                    values = [
+                        product_delta_maps.get(field_name, {}).get(core_index_name, {}).get(trade_date)
+                        for core_index_name in CORE_INDEX_NAMES
+                    ]
+                    valid_values = [value for value in values if value is not None]
+                    payload[field_name] = sum(valid_values) if valid_values else None
+                else:
+                    payload[field_name] = product_delta_maps.get(field_name, {}).get(index_name, {}).get(trade_date)
+            result[(trade_date, index_name)] = payload
+    return result
 
 
 def build_index_close_map(rows):
@@ -266,23 +782,37 @@ async def resolve_index_codes(db_tools):
     return code_map
 
 
-def build_dashboard_rows(trade_dates, index_code_map, emotion_map, index_close_map, futures_close_map, breadth_map):
+def build_dashboard_rows(
+    trade_dates,
+    index_code_map,
+    emotion_map,
+    index_close_map,
+    futures_close_map,
+    breadth_map,
+    option_pc_map=None,
+    option_flow_pc_map=None,
+    cffex_net_short_delta_map=None,
+    basis_delta_trade_dates=None,
+):
     rows = []
+    option_pc_map = option_pc_map or {}
+    option_flow_pc_map = option_flow_pc_map or {}
+    cffex_net_short_delta_map = cffex_net_short_delta_map or {}
+    basis_delta_dates = basis_delta_trade_dates or trade_dates
+    raw_core_basis_by_date = build_raw_core_basis_by_date(basis_delta_dates, index_close_map, futures_close_map)
+    basis_delta_map = build_index_basis_delta_map(raw_core_basis_by_date, basis_delta_dates)
     for trade_date in trade_dates:
         raw_core_emotions = {
             index_name: emotion_map.get((trade_date, index_name))
             for index_name in CORE_INDEX_NAMES
         }
-        raw_core_basis = {}
-        for index_name in CORE_INDEX_NAMES:
-            index_close = index_close_map.get((trade_date, index_name))
-            symbol_meta = INDEX_FUTURES_SYMBOLS[index_name]
-            main_close = futures_close_map.get((trade_date, symbol_meta["main_symbol"]))
-            month_close = futures_close_map.get((trade_date, symbol_meta["month_symbol"]))
-            raw_core_basis[index_name] = {
-                "main_basis": (main_close - index_close) if main_close is not None and index_close is not None else None,
-                "month_basis": (month_close - index_close) if month_close is not None and index_close is not None else None,
+        raw_core_basis = {
+            index_name: {
+                "main_basis": (raw_core_basis_by_date.get(trade_date, {}).get(index_name) or {}).get("main"),
+                "month_basis": (raw_core_basis_by_date.get(trade_date, {}).get(index_name) or {}).get("month"),
             }
+            for index_name in CORE_INDEX_NAMES
+        }
 
         sse_emotion = average_or_default(raw_core_emotions.values(), 50)
         sse_main_basis = average_or_default(
@@ -315,6 +845,13 @@ def build_dashboard_rows(trade_dates, index_code_map, emotion_map, index_close_m
                 main_basis = 0 if main_basis is None else main_basis
                 month_basis = 0 if month_basis is None else month_basis
 
+            option_pc_payload = option_pc_map.get((trade_date, index_name)) or empty_option_pc_payload()
+            option_flow_pc_payload = option_flow_pc_map.get((trade_date, index_name)) or empty_option_flow_pc_payload()
+            cffex_delta_payload = (
+                cffex_net_short_delta_map.get((trade_date, index_name))
+                or empty_cffex_net_short_delta_payload()
+            )
+            basis_delta_payload = basis_delta_map.get((trade_date, index_name)) or empty_basis_delta_payload()
             rows.append({
                 "trade_date": trade_date,
                 "index_code": index_code_map.get(index_name) or INDEX_CODE_FALLBACKS[index_name],
@@ -325,6 +862,10 @@ def build_dashboard_rows(trade_dates, index_code_map, emotion_map, index_close_m
                 "breadth_up_count": breadth["breadth_up_count"],
                 "breadth_total_count": breadth["breadth_total_count"],
                 "breadth_up_pct": breadth["breadth_up_pct"],
+                **option_pc_payload,
+                **option_flow_pc_payload,
+                **cffex_delta_payload,
+                **basis_delta_payload,
             })
 
     return rows
@@ -378,9 +919,15 @@ def build_us_dashboard_rows(trade_dates, index_code_map, index_close_map, future
 
 
 async def compute_and_upsert_range(db_tools, start_date, end_date):
+    basis_delta_start_date = shift_date_text(start_date, -CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS)
     cn_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(
         INDEX_NAME_ORDER,
         start_date=start_date,
+        end_date=end_date,
+    )
+    cn_basis_delta_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(
+        INDEX_NAME_ORDER,
+        start_date=basis_delta_start_date,
         end_date=end_date,
     )
     hk_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates_for_market(
@@ -402,9 +949,10 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
     index_code_map = await resolve_index_codes(db_tools)
     cn_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes(
         INDEX_NAME_ORDER,
-        start_date,
+        basis_delta_start_date,
         end_date,
     )
+    cn_index_close_map = build_index_close_map(cn_index_close_rows)
     emotion_rows = await db_tools.get_quant_index_dashboard_emotions(
         CORE_INDEX_NAMES,
         start_date,
@@ -412,18 +960,35 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
     )
     futures_rows = await db_tools.get_quant_index_dashboard_futures_closes(
         [symbol for item in INDEX_FUTURES_SYMBOLS.values() for symbol in (item["main_symbol"], item["month_symbol"])],
-        start_date,
+        basis_delta_start_date,
         end_date,
     )
     breadth_rows = await db_tools.get_quant_index_dashboard_breadth(start_date, end_date)
+    option_rows = await db_tools.get_quant_index_dashboard_option_closes(
+        INDEX_OPTION_PRODUCTS.values(),
+        start_date,
+        end_date,
+    )
+    cffex_position_rows = await db_tools.get_quant_index_dashboard_cffex_net_short_positions(
+        shift_date_text(start_date, -CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS),
+        end_date,
+    )
 
     rows = build_dashboard_rows(
         trade_dates=cn_trade_dates,
         index_code_map=index_code_map,
         emotion_map=build_emotion_map(emotion_rows),
-        index_close_map=build_index_close_map(cn_index_close_rows),
+        index_close_map=cn_index_close_map,
         futures_close_map=build_futures_close_map(futures_rows),
         breadth_map=build_breadth_map(breadth_rows),
+        option_pc_map=build_index_option_pc_map(option_rows, cn_index_close_map),
+        option_flow_pc_map=build_index_option_flow_pc_map(option_rows),
+        cffex_net_short_delta_map=build_index_cffex_net_short_delta_map(
+            cffex_position_rows,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+        basis_delta_trade_dates=cn_basis_delta_trade_dates,
     )
     if hk_trade_dates:
         hk_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(

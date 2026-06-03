@@ -1,6 +1,9 @@
 import asyncio
 import re
 import sys
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 
 from parsel import Selector
@@ -12,7 +15,9 @@ from akshare_project.core.progress import ProgressStore
 from akshare_project.db.db_tool import DbTools
 
 BASE_URL = "http://www.cffex.com.cn/rtj/"
+XML_URL_TEMPLATE = "http://www.cffex.com.cn/sj/hqsj/rtj/{date}/index.xml"
 PAGE_TIMEOUT_MS = 15000
+XML_TIMEOUT_SECONDS = 15
 REQUEST_SLEEP_SECONDS = 1
 LOGGER = get_logger("option")
 BACKFILL_PROGRESS_STORE = ProgressStore("option_rtj")
@@ -174,6 +179,103 @@ def extract_contract_meta(contract_code):
         ),
         "strike_price": parse_numeric(strike_match.group(1)) if strike_match else None,
     }
+
+
+def build_rtj_xml_url(target_date):
+    return XML_URL_TEMPLATE.format(date=str(target_date).replace("-", ""))
+
+
+def fetch_rtj_xml_content_sync(target_date):
+    url = build_rtj_xml_url(target_date)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "http://www.cffex.com.cn/cn/rtj.html",
+        },
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=XML_TIMEOUT_SECONDS) as response:
+        return response.read()
+
+
+async def fetch_rtj_xml_content(target_date):
+    return await asyncio.to_thread(fetch_rtj_xml_content_sync, target_date)
+
+
+def xml_text(element, tag_name):
+    child = element.find(tag_name)
+    return clean_text(child.text if child is not None else "")
+
+
+def parse_rtj_option_rows_from_xml(xml_content, target_date):
+    if not xml_content:
+        return []
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return []
+
+    rows_to_save = []
+    for item in root.findall(".//dailydata"):
+        product_prefix = xml_text(item, "productid").upper()
+        if product_prefix not in PREFIX_TO_INDEX:
+            continue
+
+        contract_code = xml_text(item, "instrumentid").upper()
+        contract_meta = extract_contract_meta(contract_code)
+        if not contract_meta:
+            continue
+
+        listed_date = OPTION_PRODUCTS[contract_meta["index_type"]]["listed_date"]
+        if target_date < listed_date:
+            continue
+
+        close_price = parse_numeric(xml_text(item, "closeprice"))
+        settle_price = parse_numeric(xml_text(item, "settlementprice"))
+        pre_settle_price = parse_numeric(xml_text(item, "presettlementprice"))
+        open_interest = parse_numeric(xml_text(item, "openinterest"))
+        pre_open_interest = parse_numeric(xml_text(item, "preopeninterest"))
+
+        rows_to_save.append({
+            "index_type": contract_meta["index_type"],
+            "index_name": contract_meta["index_name"],
+            "product_prefix": contract_meta["product_prefix"],
+            "contract_code": contract_code,
+            "contract_month": contract_meta["contract_month"],
+            "option_type": contract_meta["option_type"],
+            "strike_price": contract_meta["strike_price"],
+            "trade_date": target_date,
+            "open_price": parse_numeric(xml_text(item, "openprice")),
+            "high_price": parse_numeric(xml_text(item, "highestprice")),
+            "low_price": parse_numeric(xml_text(item, "lowestprice")),
+            "close_price": close_price,
+            "settle_price": settle_price,
+            "pre_settle_price": pre_settle_price,
+            "price_change_close": (
+                close_price - pre_settle_price
+                if close_price is not None and pre_settle_price is not None
+                else None
+            ),
+            "price_change_settle": (
+                settle_price - pre_settle_price
+                if settle_price is not None and pre_settle_price is not None
+                else None
+            ),
+            "volume": parse_numeric(xml_text(item, "volume")),
+            "turnover": parse_numeric(xml_text(item, "turnover")),
+            "open_interest": open_interest,
+            "open_interest_change": (
+                open_interest - pre_open_interest
+                if open_interest is not None and pre_open_interest is not None
+                else None
+            ),
+            "data_source": "cffex_rtj",
+            "source_url": build_rtj_xml_url(target_date),
+        })
+
+    return rows_to_save
 
 
 def get_field_index(headers, field_name):
@@ -497,6 +599,14 @@ async def click_query(page):
 
 
 async def query_single_trade_day(page, target_date):
+    try:
+        xml_content = await fetch_rtj_xml_content(target_date)
+        rows = parse_rtj_option_rows_from_xml(xml_content, target_date)
+        if rows:
+            return rows
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        pass
+
     await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     await switch_to_option_mode_v2(page)
     await select_all_contracts(page)
@@ -536,7 +646,15 @@ async def sync_rows(db_tools, rows):
     return await db_tools.batch_option_rtj_daily_data(rows)
 
 
-async def process_trade_day(page, db_tools, target_date, processed=None, save_state=False, swallow_exceptions=True):
+async def process_trade_day(
+    page,
+    db_tools,
+    target_date,
+    processed=None,
+    save_state=False,
+    swallow_exceptions=True,
+    save_empty_progress=True,
+):
     progress_key = normalize_trade_date(target_date)
     if save_state and processed is not None and progress_key in processed:
         return 0
@@ -544,9 +662,14 @@ async def process_trade_day(page, db_tools, target_date, processed=None, save_st
     try:
         rows = await query_single_trade_day(page, progress_key)
         inserted = await sync_rows(db_tools, rows)
-        if save_state and processed is not None:
+        if save_state and processed is not None and (rows or save_empty_progress):
             save_progress(progress_key)
             processed.add(progress_key)
+        if rows:
+            from akshare_project.collectors import quant_index
+
+            quant_affected = await quant_index.refresh_trade_dates(db_tools, [progress_key])
+            print(f"option {progress_key} quant dashboard refreshed: {quant_affected}")
         print(f"option {progress_key} saved rows: {inserted}")
         await asyncio.sleep(REQUEST_SLEEP_SECONDS)
         return inserted
@@ -573,7 +696,7 @@ async def backfill_history(headless=True, end_date=None):
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=headless)
+            browser = await playwright.chromium.launch(headless=headless, args=["--no-proxy-server"])
             page = await browser.new_page()
             try:
                 for trade_date in iter_weekdays(BACKFILL_START_DATE, end_trade_date):
@@ -584,6 +707,7 @@ async def backfill_history(headless=True, end_date=None):
                         processed=processed,
                         save_state=True,
                         swallow_exceptions=True,
+                        save_empty_progress=True,
                     )
             finally:
                 await browser.close()
@@ -617,7 +741,7 @@ async def repair_backfill(headless=True, start_date=None, end_date=None):
 
         total_rows = 0
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=headless)
+            browser = await playwright.chromium.launch(headless=headless, args=["--no-proxy-server"])
             page = await browser.new_page()
             try:
                 for trade_date in missing_dates:
@@ -628,6 +752,7 @@ async def repair_backfill(headless=True, start_date=None, end_date=None):
                         processed=processed,
                         save_state=True,
                         swallow_exceptions=True,
+                        save_empty_progress=False,
                     )
             finally:
                 await browser.close()
@@ -650,7 +775,7 @@ async def sync_daily(record_failures=False, headless=True, target_date=None):
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=headless)
+            browser = await playwright.chromium.launch(headless=headless, args=["--no-proxy-server"])
             page = await browser.new_page()
             try:
                 return await process_trade_day(

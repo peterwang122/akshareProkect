@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 
@@ -33,6 +34,9 @@ def get_config_dir() -> Path:
 
 
 def get_logs_dir() -> Path:
+    override = os.getenv("AK_LOG_DIR")
+    if override and override.strip():
+        return ensure_dir(Path(override).expanduser())
     return ensure_dir(LOGS_DIR)
 
 

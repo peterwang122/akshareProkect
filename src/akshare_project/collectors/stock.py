@@ -2,12 +2,14 @@ import asyncio
 import json
 import re
 import sys
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from akshare_project.core.ak_scheduler_client import SchedulerContext
 from akshare_project.core.logging_utils import echo_and_log, get_logger
@@ -28,6 +30,21 @@ SH_SOURCES = ["主板A股", "科创板"]
 SZ_SOURCES = ["A股列表"]
 SH_ALLOWED_BOARDS = {"主板A股", "科创板"}
 SZ_ALLOWED_BOARDS = {"主板", "创业板"}
+OFFICIAL_EXCHANGE_REQUEST_INTERVAL_SECONDS = 2.0
+SSE_OFFICIAL_DAILY_SOURCE = "sse_official_daily"
+SZSE_OFFICIAL_DAILY_SOURCE = "szse_official_daily"
+SSE_OFFICIAL_DAILY_URL = "https://query.sse.com.cn/sseQuery/commonQuery.do"
+SSE_OFFICIAL_REFERER_URL = "https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml"
+SZSE_OFFICIAL_HISTORY_URL = "https://www.szse.cn/api/market/ssjjhq/getHistoryData"
+SZSE_OFFICIAL_KEY_INDEX_URL = "https://www.szse.cn/api/report/index/stockKeyIndexGeneralization"
+SZSE_OFFICIAL_REFERER_URL = "https://www.szse.cn/certificate/individual/index.html"
+OFFICIAL_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
 
 
 def print(*args, **kwargs):
@@ -192,6 +209,41 @@ def format_ak_date(value):
     if isinstance(value, date):
         return value.strftime("%Y%m%d")
     return str(value or "").replace("-", "")
+
+
+def format_official_date(value):
+    parsed = parse_trade_date(value)
+    if not parsed:
+        return ""
+    return parsed.strftime("%Y%m%d")
+
+
+def normalize_percent_number(value):
+    numeric_value = normalize_numeric(value)
+    return numeric_value
+
+
+def multiply_metric(value, multiplier):
+    numeric_value = normalize_numeric(value)
+    if numeric_value is None:
+        return None
+    return numeric_value * multiplier
+
+
+def subtract_metric(left, right):
+    left_value = normalize_numeric(left)
+    right_value = normalize_numeric(right)
+    if left_value is None or right_value is None:
+        return None
+    return left_value - right_value
+
+
+def divide_metric(left, right):
+    left_value = normalize_numeric(left)
+    right_value = normalize_numeric(right)
+    if left_value is None or right_value in (None, 0):
+        return None
+    return left_value / right_value
 
 
 def resolve_scheduler_bucket_date_text(value=None):
@@ -837,6 +889,338 @@ def build_hist_metric_update_rows(prefixed_code, history_rows, repair_start_date
     return updates
 
 
+class OfficialExchangeRateLimiter:
+    def __init__(self, interval_seconds=OFFICIAL_EXCHANGE_REQUEST_INTERVAL_SECONDS, sleep_func=asyncio.sleep, monotonic_func=time.monotonic):
+        self.interval_seconds = max(0.0, float(interval_seconds or 0))
+        self.sleep_func = sleep_func
+        self.monotonic_func = monotonic_func
+        self._lock = asyncio.Lock()
+        self._next_allowed_at = 0.0
+
+    async def wait(self):
+        async with self._lock:
+            now = self.monotonic_func()
+            sleep_seconds = self._next_allowed_at - now
+            if sleep_seconds > 0:
+                await self.sleep_func(sleep_seconds)
+                now = self.monotonic_func()
+            self._next_allowed_at = now + self.interval_seconds
+
+
+class OfficialExchangeHttpClient:
+    def __init__(self, exchange, limiter=None, timeout=30):
+        self.exchange = str(exchange or "").strip().upper()
+        self.limiter = limiter or OfficialExchangeRateLimiter()
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.trust_env = False
+
+    def close(self):
+        self.session.close()
+
+    async def get_text(self, url, params=None, headers=None):
+        await self.limiter.wait()
+        return await asyncio.to_thread(self._get_text_sync, url, params or {}, headers or {})
+
+    def _get_text_sync(self, url, params, headers):
+        request_headers = dict(OFFICIAL_HTTP_HEADERS)
+        request_headers.update(headers or {})
+        response = self.session.get(
+            url,
+            params=params,
+            headers=request_headers,
+            timeout=self.timeout,
+            proxies={"http": None, "https": None},
+        )
+        response.raise_for_status()
+        return response.text
+
+
+def parse_json_or_jsonp(text):
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        raise ValueError("official response is empty")
+    if raw_text[0] != "{":
+        start = raw_text.find("(")
+        end = raw_text.rfind(")")
+        if start >= 0 and end > start:
+            raw_text = raw_text[start + 1:end].strip()
+    return json.loads(raw_text)
+
+
+def get_target_official_stock_rows(info_rows, exchange, selected_codes=None):
+    normalized_exchange = str(exchange or "").strip().upper()
+    selected = {
+        normalize_stock_code(code)
+        for code in (selected_codes or [])
+        if normalize_stock_code(code)
+    }
+    rows = []
+    for row in info_rows or []:
+        stock_code = normalize_stock_code(row.get("stock_code"))
+        if not stock_code or (selected and stock_code not in selected):
+            continue
+        if str(row.get("exchange") or "").strip().upper() != normalized_exchange:
+            continue
+        if str(row.get("security_type") or "").strip().upper() != "A":
+            continue
+        prefixed_code = normalize_prefixed_code(row.get("prefixed_code"))
+        if normalized_exchange == "SH" and not prefixed_code.startswith("sh"):
+            continue
+        if normalized_exchange == "SZ" and not prefixed_code.startswith("sz"):
+            continue
+        rows.append(row)
+    return rows
+
+
+def build_sse_official_row(stock_row, target_date, result_row):
+    trade_date = normalize_trade_date_text((result_row or {}).get("TX_DATE"))
+    target_date_text = normalize_trade_date_text(target_date)
+    if trade_date != target_date_text:
+        return None
+
+    close_price = normalize_numeric((result_row or {}).get("CLOSE_PRICE"))
+    price_change_amount = normalize_numeric((result_row or {}).get("CHANGE_PRICE"))
+    pre_close_price = subtract_metric(close_price, price_change_amount)
+    total_market_value = multiply_metric((result_row or {}).get("TOTAL_VALUE"), 10000)
+    circulating_market_value = multiply_metric((result_row or {}).get("NEGO_VALUE"), 10000)
+    total_share_capital = divide_metric(total_market_value, close_price)
+    circulating_share_capital = divide_metric(circulating_market_value, close_price)
+
+    return {
+        "exchange": "SH",
+        "stock_code": normalize_stock_code(stock_row.get("stock_code")),
+        "prefixed_code": normalize_prefixed_code(stock_row.get("prefixed_code")),
+        "stock_name": normalize_text((result_row or {}).get("SEC_NAME")) or normalize_text(stock_row.get("stock_name")),
+        "trade_date": trade_date,
+        "open_price": (result_row or {}).get("OPEN_PRICE"),
+        "close_price": close_price,
+        "high_price": (result_row or {}).get("HIGH_PRICE"),
+        "low_price": (result_row or {}).get("LOW_PRICE"),
+        "pre_close_price": pre_close_price,
+        "price_change_amount": price_change_amount,
+        "price_change_rate": normalize_percent_number((result_row or {}).get("CHANGE_RATE")),
+        "volume": multiply_metric((result_row or {}).get("TRADE_VOL"), 10000),
+        "turnover_amount": multiply_metric((result_row or {}).get("TRADE_AMT"), 10000),
+        "total_market_value": total_market_value,
+        "circulating_market_value": circulating_market_value,
+        "total_share_capital": total_share_capital,
+        "circulating_share_capital": circulating_share_capital,
+        "pe_rate": (result_row or {}).get("PE_RATE"),
+        "turnover_rate": (result_row or {}).get("TO_RATE"),
+        "amplitude": (result_row or {}).get("SWING_RATE"),
+        "data_source": SSE_OFFICIAL_DAILY_SOURCE,
+        "raw_trading_json": result_row,
+        "raw_metrics_json": result_row,
+    }
+
+
+def find_sse_daily_result(payload, target_date):
+    target_compact = format_official_date(target_date)
+    for row in (payload or {}).get("result") or []:
+        if str(row.get("DATE_TYPE") or "").strip().upper() != "D":
+            continue
+        if format_official_date(row.get("TX_DATE")) == target_compact:
+            return row
+    return None
+
+
+def normalize_szse_history_row(raw_row):
+    if not isinstance(raw_row, (list, tuple)) or len(raw_row) < 9:
+        return None
+    return {
+        "trade_date": normalize_trade_date_text(raw_row[0]),
+        "open_price": raw_row[1],
+        "close_price": raw_row[2],
+        "low_price": raw_row[3],
+        "high_price": raw_row[4],
+        "price_change_amount": raw_row[5],
+        "price_change_rate": raw_row[6],
+        "volume_lot": raw_row[7],
+        "turnover_amount": raw_row[8],
+        "raw": list(raw_row),
+    }
+
+
+def find_szse_daily_result(payload, target_date):
+    target_date_text = normalize_trade_date_text(target_date)
+    for raw_row in ((payload or {}).get("data") or {}).get("picupdata") or []:
+        normalized_row = normalize_szse_history_row(raw_row)
+        if normalized_row and normalized_row.get("trade_date") == target_date_text:
+            return normalized_row
+    return None
+
+
+def extract_szse_now_metrics(metrics_payload):
+    now_metrics = {}
+    for item in (metrics_payload or {}).get("data") or []:
+        if isinstance(item, dict) and any(str(key).startswith("now_") for key in item):
+            now_metrics.update(item)
+    return now_metrics
+
+
+def build_szse_official_row(stock_row, target_date, daily_row, metrics_payload):
+    trade_date = normalize_trade_date_text(daily_row.get("trade_date") if daily_row else None)
+    target_date_text = normalize_trade_date_text(target_date)
+    if trade_date != target_date_text:
+        return None
+
+    metrics_date = normalize_trade_date_text((metrics_payload or {}).get("lastDate"))
+    if metrics_date != target_date_text:
+        raise ValueError(f"SZSE metrics latest date {metrics_date or '-'} does not match target {target_date_text}")
+
+    now_metrics = extract_szse_now_metrics(metrics_payload)
+    close_price = normalize_numeric(daily_row.get("close_price"))
+    price_change_amount = normalize_numeric(daily_row.get("price_change_amount"))
+    pre_close_price = subtract_metric(close_price, price_change_amount)
+    amplitude = None
+    if pre_close_price not in (None, 0):
+        high_value = normalize_numeric(daily_row.get("high_price"))
+        low_value = normalize_numeric(daily_row.get("low_price"))
+        if high_value is not None and low_value is not None:
+            amplitude = (high_value - low_value) / pre_close_price * 100
+
+    return {
+        "exchange": "SZ",
+        "stock_code": normalize_stock_code(stock_row.get("stock_code")),
+        "prefixed_code": normalize_prefixed_code(stock_row.get("prefixed_code")),
+        "stock_name": normalize_text(stock_row.get("stock_name")),
+        "trade_date": trade_date,
+        "open_price": daily_row.get("open_price"),
+        "close_price": close_price,
+        "high_price": daily_row.get("high_price"),
+        "low_price": daily_row.get("low_price"),
+        "pre_close_price": pre_close_price,
+        "price_change_amount": price_change_amount,
+        "price_change_rate": normalize_percent_number(daily_row.get("price_change_rate")),
+        "volume": multiply_metric(daily_row.get("volume_lot"), 100),
+        "turnover_amount": daily_row.get("turnover_amount"),
+        "total_market_value": multiply_metric(now_metrics.get("now_sjzz"), 100000000),
+        "circulating_market_value": multiply_metric(now_metrics.get("now_ltsz"), 100000000),
+        "total_share_capital": multiply_metric(now_metrics.get("now_zgb"), 100000000),
+        "circulating_share_capital": multiply_metric(now_metrics.get("now_ltgb"), 100000000),
+        "pe_rate": now_metrics.get("now_syl"),
+        "turnover_rate": now_metrics.get("now_hsl"),
+        "amplitude": amplitude,
+        "data_source": SZSE_OFFICIAL_DAILY_SOURCE,
+        "raw_trading_json": daily_row.get("raw"),
+        "raw_metrics_json": metrics_payload,
+    }
+
+
+async def fetch_sse_official_daily_row(client, stock_row, target_date):
+    stock_code = normalize_stock_code(stock_row.get("stock_code"))
+    params = {
+        "jsonCallBack": "jsonpCallback",
+        "isPagination": "false",
+        "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_CJGK_MRGK_C",
+        "SEC_CODE": stock_code,
+        "TX_DATE": format_official_date(target_date),
+        "TX_DATE_MON": "",
+        "TX_DATE_YEAR": "",
+    }
+    text = await client.get_text(
+        SSE_OFFICIAL_DAILY_URL,
+        params=params,
+        headers={"Referer": f"{SSE_OFFICIAL_REFERER_URL}?COMPANY_CODE={stock_code}"},
+    )
+    payload = parse_json_or_jsonp(text)
+    result_row = find_sse_daily_result(payload, target_date)
+    if not result_row:
+        return None, payload
+    return build_sse_official_row(stock_row, target_date, result_row), payload
+
+
+async def fetch_szse_official_daily_row(client, stock_row, target_date):
+    stock_code = normalize_stock_code(stock_row.get("stock_code"))
+    history_text = await client.get_text(
+        SZSE_OFFICIAL_HISTORY_URL,
+        params={"cycleType": 32, "marketId": 1, "code": stock_code},
+        headers={"Referer": f"{SZSE_OFFICIAL_REFERER_URL}?code={stock_code}"},
+    )
+    history_payload = parse_json_or_jsonp(history_text)
+    daily_row = find_szse_daily_result(history_payload, target_date)
+    if not daily_row:
+        return None, history_payload, None
+
+    metrics_text = await client.get_text(
+        SZSE_OFFICIAL_KEY_INDEX_URL,
+        params={"secCode": stock_code},
+        headers={"Referer": f"{SZSE_OFFICIAL_REFERER_URL}?code={stock_code}"},
+    )
+    metrics_payload = parse_json_or_jsonp(metrics_text)
+    return build_szse_official_row(stock_row, target_date, daily_row, metrics_payload), history_payload, metrics_payload
+
+
+async def collect_exchange_official_rows(
+    exchange,
+    stock_rows,
+    target_date,
+    db_tools=None,
+    request_interval_seconds=OFFICIAL_EXCHANGE_REQUEST_INTERVAL_SECONDS,
+):
+    limiter = OfficialExchangeRateLimiter(interval_seconds=request_interval_seconds)
+    client = OfficialExchangeHttpClient(exchange=exchange, limiter=limiter)
+    missing_codes = []
+    failed_items = []
+    latest_source_date = None
+    row_count = 0
+    upserted_count = 0
+    turnover_amount_count = 0
+    try:
+        for index, stock_row in enumerate(stock_rows, start=1):
+            stock_code = normalize_stock_code(stock_row.get("stock_code"))
+            try:
+                if exchange == "SH":
+                    row, payload = await fetch_sse_official_daily_row(client, stock_row, target_date)
+                    for item in (payload or {}).get("result") or []:
+                        candidate_date = normalize_trade_date_text(item.get("TX_DATE"))
+                        if candidate_date and (latest_source_date is None or candidate_date > latest_source_date):
+                            latest_source_date = candidate_date
+                elif exchange == "SZ":
+                    row, history_payload, _metrics_payload = await fetch_szse_official_daily_row(client, stock_row, target_date)
+                    for raw in ((history_payload or {}).get("data") or {}).get("picupdata") or []:
+                        candidate = normalize_szse_history_row(raw)
+                        candidate_date = candidate.get("trade_date") if candidate else None
+                        if candidate_date and (latest_source_date is None or candidate_date > latest_source_date):
+                            latest_source_date = candidate_date
+                else:
+                    raise ValueError(f"unsupported exchange: {exchange}")
+
+                if row:
+                    if db_tools is not None:
+                        upserted_count += await db_tools.upsert_stock_exchange_official_daily_data([row])
+                    row_count += 1
+                    if normalize_numeric(row.get("turnover_amount")) is not None:
+                        turnover_amount_count += 1
+                    if row_count % 100 == 0:
+                        LOGGER.info(
+                            "stock exchange official daily progress: "
+                            f"target_date={target_date}, exchange={exchange}, "
+                            f"rows={row_count}/{len(stock_rows)}, upserted={upserted_count}, "
+                            f"processed={index}, missing={len(missing_codes)}, failed={len(failed_items)}"
+                        )
+                else:
+                    missing_codes.append(stock_code)
+            except Exception as exc:
+                failed_items.append({"stock_code": stock_code, "error": str(exc)})
+    finally:
+        client.close()
+
+    return {
+        "exchange": exchange,
+        "target_count": len(stock_rows),
+        "row_count": row_count,
+        "upserted_count": upserted_count,
+        "turnover_amount_count": turnover_amount_count,
+        "missing_codes": missing_codes,
+        "missing_count": len(missing_codes),
+        "failed_items": failed_items,
+        "failed_count": len(failed_items),
+        "latest_source_date": latest_source_date,
+    }
+
+
 async def sync_stock_info_all(db_tools=None, force=False):
     own_db = db_tools is None
     db_tools = db_tools or DbTools()
@@ -948,6 +1332,94 @@ async def sync_daily(selected_codes=None, db_tools=None):
             f"start_date={derived_trade_date}, end_date={derived_trade_date}, affected={quant_affected}"
         )
         return affected
+    finally:
+        if own_db:
+            await db_tools.close()
+
+
+async def sync_exchange_official_daily(selected_codes=None, db_tools=None, target_date=None, request_interval_seconds=OFFICIAL_EXCHANGE_REQUEST_INTERVAL_SECONDS):
+    own_db = db_tools is None
+    db_tools = db_tools or DbTools()
+    if own_db:
+        await db_tools.init_pool()
+    started = time.perf_counter()
+    try:
+        target_date_text = normalize_trade_date_text(target_date) or date.today().strftime("%Y-%m-%d")
+        await db_tools.ensure_stock_exchange_official_daily_table()
+        info_rows = await db_tools.get_all_stock_info_rows()
+        if not info_rows:
+            info_rows = await sync_stock_info_all(db_tools=db_tools, force=True)
+
+        sh_rows = get_target_official_stock_rows(info_rows, "SH", selected_codes=selected_codes)
+        sz_rows = get_target_official_stock_rows(info_rows, "SZ", selected_codes=selected_codes)
+        if not sh_rows and not sz_rows:
+            raise ValueError("stock_exchange_official_daily found no SH/SZ stock_info_all rows")
+
+        sh_result, sz_result = await asyncio.gather(
+            collect_exchange_official_rows(
+                "SH",
+                sh_rows,
+                target_date_text,
+                db_tools=db_tools,
+                request_interval_seconds=request_interval_seconds,
+            ),
+            collect_exchange_official_rows(
+                "SZ",
+                sz_rows,
+                target_date_text,
+                db_tools=db_tools,
+                request_interval_seconds=request_interval_seconds,
+            ),
+        )
+        upserted = sh_result["upserted_count"] + sz_result["upserted_count"]
+
+        exchange_failures = []
+        for result in (sh_result, sz_result):
+            if result["target_count"] > 0 and result["row_count"] == 0:
+                exchange_failures.append(
+                    f"{result['exchange']}目标日{target_date_text}无数据"
+                    f"（源最新{result.get('latest_source_date') or '-'}，失败{result['failed_count']}，缺失{result['missing_count']}）"
+                )
+
+        summary = {
+            "target_date": target_date_text,
+            "upserted": upserted,
+            "sh": {
+                "target_count": sh_result["target_count"],
+                "row_count": sh_result["row_count"],
+                "missing_count": sh_result["missing_count"],
+                "failed_count": sh_result["failed_count"],
+                "turnover_amount_count": sh_result["turnover_amount_count"],
+                "latest_source_date": sh_result.get("latest_source_date"),
+                "missing_samples": sh_result["missing_codes"][:10],
+                "failed_samples": sh_result["failed_items"][:5],
+            },
+            "sz": {
+                "target_count": sz_result["target_count"],
+                "row_count": sz_result["row_count"],
+                "missing_count": sz_result["missing_count"],
+                "failed_count": sz_result["failed_count"],
+                "turnover_amount_count": sz_result["turnover_amount_count"],
+                "latest_source_date": sz_result.get("latest_source_date"),
+                "missing_samples": sz_result["missing_codes"][:10],
+                "failed_samples": sz_result["failed_items"][:5],
+            },
+            "turnover_amount_count": sh_result["turnover_amount_count"] + sz_result["turnover_amount_count"],
+            "duration_seconds": round(time.perf_counter() - started, 3),
+        }
+        print(
+            "stock exchange official daily finished: "
+            f"target_date={target_date_text}, upserted={upserted}, "
+            f"sh={sh_result['row_count']}/{sh_result['target_count']}, "
+            f"sz={sz_result['row_count']}/{sz_result['target_count']}"
+        )
+        if exchange_failures:
+            raise RuntimeError(
+                "stock exchange official daily incomplete: "
+                + "；".join(exchange_failures)
+                + f"；summary={json.dumps(summary, ensure_ascii=False, default=str)}"
+            )
+        return summary
     finally:
         if own_db:
             await db_tools.close()
@@ -1410,6 +1882,9 @@ async def main():
     if command == "daily":
         await sync_daily(selected_codes=args or None)
         return
+    if command == "exchange-official-daily":
+        await sync_exchange_official_daily(selected_codes=args or None)
+        return
     if command == "repair-backfill":
         await repair_backfill_missing_history(selected_codes=args or None)
         return
@@ -1424,6 +1899,7 @@ async def main():
 
     raise ValueError(
         "stock supports: backfill [stock_code ...] | daily [stock_code ...] | "
+        "exchange-official-daily [stock_code ...] | "
         "repair-backfill [stock_code ...] | "
         "repair-daily-dates <YYYY-MM-DD> [YYYY-MM-DD ...] [--codes <stock_code ...>] | "
         "repair-hist-metrics [start_date] [end_date] [--codes <stock_code ...>]"

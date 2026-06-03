@@ -25,14 +25,40 @@
 
 ### 1. 安装依赖
 ```bash
-pip install -r requirements.txt
-playwright install chromium
+conda env create -f environment.yml
+conda activate akshareProkect
+python -m playwright install chromium
+```
+
+如果环境已存在，使用：
+
+```bash
+conda env update -f environment.yml --prune
+conda activate akshareProkect
+python -m playwright install chromium
 ```
 
 ### 2. 数据库配置
-数据库配置文件：
+默认面向本机 Docker MySQL：
+
+- host: `127.0.0.1`
+- port: `3306`
+- database: `stock_info`
+- user/password: `fit` / `fitpass`
+
+数据库配置文件仍兼容：
 
 - `config/db_info.json`
+- `config/db_info.example.json`
+
+也可以用环境变量覆盖配置，推荐生产/迁移时使用环境变量而不是把真实密码写入 git：
+
+- `AK_DB_HOST`
+- `AK_DB_PORT`
+- `AK_DB_USER`
+- `AK_DB_PASSWORD`
+- `AK_DB_NAME`
+- `AK_DB_TIMEZONE`
 
 建议在配置中显式设置：
 
@@ -61,9 +87,40 @@ SET time_zone = '+08:00'
 ## 启动顺序
 如果要运行任何依赖 AKShare 的采集任务，推荐顺序如下：
 
-1. 启动 AK 调度服务：`python ak_scheduler_service.py serve`
-2. 如需接收另一个项目的股票后复权或 US/HK 指数日常采集请求，再启动：`python stock_temp_service.py serve`
-3. 执行 `python run.py ...` 对应采集命令
+1. 启动本机 Docker MySQL/Redis/Flower（在 FIT 项目执行 `docker compose up -d`）
+2. 启动 AK 调度服务：`python ak_scheduler_service.py serve`
+3. 如需接收 FIT 的股票后复权或 US/HK 指数日常采集请求，再启动：`python stock_temp_service.py serve`
+4. 执行 `python run.py ...` 对应采集命令
+
+跨平台辅助脚本：
+
+```bash
+python scripts/dev.py scheduler
+python scripts/dev.py stock-temp
+python scripts/dev.py runner-daily
+python scripts/dev.py scheduler-health
+python scripts/dev.py stock-temp-health
+```
+
+macOS 可按需安装 launchd 服务：
+
+```bash
+python scripts/install_launchd.py scheduler stock-temp
+```
+
+`scripts/db_sync.py` 是手动数据库同步工具，不会自动运行：
+
+```bash
+# Windows 192.168.1.16 -> 本机 Docker MySQL，正式恢复目标库时必须显式确认
+REMOTE_DB_PASSWORD=... python scripts/db_sync.py windows-to-mac --confirm
+REMOTE_DB_PASSWORD=... python scripts/db_compare.py
+
+# 本机 Docker MySQL -> Windows 备用库，仅手动执行
+REMOTE_DB_PASSWORD=... python scripts/db_sync.py mac-to-windows --confirm
+
+# 只备份本机 Docker MySQL 到 runtime/artifacts/db_sync
+python scripts/db_sync.py backup-only
+```
 
 以下网页抓取链路不依赖 AK 调度服务：
 
@@ -972,6 +1029,7 @@ python run.py runner retry-failures etf_daily 50
 
 - `docs/DATABASE_DISPLAY_GUIDE.md`
 - `docs/STOCK_TEMP_SERVICE_INTEGRATION.md`
+- `docs/LOCAL_DOCKER_MIGRATION.md`
 
 ## 备注
 

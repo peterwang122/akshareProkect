@@ -1,5 +1,4 @@
 import asyncio
-import os
 import re
 import sys
 from datetime import date, datetime, timedelta
@@ -9,6 +8,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
+from akshare_project.core.network import direct_network_env
 from akshare_project.core.progress import ProgressStore
 from akshare_project.db.db_tool import DbTools
 
@@ -29,13 +29,24 @@ PRODUCTS = {
     "T": {"name": "10-Year Treasury Futures", "listed_date": "2015-03-20"},
     "TL": {"name": "30-Year Treasury Futures", "listed_date": "2023-04-21"},
 }
+CORE_EQUITY_INDEX_PRODUCTS = ("IH", "IF", "IC", "IM")
+CORE_EQUITY_INDEX_COMPLETE_START_DATE = PRODUCTS["IM"]["listed_date"]
 CONTRACT_CODE_PATTERN = re.compile(r"(?:TL|TF|TS|IF|IH|IC|IM|T)\d{3,4}", re.IGNORECASE)
 CONTRACT_PRODUCT_PATTERN = re.compile(r"^(TL|TF|TS|IF|IH|IC|IM|T)\d{3,4}$", re.IGNORECASE)
 FUTURES_RADIO_VALUE = "\u671f\u8d27"
+CHROMIUM_DIRECT_ARGS = ["--no-proxy-server"]
 
 
 def print(*args, **kwargs):
     echo_and_log(LOGGER, *args, **kwargs)
+
+
+async def launch_direct_browser(playwright, headless=True):
+    return await playwright.chromium.launch(
+        headless=headless,
+        args=CHROMIUM_DIRECT_ARGS,
+        env=direct_network_env(),
+    )
 
 
 def normalize_date(value):
@@ -222,6 +233,24 @@ def iter_weekdays(start_date, end_date):
         if current.weekday() < 5:
             yield current
         current += timedelta(days=1)
+
+
+async def cleanup_incomplete_core_equity_dates(db_tools, selected_codes, end_trade_date):
+    selected_set = {str(code).strip().upper() for code in selected_codes}
+    if not set(CORE_EQUITY_INDEX_PRODUCTS).issubset(selected_set):
+        return 0
+
+    deleted_rows = await db_tools.delete_incomplete_cffex_equity_index_dates(
+        CORE_EQUITY_INDEX_COMPLETE_START_DATE,
+        normalize_date(end_trade_date),
+        list(CORE_EQUITY_INDEX_PRODUCTS),
+    )
+    if deleted_rows:
+        print(
+            "removed incomplete cffex equity-index ranking rows "
+            f"from {CORE_EQUITY_INDEX_COMPLETE_START_DATE} to {normalize_date(end_trade_date)}: {deleted_rows}"
+        )
+    return deleted_rows
 
 
 async def query_single_trade_day(page, product_code, target_date):
@@ -412,7 +441,7 @@ async def backfill_all_history(headless=True, end_date=None, product_codes=None)
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=headless)
+            browser = await launch_direct_browser(playwright, headless=headless)
             page = await browser.new_page()
             try:
                 for product_code in selected_codes:
@@ -427,6 +456,7 @@ async def backfill_all_history(headless=True, end_date=None, product_codes=None)
                         )
             finally:
                 await browser.close()
+        await cleanup_incomplete_core_equity_dates(db_tools, selected_codes, end_trade_date)
     finally:
         await db_tools.close()
 
@@ -445,7 +475,7 @@ async def sync_latest_daily_data(headless=True, end_date=None, product_codes=Non
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=headless)
+            browser = await launch_direct_browser(playwright, headless=headless)
             page = await browser.new_page()
             try:
                 for product_code in selected_codes:
@@ -468,6 +498,7 @@ async def sync_latest_daily_data(headless=True, end_date=None, product_codes=Non
                         )
             finally:
                 await browser.close()
+        await cleanup_incomplete_core_equity_dates(db_tools, selected_codes, end_trade_date)
     finally:
         await db_tools.close()
 
@@ -511,7 +542,7 @@ async def main():
         await db_tools.init_pool()
         try:
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(headless=False)
+                browser = await launch_direct_browser(playwright, headless=False)
                 page = await browser.new_page()
                 try:
                     rows = await query_single_trade_day(page, product_code, target_date)
