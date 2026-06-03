@@ -1,11 +1,26 @@
 import json
 import math
-import os
 from datetime import datetime
 
 import aiomysql
 
-from akshare_project.core.paths import get_config_dir
+from akshare_project.db.config import load_db_info
+
+
+CFFEX_NET_SHORT_DELTA_WINDOWS = (5, 7, 14, 20, 30, 60, 120)
+CFFEX_NET_SHORT_DELTA_SOURCE_PREFIXES = ("top20", "citic")
+QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS = tuple(
+    f"cffex_{source_prefix}_net_short_delta_{window}d"
+    for source_prefix in CFFEX_NET_SHORT_DELTA_SOURCE_PREFIXES
+    for window in CFFEX_NET_SHORT_DELTA_WINDOWS
+)
+BASIS_DELTA_WINDOWS = CFFEX_NET_SHORT_DELTA_WINDOWS
+BASIS_DELTA_KINDS = ("main", "month")
+QUANT_INDEX_BASIS_DELTA_FIELDS = tuple(
+    f"basis_{basis_kind}_delta_{window}d"
+    for basis_kind in BASIS_DELTA_KINDS
+    for window in BASIS_DELTA_WINDOWS
+)
 
 
 def get_timestamp():
@@ -68,7 +83,45 @@ class DbTools:
         'main_basis': 9999999999.9999,
         'month_basis': 9999999999.9999,
         'breadth_up_pct': 9999999999.9999,
+        'option_pc_current_month': 9999999999.9999,
+        'option_pc_next_month': 9999999999.9999,
+        'option_pc_quarter_1': 9999999999.9999,
+        'option_pc_quarter_2': 9999999999.9999,
+        'option_volume_pc_ratio': 9999999999.9999,
+        'option_turnover_pc_ratio': 9999999999.9999,
+        **{field: 99999999999999.99 for field in QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS},
+        **{field: 99999999999999.99 for field in QUANT_INDEX_BASIS_DELTA_FIELDS},
     }
+    QUANT_INDEX_OPTION_PC_RATIO_FIELDS = (
+        'option_pc_current_month',
+        'option_pc_next_month',
+        'option_pc_quarter_1',
+        'option_pc_quarter_2',
+    )
+    QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS = (
+        'option_pc_current_month_contract_month',
+        'option_pc_next_month_contract_month',
+        'option_pc_quarter_1_contract_month',
+        'option_pc_quarter_2_contract_month',
+    )
+    QUANT_INDEX_OPTION_PC_SPECIAL_FLAG_FIELDS = (
+        'option_pc_current_month_special_flag',
+        'option_pc_next_month_special_flag',
+        'option_pc_quarter_1_special_flag',
+        'option_pc_quarter_2_special_flag',
+    )
+    QUANT_INDEX_OPTION_PC_SPECIAL_NOTE_FIELDS = (
+        'option_pc_current_month_special_note',
+        'option_pc_next_month_special_note',
+        'option_pc_quarter_1_special_note',
+        'option_pc_quarter_2_special_note',
+    )
+    QUANT_INDEX_OPTION_FLOW_PC_RATIO_FIELDS = (
+        'option_volume_pc_ratio',
+        'option_turnover_pc_ratio',
+    )
+    QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS = QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS
+    QUANT_INDEX_BASIS_DELTA_FIELDS = QUANT_INDEX_BASIS_DELTA_FIELDS
     INDEX_BASIC_TABLES = {'index_basic_info', 'index_us_basic_info', 'index_hk_basic_info', 'index_qvix_basic_info'}
     INDEX_DAILY_TABLES = {'index_daily_data', 'index_us_daily_data', 'index_hk_daily_data', 'index_qvix_daily_data'}
     INDEX_FUTURES_CONTRACT_TABLES = {
@@ -84,11 +137,11 @@ class DbTools:
         self.pool = None
         self._stock_qfq_change_columns_ready = False
         self._stock_hfq_change_columns_ready = False
+        self._stock_exchange_official_daily_table_ready = False
+        self._quant_index_dashboard_option_pc_columns_ready = False
 
     def load_db_info(self):
-        db_info_path = os.path.join(get_config_dir(), 'db_info.json')
-        with open(db_info_path, 'r') as f:
-            return json.load(f)
+        return load_db_info()
 
     def _normalize_numeric(self, field, value):
         if value is None:
@@ -171,6 +224,40 @@ class DbTools:
             snapshot_time = snapshot_time.replace(tzinfo=None)
         sanitized['snapshot_time'] = snapshot_time or None
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'stock_zh_a_spot'
+        return sanitized
+
+    def _sanitize_stock_exchange_official_daily_row(self, row):
+        sanitized = dict(row)
+        sanitized['exchange'] = str(row.get('exchange', '')).strip().upper()
+        sanitized['stock_code'] = str(row.get('stock_code', '')).strip()
+        sanitized['prefixed_code'] = str(row.get('prefixed_code', '')).strip().lower()
+        sanitized['stock_name'] = str(row.get('stock_name', '')).strip() or None
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        numeric_scales = {
+            'open_price': 4,
+            'close_price': 4,
+            'high_price': 4,
+            'low_price': 4,
+            'pre_close_price': 4,
+            'price_change_amount': 4,
+            'price_change_rate': 4,
+            'volume': 2,
+            'turnover_amount': 2,
+            'total_market_value': 2,
+            'circulating_market_value': 2,
+            'total_share_capital': 2,
+            'circulating_share_capital': 2,
+            'pe_rate': 4,
+            'turnover_rate': 4,
+            'amplitude': 4,
+        }
+        for field, scale in numeric_scales.items():
+            numeric_value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(numeric_value, scale) if numeric_value is not None else None
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'exchange_official_daily'
+        sanitized['raw_trading_json'] = self._serialize_json_field(row.get('raw_trading_json'))
+        sanitized['raw_metrics_json'] = self._serialize_json_field(row.get('raw_metrics_json'))
         return sanitized
 
     def _sanitize_stock_qfq_daily_row(self, row):
@@ -512,6 +599,26 @@ class DbTools:
         sanitized['main_basis'] = round(float(main_basis), 6) if main_basis is not None else None
         sanitized['month_basis'] = round(float(month_basis), 6) if month_basis is not None else None
         sanitized['breadth_up_pct'] = round(float(breadth_up_pct), 6) if breadth_up_pct is not None else None
+        for field in self.QUANT_INDEX_OPTION_PC_RATIO_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(float(value), 6) if value is not None else None
+        for field in self.QUANT_INDEX_OPTION_FLOW_PC_RATIO_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(float(value), 6) if value is not None else None
+        for field in self.QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(float(value), 6) if value is not None else None
+        for field in self.QUANT_INDEX_BASIS_DELTA_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(float(value), 6) if value is not None else None
+        for field in self.QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS:
+            raw_value = row.get(field)
+            sanitized[field] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
+        for field in self.QUANT_INDEX_OPTION_PC_SPECIAL_FLAG_FIELDS:
+            sanitized[field] = 1 if row.get(field) else 0
+        for field in self.QUANT_INDEX_OPTION_PC_SPECIAL_NOTE_FIELDS:
+            raw_value = row.get(field)
+            sanitized[field] = str(raw_value).strip()[:512] if raw_value is not None and str(raw_value).strip() else None
         return sanitized
 
     def _sanitize_excel_emotion_row(self, row):
@@ -702,6 +809,56 @@ class DbTools:
                     await conn.commit()
 
         self._stock_hfq_change_columns_ready = True
+
+    async def ensure_stock_exchange_official_daily_table(self):
+        if self._stock_exchange_official_daily_table_ready:
+            return
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS stock_exchange_official_daily_data (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        exchange VARCHAR(16) NOT NULL,
+                        stock_code VARCHAR(16) NOT NULL,
+                        prefixed_code VARCHAR(16) NOT NULL,
+                        stock_name VARCHAR(128) NULL,
+                        trade_date DATE NOT NULL,
+                        open_price DECIMAL(18, 4) NULL,
+                        close_price DECIMAL(18, 4) NULL,
+                        high_price DECIMAL(18, 4) NULL,
+                        low_price DECIMAL(18, 4) NULL,
+                        pre_close_price DECIMAL(18, 4) NULL,
+                        price_change_amount DECIMAL(18, 4) NULL,
+                        price_change_rate DECIMAL(18, 4) NULL,
+                        volume DECIMAL(24, 2) NULL,
+                        turnover_amount DECIMAL(24, 2) NULL,
+                        total_market_value DECIMAL(28, 2) NULL,
+                        circulating_market_value DECIMAL(28, 2) NULL,
+                        total_share_capital DECIMAL(24, 2) NULL,
+                        circulating_share_capital DECIMAL(24, 2) NULL,
+                        pe_rate DECIMAL(18, 4) NULL,
+                        turnover_rate DECIMAL(18, 4) NULL,
+                        amplitude DECIMAL(18, 4) NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        raw_trading_json LONGTEXT NULL,
+                        raw_metrics_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_stock_exchange_official_daily (exchange, prefixed_code, trade_date),
+                        KEY idx_stock_exchange_official_date_exchange (trade_date, exchange),
+                        KEY idx_stock_exchange_official_code_date (prefixed_code, trade_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await conn.commit()
+
+        self._stock_exchange_official_daily_table_ready = True
 
     async def upsert_stock_info_all(self, rows):
         if not rows:
@@ -956,6 +1113,114 @@ class DbTools:
                     turnover_amount = VALUES(turnover_amount),
                     data_source = VALUES(data_source),
                     snapshot_time = VALUES(snapshot_time),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def upsert_stock_exchange_official_daily_data(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_stock_exchange_official_daily_table()
+
+        sanitized_rows = [self._sanitize_stock_exchange_official_daily_row(row) for row in rows]
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['exchange'] and row['stock_code'] and row['prefixed_code'] and row['trade_date']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped = {}
+        for row in sanitized_rows:
+            deduped[(row['exchange'], row['prefixed_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped.values())
+
+        values = [
+            (
+                row['exchange'],
+                row['stock_code'],
+                row['prefixed_code'],
+                row['stock_name'],
+                row['trade_date'],
+                row['open_price'],
+                row['close_price'],
+                row['high_price'],
+                row['low_price'],
+                row['pre_close_price'],
+                row['price_change_amount'],
+                row['price_change_rate'],
+                row['volume'],
+                row['turnover_amount'],
+                row['total_market_value'],
+                row['circulating_market_value'],
+                row['total_share_capital'],
+                row['circulating_share_capital'],
+                row['pe_rate'],
+                row['turnover_rate'],
+                row['amplitude'],
+                row['data_source'],
+                row['raw_trading_json'],
+                row['raw_metrics_json'],
+            )
+            for row in sanitized_rows
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                query = """
+                INSERT INTO stock_exchange_official_daily_data (
+                    exchange,
+                    stock_code,
+                    prefixed_code,
+                    stock_name,
+                    trade_date,
+                    open_price,
+                    close_price,
+                    high_price,
+                    low_price,
+                    pre_close_price,
+                    price_change_amount,
+                    price_change_rate,
+                    volume,
+                    turnover_amount,
+                    total_market_value,
+                    circulating_market_value,
+                    total_share_capital,
+                    circulating_share_capital,
+                    pe_rate,
+                    turnover_rate,
+                    amplitude,
+                    data_source,
+                    raw_trading_json,
+                    raw_metrics_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    stock_code = VALUES(stock_code),
+                    stock_name = VALUES(stock_name),
+                    open_price = VALUES(open_price),
+                    close_price = VALUES(close_price),
+                    high_price = VALUES(high_price),
+                    low_price = VALUES(low_price),
+                    pre_close_price = VALUES(pre_close_price),
+                    price_change_amount = VALUES(price_change_amount),
+                    price_change_rate = VALUES(price_change_rate),
+                    volume = VALUES(volume),
+                    turnover_amount = VALUES(turnover_amount),
+                    total_market_value = VALUES(total_market_value),
+                    circulating_market_value = VALUES(circulating_market_value),
+                    total_share_capital = VALUES(total_share_capital),
+                    circulating_share_capital = VALUES(circulating_share_capital),
+                    pe_rate = VALUES(pe_rate),
+                    turnover_rate = VALUES(turnover_rate),
+                    amplitude = VALUES(amplitude),
+                    data_source = VALUES(data_source),
+                    raw_trading_json = VALUES(raw_trading_json),
+                    raw_metrics_json = VALUES(raw_metrics_json),
                     updated_at = CURRENT_TIMESTAMP
                 """
                 await cursor.executemany(query, values)
@@ -1848,6 +2113,103 @@ class DbTools:
                     for product_code, latest_date in rows
                     if product_code and latest_date
                 }
+
+    async def get_quant_index_dashboard_cffex_net_short_positions(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        start_date = str(start_date or "1900-01-01")
+        end_date = str(end_date or "2999-12-31")
+        product_codes_sql = "'IH','IF','IC','IM'"
+        member_match_sql = """
+            ((trade_date < %s AND {member_column} = %s)
+             OR (trade_date >= %s AND trade_date < %s AND {member_column} = %s)
+             OR (trade_date >= %s AND {member_column} = %s))
+        """
+        short_member_match_sql = member_match_sql.format(member_column="short_member")
+        long_member_match_sql = member_match_sql.format(member_column="long_member")
+        query = f"""
+        SELECT
+            trade_date,
+            product_code,
+            'top20_institutions' AS source_key,
+            SUM(COALESCE(short_open_interest, 0)) AS short_position,
+            SUM(COALESCE(long_open_interest, 0)) AS long_position
+        FROM cffex_member_rankings
+        WHERE product_code IN ({product_codes_sql})
+          AND trade_date BETWEEN %s AND %s
+          AND rank_no <= 20
+          AND volume_member IS NOT NULL
+        GROUP BY trade_date, product_code
+        UNION ALL
+        SELECT
+            trade_date,
+            product_code,
+            'citic_customer' AS source_key,
+            SUM(CASE WHEN {short_member_match_sql} THEN COALESCE(short_open_interest, 0) ELSE 0 END) AS short_position,
+            SUM(CASE WHEN {long_member_match_sql} THEN COALESCE(long_open_interest, 0) ELSE 0 END) AS long_position
+        FROM cffex_member_rankings
+        WHERE product_code IN ({product_codes_sql})
+          AND trade_date BETWEEN %s AND %s
+        GROUP BY trade_date, product_code
+        ORDER BY trade_date ASC, source_key ASC, product_code ASC
+        """
+        params = [
+            str(start_date),
+            str(end_date),
+            "2024-02-26",
+            "中信期货",
+            "2024-02-26",
+            "2024-04-29",
+            "中信期货(经纪)",
+            "2024-04-29",
+            "中信期货(代客)",
+            "2024-02-26",
+            "中信期货",
+            "2024-02-26",
+            "2024-04-29",
+            "中信期货(经纪)",
+            "2024-04-29",
+            "中信期货(代客)",
+            str(start_date),
+            str(end_date),
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def delete_incomplete_cffex_equity_index_dates(self, start_date, end_date, product_codes):
+        if not product_codes:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+
+        placeholders = ','.join(['%s'] * len(product_codes))
+        query = f"""
+        DELETE FROM cffex_member_rankings
+        WHERE trade_date IN (
+            SELECT trade_date FROM (
+                SELECT trade_date
+                FROM cffex_member_rankings
+                WHERE trade_date BETWEEN %s AND %s
+                  AND product_code IN ({placeholders})
+                GROUP BY trade_date
+                HAVING COUNT(DISTINCT product_code) > 0
+                   AND COUNT(DISTINCT product_code) < %s
+            ) incomplete_dates
+        )
+          AND product_code IN ({placeholders})
+        """
+        params = [start_date, end_date, *product_codes, len(product_codes), *product_codes]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, params)
+                await conn.commit()
+                return cursor.rowcount
 
     async def upsert_douyin_emotion_daily(self, rows):
         if not rows:
@@ -3475,12 +3837,170 @@ class DbTools:
                 await cursor.execute(query, [str(start_date), str(end_date)])
                 return list(await cursor.fetchall())
 
+    async def ensure_quant_index_dashboard_option_pc_columns(self):
+        if self._quant_index_dashboard_option_pc_columns_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+
+        column_definitions = [
+            (
+                'option_pc_current_month',
+                "ADD COLUMN option_pc_current_month DECIMAL(18, 6) NULL COMMENT '当月股指期权Put/Call价格比' AFTER breadth_up_pct",
+            ),
+            (
+                'option_pc_current_month_contract_month',
+                "ADD COLUMN option_pc_current_month_contract_month VARCHAR(16) NULL COMMENT '当月股指期权合约月份' AFTER option_pc_current_month",
+            ),
+            (
+                'option_pc_current_month_special_flag',
+                "ADD COLUMN option_pc_current_month_special_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT '当月Put/Call是否使用特殊点位计算' AFTER option_pc_current_month_contract_month",
+            ),
+            (
+                'option_pc_current_month_special_note',
+                "ADD COLUMN option_pc_current_month_special_note VARCHAR(512) NULL COMMENT '当月Put/Call特殊点位说明' AFTER option_pc_current_month_special_flag",
+            ),
+            (
+                'option_pc_next_month',
+                "ADD COLUMN option_pc_next_month DECIMAL(18, 6) NULL COMMENT '下月股指期权Put/Call价格比' AFTER option_pc_current_month_special_note",
+            ),
+            (
+                'option_pc_next_month_contract_month',
+                "ADD COLUMN option_pc_next_month_contract_month VARCHAR(16) NULL COMMENT '下月股指期权合约月份' AFTER option_pc_next_month",
+            ),
+            (
+                'option_pc_next_month_special_flag',
+                "ADD COLUMN option_pc_next_month_special_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT '下月Put/Call是否使用特殊点位计算' AFTER option_pc_next_month_contract_month",
+            ),
+            (
+                'option_pc_next_month_special_note',
+                "ADD COLUMN option_pc_next_month_special_note VARCHAR(512) NULL COMMENT '下月Put/Call特殊点位说明' AFTER option_pc_next_month_special_flag",
+            ),
+            (
+                'option_pc_quarter_1',
+                "ADD COLUMN option_pc_quarter_1 DECIMAL(18, 6) NULL COMMENT '第一季月股指期权Put/Call价格比' AFTER option_pc_next_month_special_note",
+            ),
+            (
+                'option_pc_quarter_1_contract_month',
+                "ADD COLUMN option_pc_quarter_1_contract_month VARCHAR(16) NULL COMMENT '第一季月股指期权合约月份' AFTER option_pc_quarter_1",
+            ),
+            (
+                'option_pc_quarter_1_special_flag',
+                "ADD COLUMN option_pc_quarter_1_special_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT '季月1 Put/Call是否使用特殊点位计算' AFTER option_pc_quarter_1_contract_month",
+            ),
+            (
+                'option_pc_quarter_1_special_note',
+                "ADD COLUMN option_pc_quarter_1_special_note VARCHAR(512) NULL COMMENT '季月1 Put/Call特殊点位说明' AFTER option_pc_quarter_1_special_flag",
+            ),
+            (
+                'option_pc_quarter_2',
+                "ADD COLUMN option_pc_quarter_2 DECIMAL(18, 6) NULL COMMENT '第二季月股指期权Put/Call价格比' AFTER option_pc_quarter_1_special_note",
+            ),
+            (
+                'option_pc_quarter_2_contract_month',
+                "ADD COLUMN option_pc_quarter_2_contract_month VARCHAR(16) NULL COMMENT '第二季月股指期权合约月份' AFTER option_pc_quarter_2",
+            ),
+            (
+                'option_pc_quarter_2_special_flag',
+                "ADD COLUMN option_pc_quarter_2_special_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT '季月2 Put/Call是否使用特殊点位计算' AFTER option_pc_quarter_2_contract_month",
+            ),
+            (
+                'option_pc_quarter_2_special_note',
+                "ADD COLUMN option_pc_quarter_2_special_note VARCHAR(512) NULL COMMENT '季月2 Put/Call特殊点位说明' AFTER option_pc_quarter_2_special_flag",
+            ),
+            (
+                'option_volume_pc_ratio',
+                "ADD COLUMN option_volume_pc_ratio DECIMAL(18, 6) NULL COMMENT '股指期权成交量Put/Call比' AFTER option_pc_quarter_2_special_note",
+            ),
+            (
+                'option_turnover_pc_ratio',
+                "ADD COLUMN option_turnover_pc_ratio DECIMAL(18, 6) NULL COMMENT '股指期权成交额Put/Call比' AFTER option_volume_pc_ratio",
+            ),
+        ]
+        source_label_by_prefix = {
+            'top20': '前20机构',
+            'citic': '中信代客',
+        }
+        previous_column = 'option_turnover_pc_ratio'
+        for field in self.QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS:
+            parts = field.split('_')
+            source_prefix = parts[1] if len(parts) > 1 else ''
+            window = parts[-1].removesuffix('d')
+            source_label = source_label_by_prefix.get(source_prefix, source_prefix)
+            column_definitions.append(
+                (
+                    field,
+                    f"ADD COLUMN {field} DECIMAL(18, 6) NULL COMMENT '{source_label}股指期货净空单{window}交易日增量' AFTER {previous_column}",
+                )
+            )
+            previous_column = field
+        basis_label_by_kind = {
+            'main': '主连',
+            'month': '月连',
+        }
+        for field in self.QUANT_INDEX_BASIS_DELTA_FIELDS:
+            parts = field.split('_')
+            basis_kind = parts[1] if len(parts) > 1 else ''
+            window = parts[-1].removesuffix('d')
+            basis_label = basis_label_by_kind.get(basis_kind, basis_kind)
+            column_definitions.append(
+                (
+                    field,
+                    f"ADD COLUMN {field} DECIMAL(18, 6) NULL COMMENT '{basis_label}期现差{window}交易日变化' AFTER {previous_column}",
+                )
+            )
+            previous_column = field
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SHOW COLUMNS FROM quant_index_dashboard_daily")
+                existing_columns = {str(row[0]).strip() for row in await cursor.fetchall()}
+                for column_name, alter_clause in column_definitions:
+                    if column_name in existing_columns:
+                        continue
+                    await cursor.execute(f"ALTER TABLE quant_index_dashboard_daily {alter_clause}")
+                    existing_columns.add(column_name)
+                await conn.commit()
+        self._quant_index_dashboard_option_pc_columns_ready = True
+
+    async def get_quant_index_dashboard_option_closes(self, product_prefixes, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_prefixes = [
+            str(product_prefix).strip().upper()
+            for product_prefix in (product_prefixes or [])
+            if str(product_prefix).strip()
+        ]
+        if not normalized_prefixes:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_prefixes))
+        query = (
+            f"SELECT trade_date, product_prefix, index_type, contract_month, option_type, "
+            f"strike_price, close_price, volume, turnover "
+            f"FROM option_cffex_rtj_daily_data "
+            f"WHERE product_prefix IN ({placeholders}) "
+            f"AND trade_date BETWEEN %s AND %s "
+            f"AND option_type IN ('CALL', 'PUT') "
+            f"AND strike_price IS NOT NULL "
+            f"AND close_price IS NOT NULL "
+            f"ORDER BY trade_date ASC, product_prefix ASC, contract_month ASC, strike_price ASC"
+        )
+        params = [*normalized_prefixes, str(start_date), str(end_date)]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
     async def upsert_quant_index_dashboard_daily(self, rows):
         if not rows:
             return 0
 
         if self.pool is None:
             await self.init_pool()
+        await self.ensure_quant_index_dashboard_option_pc_columns()
 
         sanitized_rows = [self._sanitize_quant_index_dashboard_row(row) for row in rows]
         deduped_rows = {}
@@ -3492,6 +4012,9 @@ class DbTools:
         if not sanitized_rows:
             return 0
 
+        cffex_delta_columns = list(self.QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS)
+        basis_delta_columns = list(self.QUANT_INDEX_BASIS_DELTA_FIELDS)
+        optional_metric_columns = [*cffex_delta_columns, *basis_delta_columns]
         values = [
             (
                 row['trade_date'],
@@ -3503,13 +4026,37 @@ class DbTools:
                 row['breadth_up_count'],
                 row['breadth_total_count'],
                 row['breadth_up_pct'] if row['breadth_up_pct'] is not None else 0,
+                row['option_pc_current_month'],
+                row['option_pc_current_month_contract_month'],
+                row['option_pc_current_month_special_flag'],
+                row['option_pc_current_month_special_note'],
+                row['option_pc_next_month'],
+                row['option_pc_next_month_contract_month'],
+                row['option_pc_next_month_special_flag'],
+                row['option_pc_next_month_special_note'],
+                row['option_pc_quarter_1'],
+                row['option_pc_quarter_1_contract_month'],
+                row['option_pc_quarter_1_special_flag'],
+                row['option_pc_quarter_1_special_note'],
+                row['option_pc_quarter_2'],
+                row['option_pc_quarter_2_contract_month'],
+                row['option_pc_quarter_2_special_flag'],
+                row['option_pc_quarter_2_special_note'],
+                row['option_volume_pc_ratio'],
+                row['option_turnover_pc_ratio'],
+                *[row[field] for field in optional_metric_columns],
             )
             for row in sanitized_rows
         ]
 
+        optional_metric_insert_columns = ",\n                    ".join(optional_metric_columns)
+        optional_metric_placeholders = ", ".join(["%s"] * len(optional_metric_columns))
+        optional_metric_update_assignments = ",\n                    ".join(
+            f"{field} = VALUES({field})" for field in optional_metric_columns
+        )
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                query = """
+                query = f"""
                 INSERT INTO quant_index_dashboard_daily (
                     trade_date,
                     index_code,
@@ -3519,8 +4066,27 @@ class DbTools:
                     month_basis,
                     breadth_up_count,
                     breadth_total_count,
-                    breadth_up_pct
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    breadth_up_pct,
+                    option_pc_current_month,
+                    option_pc_current_month_contract_month,
+                    option_pc_current_month_special_flag,
+                    option_pc_current_month_special_note,
+                    option_pc_next_month,
+                    option_pc_next_month_contract_month,
+                    option_pc_next_month_special_flag,
+                    option_pc_next_month_special_note,
+                    option_pc_quarter_1,
+                    option_pc_quarter_1_contract_month,
+                    option_pc_quarter_1_special_flag,
+                    option_pc_quarter_1_special_note,
+                    option_pc_quarter_2,
+                    option_pc_quarter_2_contract_month,
+                    option_pc_quarter_2_special_flag,
+                    option_pc_quarter_2_special_note,
+                    option_volume_pc_ratio,
+                    option_turnover_pc_ratio,
+                    {optional_metric_insert_columns}
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {optional_metric_placeholders})
                 ON DUPLICATE KEY UPDATE
                     index_name = VALUES(index_name),
                     emotion_value = VALUES(emotion_value),
@@ -3529,6 +4095,25 @@ class DbTools:
                     breadth_up_count = VALUES(breadth_up_count),
                     breadth_total_count = VALUES(breadth_total_count),
                     breadth_up_pct = VALUES(breadth_up_pct),
+                    option_pc_current_month = VALUES(option_pc_current_month),
+                    option_pc_current_month_contract_month = VALUES(option_pc_current_month_contract_month),
+                    option_pc_current_month_special_flag = VALUES(option_pc_current_month_special_flag),
+                    option_pc_current_month_special_note = VALUES(option_pc_current_month_special_note),
+                    option_pc_next_month = VALUES(option_pc_next_month),
+                    option_pc_next_month_contract_month = VALUES(option_pc_next_month_contract_month),
+                    option_pc_next_month_special_flag = VALUES(option_pc_next_month_special_flag),
+                    option_pc_next_month_special_note = VALUES(option_pc_next_month_special_note),
+                    option_pc_quarter_1 = VALUES(option_pc_quarter_1),
+                    option_pc_quarter_1_contract_month = VALUES(option_pc_quarter_1_contract_month),
+                    option_pc_quarter_1_special_flag = VALUES(option_pc_quarter_1_special_flag),
+                    option_pc_quarter_1_special_note = VALUES(option_pc_quarter_1_special_note),
+                    option_pc_quarter_2 = VALUES(option_pc_quarter_2),
+                    option_pc_quarter_2_contract_month = VALUES(option_pc_quarter_2_contract_month),
+                    option_pc_quarter_2_special_flag = VALUES(option_pc_quarter_2_special_flag),
+                    option_pc_quarter_2_special_note = VALUES(option_pc_quarter_2_special_note),
+                    option_volume_pc_ratio = VALUES(option_volume_pc_ratio),
+                    option_turnover_pc_ratio = VALUES(option_turnover_pc_ratio),
+                    {optional_metric_update_assignments},
                     updated_at = CURRENT_TIMESTAMP
                 """
                 await cursor.executemany(query, values)

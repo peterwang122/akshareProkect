@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import random
 import subprocess
 import threading
@@ -515,6 +516,35 @@ class SchedulerRequestHandler(BaseHTTPRequestHandler):
 
 
 def inspect_listening_port_owner(port):
+    if not platform.system().lower().startswith("win"):
+        for command in (
+            ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+            ["netstat", "-anv"],
+        ):
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except Exception:
+                continue
+
+            target = f":{int(port)}"
+            for raw_line in (result.stdout or "").splitlines():
+                line = raw_line.strip()
+                if not line or target not in line or "LISTEN" not in line.upper():
+                    continue
+                parts = line.split()
+                owner = {"pid": None, "image_name": None}
+                if command[0] == "lsof" and len(parts) >= 2 and parts[1].isdigit():
+                    owner["pid"] = int(parts[1])
+                    owner["image_name"] = parts[0]
+                return owner
+        return None
+
     try:
         result = subprocess.run(
             ["netstat", "-ano", "-p", "TCP"],

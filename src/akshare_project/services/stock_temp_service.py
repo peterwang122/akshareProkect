@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,8 +10,9 @@ from typing import Awaitable, Callable, Dict
 
 import requests
 
-from akshare_project.collectors import cffex, etf, forex, futures, index, option, quant_index, stock
+from akshare_project.collectors import cffex, etf, excel_emotion, forex, futures, index, option, quant_index, stock
 from akshare_project.core.logging_utils import echo_and_log, get_logger
+from akshare_project.core.network import without_proxy_env
 from akshare_project.core.paths import ensure_runtime_layout, get_config_dir
 
 DEFAULT_HOST = "127.0.0.1"
@@ -26,6 +28,7 @@ class DailyRoute:
     path: str
     task_name: str
     handler: AsyncHandler
+    direct_network: bool = False
 
 
 def print(*args, **kwargs):
@@ -95,26 +98,37 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             path="/collect-stock-daily",
             task_name="stock_daily",
             handler=stock.sync_daily,
+            direct_network=True,
+        ),
+        "/collect-stock-exchange-official-daily": DailyRoute(
+            path="/collect-stock-exchange-official-daily",
+            task_name="stock_exchange_official_daily",
+            handler=stock.sync_exchange_official_daily,
+            direct_network=True,
         ),
         "/collect-index-cn-daily": DailyRoute(
             path="/collect-index-cn-daily",
             task_name="index_cn_daily",
             handler=index.sync_daily_from_spot,
+            direct_network=True,
         ),
         "/collect-index-bj50-daily": DailyRoute(
             path="/collect-index-bj50-daily",
             task_name="index_bj50_daily",
             handler=index.sync_daily_special_index,
+            direct_network=True,
         ),
         "/collect-cffex-daily": DailyRoute(
             path="/collect-cffex-daily",
             task_name="cffex_daily",
             handler=lambda: cffex.sync_latest_daily_data(headless=True),
+            direct_network=True,
         ),
         "/collect-forex-daily": DailyRoute(
             path="/collect-forex-daily",
             task_name="forex_daily",
             handler=forex.sync_daily_from_history,
+            direct_network=True,
         ),
         "/collect-usd-index-daily": DailyRoute(
             path="/collect-usd-index-daily",
@@ -125,6 +139,7 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             path="/collect-futures-daily",
             task_name="futures_daily",
             handler=futures.sync_today,
+            direct_network=True,
         ),
         "/collect-us-index-futures-daily": DailyRoute(
             path="/collect-us-index-futures-daily",
@@ -148,26 +163,36 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             path="/collect-etf-daily",
             task_name="etf_daily",
             handler=etf.sync_daily,
+            direct_network=True,
         ),
         "/collect-option-daily": DailyRoute(
             path="/collect-option-daily",
             task_name="option_daily",
             handler=lambda: option.sync_daily(headless=True),
+            direct_network=True,
         ),
         "/collect-quant-index-daily": DailyRoute(
             path="/collect-quant-index-daily",
             task_name="quant_index_daily",
             handler=quant_index.sync_daily,
+            direct_network=True,
         ),
         "/collect-index-qvix-daily": DailyRoute(
             path="/collect-index-qvix-daily",
             task_name="index_qvix_daily",
             handler=index.sync_daily_qvix,
+            direct_network=True,
         ),
         "/collect-index-news-sentiment-daily": DailyRoute(
             path="/collect-index-news-sentiment-daily",
             task_name="index_news_sentiment_daily",
             handler=index.sync_daily_news_sentiment_scope,
+            direct_network=True,
+        ),
+        "/import-emotion-excel": DailyRoute(
+            path="/import-emotion-excel",
+            task_name="excel_emotion_import",
+            handler=lambda: excel_emotion.import_excel("情绪指标.xlsx"),
         ),
         "/collect-index-us-vix-daily": DailyRoute(
             path="/collect-index-us-vix-daily",
@@ -265,7 +290,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
         return payload
 
     def _run_daily_route(self, route: DailyRoute, payload: dict):
-        if payload:
+        if payload and route.task_name != "stock_exchange_official_daily":
             self._send_json(
                 400,
                 {
@@ -278,7 +303,23 @@ class StockTempHandler(BaseHTTPRequestHandler):
         started_at = now_text()
         started_monotonic = time.perf_counter()
         try:
-            result = asyncio.run(route.handler())
+            context = without_proxy_env() if route.direct_network else nullcontext()
+            with context:
+                if route.task_name == "stock_exchange_official_daily":
+                    allowed_keys = {"target_date"}
+                    unexpected_keys = sorted(set(payload) - allowed_keys)
+                    if unexpected_keys:
+                        self._send_json(
+                            400,
+                            {
+                                "status": "INVALID_REQUEST",
+                                "error": f"unsupported stock_exchange_official_daily fields: {unexpected_keys}",
+                            },
+                        )
+                        return
+                    result = asyncio.run(route.handler(target_date=payload.get("target_date")))
+                else:
+                    result = asyncio.run(route.handler())
         except Exception as exc:
             finished_at = now_text()
             duration_seconds = time.perf_counter() - started_monotonic
@@ -344,13 +385,14 @@ class StockTempHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = asyncio.run(
-                stock.collect_hfq_for_request(
-                    stock_code=payload.get("stock_code"),
-                    start_date=payload.get("start_date"),
-                    end_date=payload.get("end_date"),
+            with without_proxy_env():
+                result = asyncio.run(
+                    stock.collect_hfq_for_request(
+                        stock_code=payload.get("stock_code"),
+                        start_date=payload.get("start_date"),
+                        end_date=payload.get("end_date"),
+                    )
                 )
-            )
             self._send_json(200, result)
         except ValueError as exc:
             self._send_json(400, {"status": "INVALID_REQUEST", "error": str(exc)})

@@ -1,8 +1,8 @@
 param(
     [string]$TaskName = "AkShareDailyCollection",
-    [string]$RepoRoot = "C:\Users\Administrator\PycharmProjects\akshareProkect",
-    [string]$PythonExe = "C:\Users\Administrator\miniconda3\envs\akshareProkect\python.exe",
-    [string]$RunScriptPath = "C:\Users\Administrator\PycharmProjects\akshareProkect\scripts\run_daily_collection.ps1",
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [string]$PythonExe = "python",
+    [string]$RunScriptPath = (Join-Path $PSScriptRoot "run_daily_collection.ps1"),
     [string]$AtTime = "17:00"
 )
 

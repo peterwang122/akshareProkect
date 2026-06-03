@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
-from akshare_project.core.paths import get_input_dir
+from akshare_project.core.paths import get_input_dir, get_input_path
 from akshare_project.collectors.quant_index import refresh_trade_dates
 from akshare_project.db.db_tool import DbTools
 
@@ -32,9 +32,15 @@ def normalize_date(value):
     return timestamp.strftime("%Y-%m-%d")
 
 
-def resolve_excel_path():
+def resolve_excel_path(raw_path=None):
+    if raw_path:
+        path = Path(str(raw_path).strip())
+        if path.is_absolute():
+            return path.resolve()
+        return get_input_path(str(path)).resolve()
+
     if len(sys.argv) > 1:
-        return Path(sys.argv[1]).resolve()
+        return resolve_excel_path(sys.argv[1])
 
     for path in get_input_dir().glob("*.xlsx"):
         if not path.name.startswith("~$"):
@@ -80,6 +86,59 @@ def parse_excel_rows(excel_path):
     return rows
 
 
+def build_import_summary(result):
+    affected_dates = result.get("affected_dates", [])
+    return (
+        "excel emotion import finished, "
+        f"parsed rows: {result.get('parsed_rows', 0)}, "
+        f"inserted rows: {result.get('inserted_rows', 0)}, "
+        f"updated rows: {result.get('updated_rows', 0)}, "
+        f"affected dates: {','.join(affected_dates) if affected_dates else 'NONE'}, "
+        f"quant refreshed: {result.get('quant_refreshed', 0)}"
+    )
+
+
+async def import_excel(excel_path=None):
+    resolved_excel_path = resolve_excel_path(excel_path)
+    rows = parse_excel_rows(resolved_excel_path)
+    if not rows:
+        result = {
+            "status": "UNCHANGED",
+            "excel_path": str(resolved_excel_path),
+            "parsed_rows": 0,
+            "inserted_rows": 0,
+            "updated_rows": 0,
+            "affected_dates": [],
+            "quant_refreshed": 0,
+            "message": "No valid emotion rows parsed from xlsx.",
+        }
+        print(result["message"])
+        return result
+
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        result = await db_tools.batch_excel_emotion_data(rows)
+        affected_dates = result.get("affected_dates", [])
+        quant_affected = 0
+        if affected_dates:
+            quant_affected = await refresh_trade_dates(db_tools, affected_dates)
+        result = {
+            "status": "SUCCESS",
+            "excel_path": str(resolved_excel_path),
+            "parsed_rows": result.get("parsed_rows", 0),
+            "inserted_rows": result.get("inserted_rows", 0),
+            "updated_rows": result.get("updated_rows", 0),
+            "affected_dates": affected_dates,
+            "quant_refreshed": quant_affected,
+        }
+        print(build_import_summary(result))
+        return result
+    finally:
+        await db_tools.close()
+
+
 async def run():
     excel_path = resolve_excel_path()
     rows = parse_excel_rows(excel_path)
@@ -96,14 +155,7 @@ async def run():
         quant_affected = 0
         if affected_dates:
             quant_affected = await refresh_trade_dates(db_tools, affected_dates)
-        print(
-            "excel emotion import finished, "
-            f"parsed rows: {result.get('parsed_rows', 0)}, "
-            f"inserted rows: {result.get('inserted_rows', 0)}, "
-            f"updated rows: {result.get('updated_rows', 0)}, "
-            f"affected dates: {','.join(affected_dates) if affected_dates else 'NONE'}, "
-            f"quant refreshed: {quant_affected}"
-        )
+        print(build_import_summary({**result, "quant_refreshed": quant_affected}))
     finally:
         await db_tools.close()
 
