@@ -1,4 +1,6 @@
 import asyncio
+import math
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -10,11 +12,17 @@ LOGGER = get_logger("quant_index")
 INDEX_NAME_ORDER = [
     "上证指数",
     "上证50",
+    "科创50",
     "沪深300",
     "中证500",
     "中证1000",
 ]
-CORE_INDEX_NAMES = INDEX_NAME_ORDER[1:]
+CORE_INDEX_NAMES = [
+    "上证50",
+    "沪深300",
+    "中证500",
+    "中证1000",
+]
 HK_INDEX_NAME_ORDER = [
     "恒生指数",
     "恒生中国企业指数",
@@ -28,6 +36,7 @@ ALL_INDEX_NAME_ORDER = [*INDEX_NAME_ORDER, *HK_INDEX_NAME_ORDER, *US_INDEX_NAME_
 INDEX_CODE_FALLBACKS = {
     "上证指数": "sh000001",
     "上证50": "sh000016",
+    "科创50": "sh000688",
     "沪深300": "sh000300",
     "中证500": "sh000905",
     "中证1000": "sh000852",
@@ -76,6 +85,45 @@ INDEX_NAME_BY_OPTION_PRODUCT = {
     product_prefix: index_name
     for index_name, product_prefix in INDEX_OPTION_PRODUCTS.items()
 }
+EXCHANGE_OPTION_PRODUCTS_BY_INDEX = {
+    "上证50": [("SSE", "510050")],
+    "沪深300": [("SSE", "510300"), ("SZSE", "159919")],
+    "中证500": [("SSE", "510500"), ("SZSE", "159922")],
+    "科创50": [("SSE", "588000"), ("SSE", "588080")],
+}
+EXCHANGE_OPTION_PRODUCT_META = {
+    ("SSE", "510050"): {"product_name": "上证50ETF期权"},
+    ("SSE", "510300"): {"product_name": "沪深300ETF期权"},
+    ("SZSE", "159919"): {"product_name": "沪深300ETF期权"},
+    ("SSE", "510500"): {"product_name": "中证500ETF期权"},
+    ("SZSE", "159922"): {"product_name": "中证500ETF期权"},
+    ("SSE", "588000"): {"product_name": "科创50ETF期权"},
+    ("SSE", "588080"): {"product_name": "科创板50ETF期权"},
+}
+EXCHANGE_LABELS = {
+    "SSE": "上交所",
+    "SZSE": "深交所",
+    "CFFEX": "中金所",
+}
+OPTION_VIX_SOURCES_BY_INDEX = {
+    "上证50": [("CFFEX", "HO"), ("SSE", "510050")],
+    "沪深300": [("CFFEX", "IO"), ("SSE", "510300"), ("SZSE", "159919")],
+    "中证500": [("SSE", "510500"), ("SZSE", "159922")],
+    "中证1000": [("CFFEX", "MO")],
+    "科创50": [("SSE", "588000"), ("SSE", "588080")],
+}
+OPTION_VIX_PRODUCT_NAMES = {
+    ("CFFEX", "HO"): "上证50股指期权",
+    ("CFFEX", "IO"): "沪深300股指期权",
+    ("CFFEX", "MO"): "中证1000股指期权",
+    **{
+        source: metadata["product_name"]
+        for source, metadata in EXCHANGE_OPTION_PRODUCT_META.items()
+    },
+}
+OPTION_VIX_ROLL_DAYS = 7
+OPTION_VIX_TARGET_DAYS = 30
+MINUTES_PER_YEAR = 365 * 24 * 60
 OPTION_PC_INDEX_CLOSE_OVERRIDES = {
     ("2024-09-30", "MO"): 5700.0,
     ("2025-04-07", "MO"): 5500.0,
@@ -222,6 +270,23 @@ def empty_option_flow_pc_payload():
         "option_volume_pc_ratio": None,
         "option_turnover_pc_ratio": None,
     }
+
+
+def empty_exchange_option_pc_payload(exchange, underlying_code):
+    payload = {
+        "source_key": f"{str(exchange).strip().lower()}:{str(underlying_code).strip()}",
+        "exchange": str(exchange).strip().upper(),
+        "exchange_label": EXCHANGE_LABELS.get(str(exchange).strip().upper(), str(exchange).strip().upper()),
+        "product_code": str(underlying_code).strip(),
+        "product_name": (
+            EXCHANGE_OPTION_PRODUCT_META
+            .get((str(exchange).strip().upper(), str(underlying_code).strip()), {})
+            .get("product_name")
+        ),
+    }
+    payload.update(empty_option_pc_payload())
+    payload.update(empty_option_flow_pc_payload())
+    return payload
 
 
 def empty_cffex_net_short_delta_payload():
@@ -524,6 +589,534 @@ def build_index_option_flow_pc_map(option_rows):
     return result
 
 
+def is_standard_exchange_option_contract(row):
+    trade_code = str(row.get("contract_trade_code") or "").strip().upper()
+    return bool(re.search(r"[CP]\d{4}M\d+", trade_code))
+
+
+def is_exchange_option_contract_expired(row, trade_date):
+    trade_day = parse_normalized_date(trade_date)
+    last_trade_day = parse_normalized_date(row.get("last_trade_date"))
+    if trade_day and last_trade_day:
+        return trade_day >= last_trade_day
+    return is_contract_month_expired_for_trade_date(row.get("contract_month"), trade_date)
+
+
+def build_exchange_option_price_payload(trade_date, etf_close, product_rows):
+    grouped_by_month_type = {}
+    for row in product_rows or []:
+        if is_exchange_option_contract_expired(row, trade_date):
+            continue
+        if not is_standard_exchange_option_contract(row):
+            continue
+        contract_month = normalize_contract_month(row.get("contract_month"))
+        option_type = str(row.get("option_type") or "").strip().upper()
+        strike_price = to_float(row.get("strike_price"))
+        close_price = to_float(row.get("close_price"))
+        if (
+            not contract_month
+            or option_type not in {"CALL", "PUT"}
+            or strike_price is None
+            or close_price is None
+        ):
+            continue
+        grouped_by_month_type.setdefault((contract_month, option_type), {})[strike_price] = close_price
+
+    selected_months = select_option_pc_contract_months(
+        (contract_month for contract_month, _option_type in grouped_by_month_type),
+    )
+    payload = empty_option_pc_payload()
+    for bucket in OPTION_PC_BUCKETS:
+        contract_month = selected_months.get(bucket["key"])
+        if not contract_month:
+            continue
+        payload[bucket["month_field"]] = contract_month
+        put_price = interpolate_option_price(
+            grouped_by_month_type.get((contract_month, "PUT"), {}),
+            etf_close,
+        )
+        call_price = interpolate_option_price(
+            grouped_by_month_type.get((contract_month, "CALL"), {}),
+            etf_close,
+        )
+        if put_price is None or call_price is None or call_price <= 0:
+            continue
+        payload[bucket["ratio_field"]] = put_price / call_price
+    return payload
+
+
+def build_exchange_option_flow_payload(trade_date, product_rows):
+    totals = {
+        "CALL": {"volume": 0.0, "turnover": 0.0, "volume_seen": False, "turnover_seen": False},
+        "PUT": {"volume": 0.0, "turnover": 0.0, "volume_seen": False, "turnover_seen": False},
+    }
+    for row in product_rows or []:
+        if is_exchange_option_contract_expired(row, trade_date):
+            continue
+        option_type = str(row.get("option_type") or "").strip().upper()
+        if option_type not in totals:
+            continue
+        volume = to_float(row.get("volume"))
+        turnover = to_float(row.get("turnover"))
+        if volume is not None and volume >= 0:
+            totals[option_type]["volume"] += volume
+            totals[option_type]["volume_seen"] = True
+        if turnover is not None and turnover >= 0:
+            totals[option_type]["turnover"] += turnover
+            totals[option_type]["turnover_seen"] = True
+
+    payload = empty_option_flow_pc_payload()
+    if totals["CALL"]["volume_seen"] and totals["CALL"]["volume"] > 0:
+        payload["option_volume_pc_ratio"] = totals["PUT"]["volume"] / totals["CALL"]["volume"]
+    if totals["CALL"]["turnover_seen"] and totals["CALL"]["turnover"] > 0:
+        payload["option_turnover_pc_ratio"] = totals["PUT"]["turnover"] / totals["CALL"]["turnover"]
+    return payload
+
+
+def build_etf_close_map(rows):
+    result = {}
+    for row in rows or []:
+        etf_code = str(row.get("etf_code") or "").strip()
+        trade_date = normalize_date_text(row.get("trade_date"))
+        close_price = to_float(row.get("close_price"))
+        if not etf_code or not trade_date or close_price is None:
+            continue
+        result.setdefault((trade_date, etf_code), close_price)
+    return result
+
+
+def build_exchange_option_pc_map(option_rows, etf_close_map):
+    rows_by_trade_source = {}
+    for row in option_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        exchange = str(row.get("exchange") or "").strip().upper()
+        underlying_code = str(row.get("underlying_code") or "").strip()
+        if not trade_date or (exchange, underlying_code) not in EXCHANGE_OPTION_PRODUCT_META:
+            continue
+        rows_by_trade_source.setdefault((trade_date, exchange, underlying_code), []).append(row)
+
+    index_names_by_source = {
+        (exchange, product_code): index_name
+        for index_name, sources in EXCHANGE_OPTION_PRODUCTS_BY_INDEX.items()
+        for exchange, product_code in sources
+    }
+    result = {}
+    for (trade_date, exchange, underlying_code), product_rows in rows_by_trade_source.items():
+        etf_close = etf_close_map.get((trade_date, underlying_code))
+        if etf_close is None:
+            continue
+        payload = empty_exchange_option_pc_payload(exchange, underlying_code)
+        payload.update(
+            build_exchange_option_price_payload(
+                trade_date,
+                etf_close,
+                product_rows,
+            )
+        )
+        payload.update(build_exchange_option_flow_payload(trade_date, product_rows))
+        index_name = index_names_by_source[(exchange, underlying_code)]
+        result.setdefault((trade_date, index_name), {})[payload["source_key"]] = payload
+    return result
+
+
+def build_risk_free_rate_curve_map(rate_rows):
+    curves = {}
+    for row in rate_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        tenor_days = to_int(row.get("tenor_days"))
+        rate_decimal = to_float(row.get("rate_decimal"))
+        if (
+            not trade_date
+            or tenor_days <= 0
+            or rate_decimal is None
+            or rate_decimal < 0
+        ):
+            continue
+        curves.setdefault(trade_date, {})[tenor_days] = rate_decimal
+    return curves
+
+
+def resolve_risk_free_curve(rate_curve_map, trade_date):
+    trade_date_text = normalize_date_text(trade_date)
+    eligible_dates = [
+        curve_date
+        for curve_date in rate_curve_map
+        if curve_date <= trade_date_text
+    ]
+    if not eligible_dates:
+        return None, {}
+    curve_date = max(eligible_dates)
+    return curve_date, rate_curve_map[curve_date]
+
+
+def interpolate_risk_free_rate(rate_curve, tenor_days):
+    target_days = to_float(tenor_days)
+    points = sorted(
+        (to_float(days), to_float(rate))
+        for days, rate in (rate_curve or {}).items()
+        if to_float(days) is not None and to_float(rate) is not None
+    )
+    if target_days is None or not points:
+        return None
+    if target_days <= points[0][0]:
+        return points[0][1]
+    if target_days >= points[-1][0]:
+        return points[-1][1]
+    for index in range(1, len(points)):
+        lower_days, lower_rate = points[index - 1]
+        upper_days, upper_rate = points[index]
+        if target_days <= upper_days:
+            weight = (target_days - lower_days) / (upper_days - lower_days)
+            return lower_rate + (upper_rate - lower_rate) * weight
+    return None
+
+
+def resolve_option_vix_price(row, price_mode="close"):
+    if price_mode == "open":
+        candidates = (("open_price", row.get("open_price")),)
+    else:
+        candidates = (
+            ("close_price", row.get("close_price")),
+            ("settle_price", row.get("settle_price")),
+            ("pre_settle_price", row.get("pre_settle_price")),
+        )
+    for field_name, raw_value in candidates:
+        value = to_float(raw_value)
+        if value is not None and value > 0:
+            return value, field_name
+    return None, None
+
+
+def resolve_option_vix_expiry(row, exchange):
+    if exchange in {"SSE", "SZSE"}:
+        return (
+            parse_normalized_date(row.get("last_trade_date"))
+            or parse_normalized_date(row.get("expire_date"))
+        )
+    return third_friday_of_contract_month(row.get("contract_month"))
+
+
+def calculate_option_term_variance(
+    product_rows,
+    trade_date,
+    expiry_date,
+    risk_free_rate,
+    price_mode="close",
+):
+    trade_day = parse_normalized_date(trade_date)
+    if not trade_day or not expiry_date or expiry_date <= trade_day:
+        return None
+    minutes_to_expiry = (expiry_date - trade_day).days * 24 * 60
+    if minutes_to_expiry <= 0:
+        return None
+    time_to_expiry = minutes_to_expiry / MINUTES_PER_YEAR
+
+    strike_prices = {}
+    price_basis_counts = {}
+    pre_settle_sources = set()
+    for row in product_rows or []:
+        option_type = str(row.get("option_type") or "").strip().upper()
+        strike_price = to_float(row.get("strike_price"))
+        if option_type not in {"CALL", "PUT"} or strike_price is None:
+            continue
+        price, price_basis = resolve_option_vix_price(row, price_mode=price_mode)
+        if price is None:
+            continue
+        strike_prices.setdefault(strike_price, {})[option_type] = price
+        price_basis_counts[price_basis] = price_basis_counts.get(price_basis, 0) + 1
+        if price_basis == "pre_settle_price":
+            pre_settle_source = str(row.get("pre_settle_source") or "").strip()
+            if pre_settle_source:
+                pre_settle_sources.add(pre_settle_source)
+
+    paired_strikes = [
+        (strike, prices["CALL"], prices["PUT"])
+        for strike, prices in strike_prices.items()
+        if "CALL" in prices and "PUT" in prices
+    ]
+    if len(paired_strikes) < 2:
+        return None
+    forward_strike, call_price, put_price = min(
+        paired_strikes,
+        key=lambda item: abs(item[1] - item[2]),
+    )
+    forward = forward_strike + math.exp(risk_free_rate * time_to_expiry) * (
+        call_price - put_price
+    )
+    k0_candidates = [strike for strike in strike_prices if strike <= forward]
+    if not k0_candidates:
+        return None
+    k0 = max(k0_candidates)
+
+    selected_prices = {}
+    for strike, prices in strike_prices.items():
+        if strike < k0 and "PUT" in prices:
+            selected_prices[strike] = prices["PUT"]
+        elif strike > k0 and "CALL" in prices:
+            selected_prices[strike] = prices["CALL"]
+        elif strike == k0 and "CALL" in prices and "PUT" in prices:
+            selected_prices[strike] = (prices["CALL"] + prices["PUT"]) / 2
+
+    strikes = sorted(selected_prices)
+    if len(strikes) < 3 or k0 not in selected_prices:
+        return None
+    weighted_sum = 0.0
+    for index, strike in enumerate(strikes):
+        if index == 0:
+            delta_k = strikes[1] - strike
+        elif index == len(strikes) - 1:
+            delta_k = strike - strikes[index - 1]
+        else:
+            delta_k = (strikes[index + 1] - strikes[index - 1]) / 2
+        if delta_k <= 0 or strike <= 0:
+            continue
+        weighted_sum += (
+            delta_k
+            / (strike * strike)
+            * math.exp(risk_free_rate * time_to_expiry)
+            * selected_prices[strike]
+        )
+    variance = (
+        2 / time_to_expiry * weighted_sum
+        - 1 / time_to_expiry * ((forward / k0) - 1) ** 2
+    )
+    if not math.isfinite(variance) or variance <= 0:
+        return None
+    return {
+        "variance": variance,
+        "minutes_to_expiry": minutes_to_expiry,
+        "days_to_expiry": minutes_to_expiry / (24 * 60),
+        "forward": forward,
+        "k0": k0,
+        "strike_count": len(strikes),
+        "risk_free_rate": risk_free_rate,
+        "price_basis_counts": price_basis_counts,
+        "pre_settle_sources": sorted(pre_settle_sources),
+    }
+
+
+def calculate_constant_30d_vix(term_results):
+    valid_terms = sorted(
+        (
+            item
+            for item in (term_results or [])
+            if item
+            and item["minutes_to_expiry"] > OPTION_VIX_ROLL_DAYS * 24 * 60
+        ),
+        key=lambda item: item["minutes_to_expiry"],
+    )
+    if not valid_terms:
+        return None
+    near = valid_terms[0]
+    target_minutes = OPTION_VIX_TARGET_DAYS * 24 * 60
+    if near["minutes_to_expiry"] >= target_minutes:
+        annual_variance = near["variance"]
+        next_term = None
+    else:
+        next_candidates = [
+            item
+            for item in valid_terms[1:]
+            if item["minutes_to_expiry"] > near["minutes_to_expiry"]
+        ]
+        if not next_candidates:
+            return None
+        next_term = next_candidates[0]
+        near_minutes = near["minutes_to_expiry"]
+        next_minutes = next_term["minutes_to_expiry"]
+        denominator = next_minutes - near_minutes
+        if denominator <= 0:
+            return None
+        annual_variance = (
+            (
+                near["variance"]
+                * (near_minutes / MINUTES_PER_YEAR)
+                * (next_minutes - target_minutes)
+                / denominator
+            )
+            + (
+                next_term["variance"]
+                * (next_minutes / MINUTES_PER_YEAR)
+                * (target_minutes - near_minutes)
+                / denominator
+            )
+        ) * (MINUTES_PER_YEAR / target_minutes)
+    if not math.isfinite(annual_variance) or annual_variance <= 0:
+        return None
+    return {
+        "vix_close": 100 * math.sqrt(annual_variance),
+        "near": near,
+        "next": next_term,
+    }
+
+
+def build_option_vix_payload(
+    trade_date,
+    exchange,
+    product_code,
+    product_rows,
+    rate_curve_date,
+    rate_curve,
+):
+    normalized_exchange = str(exchange or "").strip().upper()
+    normalized_product = str(product_code or "").strip().upper()
+    rows_by_expiry = {}
+    for row in product_rows or []:
+        if normalized_exchange in {"SSE", "SZSE"} and not is_standard_exchange_option_contract(row):
+            continue
+        expiry_date = resolve_option_vix_expiry(row, normalized_exchange)
+        if expiry_date is None:
+            continue
+        rows_by_expiry.setdefault(expiry_date, []).append(row)
+
+    def calculate_for_mode(price_mode):
+        term_results = []
+        for expiry_date, expiry_rows in rows_by_expiry.items():
+            trade_day = parse_normalized_date(trade_date)
+            if not trade_day or expiry_date <= trade_day:
+                continue
+            days_to_expiry = (expiry_date - trade_day).days
+            risk_free_rate = interpolate_risk_free_rate(rate_curve, days_to_expiry)
+            if risk_free_rate is None:
+                continue
+            term_result = calculate_option_term_variance(
+                expiry_rows,
+                trade_date,
+                expiry_date,
+                risk_free_rate,
+                price_mode=price_mode,
+            )
+            if term_result is None:
+                continue
+            term_result["expiry_date"] = expiry_date.isoformat()
+            contract_months = sorted(
+                {
+                    normalize_contract_month(row.get("contract_month"))
+                    for row in expiry_rows
+                    if normalize_contract_month(row.get("contract_month"))
+                },
+                key=contract_month_sort_key,
+            )
+            term_result["contract_month"] = (
+                contract_months[0] if contract_months else None
+            )
+            term_results.append(term_result)
+        return calculate_constant_30d_vix(term_results)
+
+    open_result = calculate_for_mode("open")
+    close_result = calculate_for_mode("close")
+    result = close_result or open_result
+    if result is None:
+        return None
+    near = result["near"]
+    next_term = result["next"]
+    basis_counts = dict(near.get("price_basis_counts") or {})
+    pre_settle_sources = set(near.get("pre_settle_sources") or [])
+    if next_term:
+        for key, value in (next_term.get("price_basis_counts") or {}).items():
+            basis_counts[key] = basis_counts.get(key, 0) + value
+        pre_settle_sources.update(next_term.get("pre_settle_sources") or [])
+    return {
+        "source_key": f"{normalized_exchange.lower()}:{normalized_product}",
+        "exchange": normalized_exchange,
+        "exchange_label": EXCHANGE_LABELS.get(
+            normalized_exchange,
+            normalized_exchange,
+        ),
+        "product_code": normalized_product,
+        "product_name": OPTION_VIX_PRODUCT_NAMES.get(
+            (normalized_exchange, normalized_product),
+            normalized_product,
+        ),
+        "vix_open": open_result["vix_close"] if open_result else None,
+        "vix_close": close_result["vix_close"] if close_result else None,
+        "vix_high": max(
+            value
+            for value in (
+                open_result["vix_close"] if open_result else None,
+                close_result["vix_close"] if close_result else None,
+            )
+            if value is not None
+        ),
+        "vix_low": min(
+            value
+            for value in (
+                open_result["vix_close"] if open_result else None,
+                close_result["vix_close"] if close_result else None,
+            )
+            if value is not None
+        ),
+        "near_contract_month": near.get("contract_month"),
+        "near_expiry_date": near.get("expiry_date"),
+        "near_strike_count": near.get("strike_count"),
+        "next_contract_month": next_term.get("contract_month") if next_term else None,
+        "next_expiry_date": next_term.get("expiry_date") if next_term else None,
+        "next_strike_count": next_term.get("strike_count") if next_term else None,
+        "risk_free_curve_date": normalize_date_text(rate_curve_date),
+        "near_risk_free_rate": near.get("risk_free_rate"),
+        "next_risk_free_rate": (
+            next_term.get("risk_free_rate") if next_term else None
+        ),
+        "price_basis_counts": basis_counts,
+        "pre_settle_sources": sorted(pre_settle_sources),
+        "calculation_method": "ivix_30d_option_open_and_close",
+    }
+
+
+def build_option_vix_map(cffex_rows, exchange_rows, rate_rows):
+    rate_curve_map = build_risk_free_rate_curve_map(rate_rows)
+    rows_by_trade_source = {}
+    for row in cffex_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        product_code = str(row.get("product_prefix") or "").strip().upper()
+        if trade_date and product_code in {"HO", "IO", "MO"}:
+            rows_by_trade_source.setdefault(
+                (trade_date, "CFFEX", product_code),
+                [],
+            ).append(row)
+    for row in exchange_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        exchange = str(row.get("exchange") or "").strip().upper()
+        product_code = str(row.get("underlying_code") or "").strip()
+        if (
+            trade_date
+            and (exchange, product_code) in EXCHANGE_OPTION_PRODUCT_META
+        ):
+            rows_by_trade_source.setdefault(
+                (trade_date, exchange, product_code),
+                [],
+            ).append(row)
+
+    index_by_source = {
+        source: index_name
+        for index_name, sources in OPTION_VIX_SOURCES_BY_INDEX.items()
+        for source in sources
+    }
+    result = {}
+    for (trade_date, exchange, product_code), product_rows in rows_by_trade_source.items():
+        index_name = index_by_source.get((exchange, product_code))
+        if not index_name:
+            continue
+        rate_curve_date, rate_curve = resolve_risk_free_curve(
+            rate_curve_map,
+            trade_date,
+        )
+        if not rate_curve:
+            continue
+        payload = build_option_vix_payload(
+            trade_date,
+            exchange,
+            product_code,
+            product_rows,
+            rate_curve_date,
+            rate_curve,
+        )
+        if payload:
+            result.setdefault((trade_date, index_name), {})[
+                payload["source_key"]
+            ] = payload
+    return result
+
+
 def build_index_cffex_net_short_delta_map(position_rows, start_date=None, end_date=None):
     series = {}
     for row in position_rows or []:
@@ -791,12 +1384,16 @@ def build_dashboard_rows(
     breadth_map,
     option_pc_map=None,
     option_flow_pc_map=None,
+    exchange_option_pc_map=None,
+    option_vix_map=None,
     cffex_net_short_delta_map=None,
     basis_delta_trade_dates=None,
 ):
     rows = []
     option_pc_map = option_pc_map or {}
     option_flow_pc_map = option_flow_pc_map or {}
+    exchange_option_pc_map = exchange_option_pc_map or {}
+    option_vix_map = option_vix_map or {}
     cffex_net_short_delta_map = cffex_net_short_delta_map or {}
     basis_delta_dates = basis_delta_trade_dates or trade_dates
     raw_core_basis_by_date = build_raw_core_basis_by_date(basis_delta_dates, index_close_map, futures_close_map)
@@ -837,13 +1434,17 @@ def build_dashboard_rows(
                 emotion_value = sse_emotion
                 main_basis = sse_main_basis
                 month_basis = sse_month_basis
-            else:
+            elif index_name in CORE_INDEX_NAMES:
                 emotion_value = raw_core_emotions.get(index_name)
                 emotion_value = 50 if emotion_value is None else emotion_value
                 main_basis = raw_core_basis[index_name]["main_basis"]
                 month_basis = raw_core_basis[index_name]["month_basis"]
                 main_basis = 0 if main_basis is None else main_basis
                 month_basis = 0 if month_basis is None else month_basis
+            else:
+                emotion_value = 50
+                main_basis = 0
+                month_basis = 0
 
             option_pc_payload = option_pc_map.get((trade_date, index_name)) or empty_option_pc_payload()
             option_flow_pc_payload = option_flow_pc_map.get((trade_date, index_name)) or empty_option_flow_pc_payload()
@@ -864,6 +1465,8 @@ def build_dashboard_rows(
                 "breadth_up_pct": breadth["breadth_up_pct"],
                 **option_pc_payload,
                 **option_flow_pc_payload,
+                "exchange_option_pc_json": exchange_option_pc_map.get((trade_date, index_name)) or {},
+                "option_vix_json": option_vix_map.get((trade_date, index_name)) or {},
                 **cffex_delta_payload,
                 **basis_delta_payload,
             })
@@ -969,6 +1572,34 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         start_date,
         end_date,
     )
+    exchange_option_underlyings = sorted({
+        product_code
+        for sources in EXCHANGE_OPTION_PRODUCTS_BY_INDEX.values()
+        for _exchange, product_code in sources
+    })
+    exchange_option_rows = await db_tools.get_quant_index_dashboard_exchange_option_rows(
+        exchange_option_underlyings,
+        start_date,
+        end_date,
+    )
+    etf_close_rows = await db_tools.get_quant_index_dashboard_etf_closes(
+        exchange_option_underlyings,
+        start_date,
+        end_date,
+    )
+    exchange_option_pc_map = build_exchange_option_pc_map(
+        exchange_option_rows,
+        build_etf_close_map(etf_close_rows),
+    )
+    rate_rows = await db_tools.get_cn_risk_free_rate_rows(
+        shift_date_text(start_date, -14),
+        end_date,
+    )
+    option_vix_map = build_option_vix_map(
+        option_rows,
+        exchange_option_rows,
+        rate_rows,
+    )
     cffex_position_rows = await db_tools.get_quant_index_dashboard_cffex_net_short_positions(
         shift_date_text(start_date, -CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS),
         end_date,
@@ -983,6 +1614,8 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         breadth_map=build_breadth_map(breadth_rows),
         option_pc_map=build_index_option_pc_map(option_rows, cn_index_close_map),
         option_flow_pc_map=build_index_option_flow_pc_map(option_rows),
+        exchange_option_pc_map=exchange_option_pc_map,
+        option_vix_map=option_vix_map,
         cffex_net_short_delta_map=build_index_cffex_net_short_delta_map(
             cffex_position_rows,
             start_date=start_date,
@@ -1196,7 +1829,22 @@ async def backfill_history(start_date=None, end_date=None):
         else:
             actual_start = start_date
             actual_end = end_date
-        return await compute_and_upsert_range(db_tools, actual_start, actual_end)
+
+        cursor_date = datetime.strptime(actual_start, "%Y-%m-%d").date()
+        final_date = datetime.strptime(actual_end, "%Y-%m-%d").date()
+        affected = 0
+        while cursor_date <= final_date:
+            chunk_end = min(
+                final_date,
+                datetime(cursor_date.year, 12, 31).date(),
+            )
+            affected += await compute_and_upsert_range(
+                db_tools,
+                cursor_date.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+            )
+            cursor_date = chunk_end + timedelta(days=1)
+        return affected
     finally:
         await db_tools.close()
 

@@ -12,6 +12,7 @@ from akshare_project.collectors import (  # noqa: E402
     cffex,
     douyin_emotion,
     etf,
+    exchange_option,
     excel_emotion,
     failed_tasks,
     forex,
@@ -19,6 +20,7 @@ from akshare_project.collectors import (  # noqa: E402
     index,
     option,
     quant_index,
+    risk_free_rate,
     runner,
     stock,
 )
@@ -35,7 +37,8 @@ async def dispatch():
     if len(sys.argv) < 3:
         raise ValueError(
             "usage: python run.py <domain> <command> [args]\n"
-            "domains: stock, index, quant-index, cffex, douyin, forex, futures, etf, option, runner, emotion-excel"
+            "domains: stock, index, quant-index, cffex, douyin, forex, futures, etf, "
+            "option, exchange-option, risk-free-rate, runner, emotion-excel"
         )
 
     domain = sys.argv[1].strip().lower()
@@ -77,6 +80,14 @@ async def dispatch():
     if domain == "option":
         set_argv("option", [command, *args])
         await option.main()
+        return
+    if domain == "exchange-option":
+        set_argv("exchange-option", [command, *args])
+        await exchange_option.main()
+        return
+    if domain == "risk-free-rate":
+        set_argv("risk-free-rate", [command, *args])
+        await risk_free_rate.main()
         return
     if domain == "runner":
         if command == "daily":

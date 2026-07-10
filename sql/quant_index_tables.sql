@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS quant_index_dashboard_daily (
   option_pc_quarter_2_special_note VARCHAR(512) NULL COMMENT '季月2 Put/Call特殊点位说明',
   option_volume_pc_ratio DECIMAL(18, 6) NULL COMMENT '股指期权成交量Put/Call比',
   option_turnover_pc_ratio DECIMAL(18, 6) NULL COMMENT '股指期权成交额Put/Call比',
+  exchange_option_pc_json JSON NULL COMMENT '沪深交易所期权分产品Put/Call指标',
+  option_vix_json JSON NULL COMMENT '按交易所和期权产品独立计算的30日VIX',
   cffex_top20_net_short_delta_5d DECIMAL(18, 6) NULL COMMENT '前20机构股指期货净空单5交易日增量',
   cffex_top20_net_short_delta_7d DECIMAL(18, 6) NULL COMMENT '前20机构股指期货净空单7交易日增量',
   cffex_top20_net_short_delta_14d DECIMAL(18, 6) NULL COMMENT '前20机构股指期货净空单14交易日增量',

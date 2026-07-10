@@ -1,6 +1,6 @@
 import json
 import math
-from datetime import datetime
+from datetime import date, datetime
 
 import aiomysql
 
@@ -138,6 +138,8 @@ class DbTools:
         self._stock_qfq_change_columns_ready = False
         self._stock_hfq_change_columns_ready = False
         self._stock_exchange_official_daily_table_ready = False
+        self._exchange_option_tables_ready = False
+        self._cn_risk_free_rate_table_ready = False
         self._quant_index_dashboard_option_pc_columns_ready = False
 
     def load_db_info(self):
@@ -619,6 +621,12 @@ class DbTools:
         for field in self.QUANT_INDEX_OPTION_PC_SPECIAL_NOTE_FIELDS:
             raw_value = row.get(field)
             sanitized[field] = str(raw_value).strip()[:512] if raw_value is not None and str(raw_value).strip() else None
+        sanitized['exchange_option_pc_json'] = self._serialize_json_field(
+            row.get('exchange_option_pc_json')
+        )
+        sanitized['option_vix_json'] = self._serialize_json_field(
+            row.get('option_vix_json')
+        )
         return sanitized
 
     def _sanitize_excel_emotion_row(self, row):
@@ -698,6 +706,110 @@ class DbTools:
         sanitized['open_interest_change'] = self._normalize_numeric('open_interest', row.get('open_interest_change'))
         sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'cffex_rtj'
         sanitized['source_url'] = str(row.get('source_url', '')).strip() or 'http://www.cffex.com.cn/rtj/'
+        return sanitized
+
+    def _sanitize_exchange_option_contract_daily_row(self, row):
+        sanitized = dict(row)
+        sanitized['exchange'] = str(row.get('exchange', '')).strip().upper()
+        sanitized['contract_code'] = str(row.get('contract_code', '')).strip()
+        sanitized['contract_trade_code'] = str(row.get('contract_trade_code', '')).strip() or None
+        sanitized['contract_name'] = str(row.get('contract_name', '')).strip() or None
+        sanitized['underlying_code'] = str(row.get('underlying_code', '')).strip() or None
+        sanitized['underlying_name'] = str(row.get('underlying_name', '')).strip() or None
+        sanitized['option_type'] = str(row.get('option_type', '')).strip().upper() or None
+        sanitized['contract_month'] = str(row.get('contract_month', '')).strip() or None
+        sanitized['strike_price'] = self._normalize_numeric('close_price', row.get('strike_price'))
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        for field in (
+            'open_price',
+            'high_price',
+            'low_price',
+            'close_price',
+            'pre_close_price',
+            'pre_settle_price',
+            'settle_price',
+            'volume',
+            'turnover',
+            'open_interest',
+        ):
+            sanitized[field] = self._normalize_numeric(field, row.get(field))
+        sanitized['pre_settle_source'] = (
+            str(row.get('pre_settle_source', '')).strip() or None
+        )
+        for field in (
+            'delta_value',
+            'theta_value',
+            'gamma_value',
+            'vega_value',
+            'rho_value',
+            'implied_volatility',
+        ):
+            sanitized[field] = self._normalize_numeric('price_change_rate', row.get(field))
+        sanitized['data_source'] = (
+            str(row.get('data_source', '')).strip() or 'exchange_official+sina'
+        )
+        sanitized['source_url'] = str(row.get('source_url', '')).strip() or None
+        sanitized['raw_json'] = self._serialize_json_field(row.get('raw_json'))
+        return sanitized
+
+    def _sanitize_exchange_option_contract_info_row(self, row):
+        sanitized = dict(row)
+        sanitized['exchange'] = str(row.get('exchange', '')).strip().upper()
+        sanitized['contract_code'] = str(row.get('contract_code', '')).strip()
+        sanitized['contract_trade_code'] = str(row.get('contract_trade_code', '')).strip() or None
+        sanitized['contract_name'] = str(row.get('contract_name', '')).strip() or None
+        sanitized['underlying_code'] = str(row.get('underlying_code', '')).strip() or None
+        sanitized['underlying_name'] = str(row.get('underlying_name', '')).strip() or None
+        sanitized['option_type'] = str(row.get('option_type', '')).strip().upper() or None
+        sanitized['contract_month'] = str(row.get('contract_month', '')).strip() or None
+        sanitized['strike_price'] = self._normalize_numeric('close_price', row.get('strike_price'))
+        sanitized['contract_unit'] = self._normalize_numeric('volume', row.get('contract_unit'))
+        for field in (
+            'listed_date',
+            'last_trade_date',
+            'exercise_date',
+            'expire_date',
+            'delivery_date',
+        ):
+            value = row.get(field)
+            sanitized[field] = str(value).split(' ')[0].strip() if value else None
+        sanitized['listing_reason'] = str(row.get('listing_reason', '')).strip() or None
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'exchange_official'
+        sanitized['source_url'] = str(row.get('source_url', '')).strip() or None
+        sanitized['raw_json'] = self._serialize_json_field(row.get('raw_json'))
+        return sanitized
+
+    def _sanitize_exchange_option_daily_stats_row(self, row):
+        sanitized = dict(row)
+        sanitized['exchange'] = str(row.get('exchange', '')).strip().upper()
+        sanitized['underlying_code'] = str(row.get('underlying_code', '')).strip()
+        sanitized['underlying_name'] = str(row.get('underlying_name', '')).strip() or None
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['contract_count'] = self._normalize_numeric('volume', row.get('contract_count'))
+        sanitized['turnover_amount'] = self._normalize_numeric('turnover', row.get('turnover_amount'))
+        for field in (
+            'total_volume',
+            'call_volume',
+            'put_volume',
+            'open_interest',
+            'call_open_interest',
+            'put_open_interest',
+        ):
+            sanitized[field] = self._normalize_numeric('volume', row.get(field))
+        put_call_volume_ratio = self._normalize_numeric(
+            'price_change_rate',
+            row.get('put_call_volume_ratio'),
+        )
+        sanitized['put_call_volume_ratio'] = (
+            round(put_call_volume_ratio, 8)
+            if put_call_volume_ratio is not None
+            else None
+        )
+        sanitized['data_source'] = str(row.get('data_source', '')).strip() or 'exchange_official'
+        sanitized['source_url'] = str(row.get('source_url', '')).strip() or None
+        sanitized['raw_json'] = self._serialize_json_field(row.get('raw_json'))
         return sanitized
 
     def _sanitize_failed_task_row(self, row):
@@ -859,6 +971,190 @@ class DbTools:
                 await conn.commit()
 
         self._stock_exchange_official_daily_table_ready = True
+
+    async def ensure_exchange_option_tables(self):
+        if self._exchange_option_tables_ready:
+            return
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS option_exchange_contract_info (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        exchange VARCHAR(16) NOT NULL,
+                        contract_code VARCHAR(32) NOT NULL,
+                        contract_trade_code VARCHAR(64) NULL,
+                        contract_name VARCHAR(128) NULL,
+                        underlying_code VARCHAR(16) NULL,
+                        underlying_name VARCHAR(128) NULL,
+                        option_type VARCHAR(16) NULL,
+                        contract_month VARCHAR(8) NULL,
+                        strike_price DECIMAL(18, 6) NULL,
+                        contract_unit DECIMAL(24, 2) NULL,
+                        listed_date DATE NULL,
+                        last_trade_date DATE NULL,
+                        exercise_date DATE NULL,
+                        expire_date DATE NULL,
+                        delivery_date DATE NULL,
+                        listing_reason VARCHAR(128) NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        source_url VARCHAR(512) NULL,
+                        raw_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_option_exchange_contract_info (
+                            exchange, contract_code
+                        ),
+                        KEY idx_option_exchange_info_underlying (
+                            exchange, underlying_code, listed_date
+                        ),
+                        KEY idx_option_exchange_info_expire (expire_date, exchange)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS option_exchange_contract_daily_data (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        exchange VARCHAR(16) NOT NULL,
+                        contract_code VARCHAR(32) NOT NULL,
+                        contract_trade_code VARCHAR(64) NULL,
+                        contract_name VARCHAR(128) NULL,
+                        underlying_code VARCHAR(16) NULL,
+                        underlying_name VARCHAR(128) NULL,
+                        option_type VARCHAR(16) NULL,
+                        contract_month VARCHAR(8) NULL,
+                        strike_price DECIMAL(18, 6) NULL,
+                        trade_date DATE NOT NULL,
+                        open_price DECIMAL(18, 6) NULL,
+                        high_price DECIMAL(18, 6) NULL,
+                        low_price DECIMAL(18, 6) NULL,
+                        close_price DECIMAL(18, 6) NULL,
+                        pre_close_price DECIMAL(18, 6) NULL,
+                        pre_settle_price DECIMAL(18, 6) NULL,
+                        pre_settle_source VARCHAR(64) NULL,
+                        settle_price DECIMAL(18, 6) NULL,
+                        volume DECIMAL(24, 2) NULL,
+                        turnover DECIMAL(24, 2) NULL,
+                        open_interest DECIMAL(24, 2) NULL,
+                        delta_value DECIMAL(18, 8) NULL,
+                        theta_value DECIMAL(18, 8) NULL,
+                        gamma_value DECIMAL(18, 8) NULL,
+                        vega_value DECIMAL(18, 8) NULL,
+                        rho_value DECIMAL(18, 8) NULL,
+                        implied_volatility DECIMAL(18, 8) NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        source_url VARCHAR(512) NULL,
+                        raw_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_option_exchange_contract_date (
+                            exchange, contract_code, trade_date
+                        ),
+                        KEY idx_option_exchange_date (trade_date, exchange),
+                        KEY idx_option_exchange_underlying_date (
+                            exchange, underlying_code, trade_date
+                        ),
+                        KEY idx_option_exchange_trade_code_date (
+                            contract_trade_code, trade_date
+                        )
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS option_exchange_daily_stats (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        exchange VARCHAR(16) NOT NULL,
+                        underlying_code VARCHAR(16) NOT NULL,
+                        underlying_name VARCHAR(128) NULL,
+                        trade_date DATE NOT NULL,
+                        contract_count DECIMAL(18, 2) NULL,
+                        turnover_amount DECIMAL(24, 2) NULL,
+                        total_volume DECIMAL(24, 2) NULL,
+                        call_volume DECIMAL(24, 2) NULL,
+                        put_volume DECIMAL(24, 2) NULL,
+                        put_call_volume_ratio DECIMAL(18, 8) NULL,
+                        open_interest DECIMAL(24, 2) NULL,
+                        call_open_interest DECIMAL(24, 2) NULL,
+                        put_open_interest DECIMAL(24, 2) NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        source_url VARCHAR(512) NULL,
+                        raw_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_option_exchange_stats_date (
+                            exchange, underlying_code, trade_date
+                        ),
+                        KEY idx_option_exchange_stats_date (trade_date, exchange)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await cursor.execute(
+                    "SHOW COLUMNS FROM option_exchange_contract_daily_data"
+                )
+                daily_columns = {
+                    str(row[0]).strip() for row in await cursor.fetchall()
+                }
+                if "pre_settle_price" not in daily_columns:
+                    await cursor.execute(
+                        """
+                        ALTER TABLE option_exchange_contract_daily_data
+                        ADD COLUMN pre_settle_price DECIMAL(18, 6) NULL
+                        AFTER pre_close_price
+                        """
+                    )
+                if "pre_settle_source" not in daily_columns:
+                    await cursor.execute(
+                        """
+                        ALTER TABLE option_exchange_contract_daily_data
+                        ADD COLUMN pre_settle_source VARCHAR(64) NULL
+                        AFTER pre_settle_price
+                        """
+                    )
+                await conn.commit()
+
+        self._exchange_option_tables_ready = True
+
+    async def ensure_cn_risk_free_rate_table(self):
+        if self._cn_risk_free_rate_table_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cn_risk_free_rate_daily (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        trade_date DATE NOT NULL,
+                        tenor_code VARCHAR(8) NOT NULL,
+                        tenor_days INT NOT NULL,
+                        rate_pct DECIMAL(18, 8) NOT NULL,
+                        rate_decimal DECIMAL(18, 10) NOT NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        source_url VARCHAR(512) NULL,
+                        raw_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_cn_risk_free_rate_date_tenor (
+                            trade_date, tenor_code
+                        ),
+                        KEY idx_cn_risk_free_rate_date (trade_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await conn.commit()
+        self._cn_risk_free_rate_table_ready = True
 
     async def upsert_stock_info_all(self, rows):
         if not rows:
@@ -2245,6 +2541,8 @@ class DbTools:
                     extraction_status
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
+                    emotion_date = VALUES(emotion_date),
+                    video_id = VALUES(video_id),
                     account_name = VALUES(account_name),
                     video_title = VALUES(video_title),
                     video_url = VALUES(video_url),
@@ -2278,6 +2576,161 @@ class DbTools:
                 await cursor.executemany(query_upsert, values)
                 await conn.commit()
                 return len(sanitized_rows)
+
+    async def get_douyin_emotion_by_video_id(self, video_id):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT
+            emotion_date,
+            video_id,
+            hs300_emotion,
+            zz500_emotion,
+            zz1000_emotion,
+            sz50_emotion,
+            raw_ocr_text,
+            extraction_status
+        FROM douyin_index_emotion_daily
+        WHERE video_id = %s
+        LIMIT 1
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(video_id).strip()])
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_douyin_emotion_by_date(self, emotion_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT
+            emotion_date,
+            video_id,
+            video_title,
+            video_url,
+            hs300_emotion,
+            zz500_emotion,
+            zz1000_emotion,
+            sz50_emotion,
+            extraction_status
+        FROM douyin_index_emotion_daily
+        WHERE emotion_date = %s
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(emotion_date).strip()])
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def batch_douyin_emotion_to_excel(self, emotion_date, video_id, values):
+        if self.pool is None:
+            await self.init_pool()
+
+        normalized_date = str(emotion_date or "").strip()
+        normalized_video_id = str(video_id or "").strip()
+        index_value_map = {
+            "上证50": self._normalize_numeric("douyin_emotion_value", values.get("sz50_emotion")),
+            "沪深300": self._normalize_numeric("douyin_emotion_value", values.get("hs300_emotion")),
+            "中证500": self._normalize_numeric("douyin_emotion_value", values.get("zz500_emotion")),
+            "中证1000": self._normalize_numeric("douyin_emotion_value", values.get("zz1000_emotion")),
+        }
+        if not normalized_date or not normalized_video_id or any(value is None for value in index_value_map.values()):
+            raise ValueError("douyin emotion normalization requires a date, video id, and four values")
+
+        source_file = f"douyin:{normalized_video_id}"
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT index_name, data_source
+                    FROM excel_index_emotion_daily
+                    WHERE emotion_date = %s
+                      AND index_name IN ('上证50', '沪深300', '中证500', '中证1000')
+                    """,
+                    [normalized_date],
+                )
+                existing_sources = {
+                    str(row["index_name"]): str(row.get("data_source") or "").strip().lower()
+                    for row in await cursor.fetchall()
+                }
+
+                rows_to_upsert = []
+                protected_names = []
+                for index_name, emotion_value in index_value_map.items():
+                    if existing_sources.get(index_name) == "excel":
+                        protected_names.append(index_name)
+                        continue
+                    rows_to_upsert.append(
+                        (
+                            normalized_date,
+                            index_name,
+                            round(float(emotion_value), 2),
+                            source_file,
+                            "douyin_coze",
+                        )
+                    )
+
+                if rows_to_upsert:
+                    await cursor.executemany(
+                        """
+                        INSERT INTO excel_index_emotion_daily (
+                            emotion_date,
+                            index_name,
+                            emotion_value,
+                            source_file,
+                            data_source
+                        ) VALUES (%s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            emotion_value = VALUES(emotion_value),
+                            source_file = VALUES(source_file),
+                            data_source = VALUES(data_source),
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        rows_to_upsert,
+                    )
+
+                await cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT index_name) AS row_count
+                    FROM excel_index_emotion_daily
+                    WHERE emotion_date = %s
+                      AND index_name IN ('上证50', '沪深300', '中证500', '中证1000')
+                      AND emotion_value IS NOT NULL
+                    """,
+                    [normalized_date],
+                )
+                result_row = await cursor.fetchone()
+                await conn.commit()
+                return {
+                    "upserted_rows": len(rows_to_upsert),
+                    "protected_names": protected_names,
+                    "available_rows": int((result_row or {}).get("row_count") or 0),
+                }
+
+    async def get_complete_excel_emotion_dates(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+
+        query = """
+        SELECT emotion_date
+        FROM excel_index_emotion_daily
+        WHERE emotion_date BETWEEN %s AND %s
+          AND index_name IN ('上证50', '沪深300', '中证500', '中证1000')
+          AND emotion_value IS NOT NULL
+        GROUP BY emotion_date
+        HAVING COUNT(DISTINCT index_name) = 4
+        ORDER BY emotion_date
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                rows = await cursor.fetchall()
+        return [str(row[0]).split(" ")[0] for row in rows if row and row[0]]
 
     async def get_douyin_latest_emotion_date(self, account_id='1368194981'):
         if self.pool is None:
@@ -2680,6 +3133,625 @@ class DbTools:
                 await cursor.executemany(query_insert, values)
                 await conn.commit()
                 return cursor.rowcount
+
+    async def batch_exchange_option_contract_daily_data(self, rows):
+        if not rows:
+            return 0
+
+        await self.ensure_exchange_option_tables()
+        sanitized_rows = [
+            self._sanitize_exchange_option_contract_daily_row(row)
+            for row in rows
+        ]
+        sanitized_rows = [
+            row
+            for row in sanitized_rows
+            if row['exchange'] in {'SSE', 'SZSE'}
+            and row['contract_code']
+            and row['trade_date']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped = {
+            (row['exchange'], row['contract_code'], row['trade_date']): row
+            for row in sanitized_rows
+        }
+        values = [
+            (
+                row['exchange'],
+                row['contract_code'],
+                row['contract_trade_code'],
+                row['contract_name'],
+                row['underlying_code'],
+                row['underlying_name'],
+                row['option_type'],
+                row['contract_month'],
+                row['strike_price'],
+                row['trade_date'],
+                row['open_price'],
+                row['high_price'],
+                row['low_price'],
+                row['close_price'],
+                row['pre_close_price'],
+                row['pre_settle_price'],
+                row['pre_settle_source'],
+                row['settle_price'],
+                row['volume'],
+                row['turnover'],
+                row['open_interest'],
+                row['delta_value'],
+                row['theta_value'],
+                row['gamma_value'],
+                row['vega_value'],
+                row['rho_value'],
+                row['implied_volatility'],
+                row['data_source'],
+                row['source_url'],
+                row['raw_json'],
+            )
+            for row in deduped.values()
+        ]
+        query = """
+            INSERT INTO option_exchange_contract_daily_data (
+                exchange,
+                contract_code,
+                contract_trade_code,
+                contract_name,
+                underlying_code,
+                underlying_name,
+                option_type,
+                contract_month,
+                strike_price,
+                trade_date,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                pre_close_price,
+                pre_settle_price,
+                pre_settle_source,
+                settle_price,
+                volume,
+                turnover,
+                open_interest,
+                delta_value,
+                theta_value,
+                gamma_value,
+                vega_value,
+                rho_value,
+                implied_volatility,
+                data_source,
+                source_url,
+                raw_json
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON DUPLICATE KEY UPDATE
+                contract_trade_code = COALESCE(VALUES(contract_trade_code), contract_trade_code),
+                contract_name = COALESCE(VALUES(contract_name), contract_name),
+                underlying_code = COALESCE(VALUES(underlying_code), underlying_code),
+                underlying_name = COALESCE(VALUES(underlying_name), underlying_name),
+                option_type = COALESCE(VALUES(option_type), option_type),
+                contract_month = COALESCE(VALUES(contract_month), contract_month),
+                strike_price = COALESCE(VALUES(strike_price), strike_price),
+                open_price = COALESCE(VALUES(open_price), open_price),
+                high_price = COALESCE(VALUES(high_price), high_price),
+                low_price = COALESCE(VALUES(low_price), low_price),
+                close_price = COALESCE(VALUES(close_price), close_price),
+                pre_close_price = COALESCE(VALUES(pre_close_price), pre_close_price),
+                pre_settle_price = COALESCE(VALUES(pre_settle_price), pre_settle_price),
+                pre_settle_source = COALESCE(VALUES(pre_settle_source), pre_settle_source),
+                settle_price = COALESCE(VALUES(settle_price), settle_price),
+                volume = COALESCE(VALUES(volume), volume),
+                turnover = COALESCE(VALUES(turnover), turnover),
+                open_interest = COALESCE(VALUES(open_interest), open_interest),
+                delta_value = COALESCE(VALUES(delta_value), delta_value),
+                theta_value = COALESCE(VALUES(theta_value), theta_value),
+                gamma_value = COALESCE(VALUES(gamma_value), gamma_value),
+                vega_value = COALESCE(VALUES(vega_value), vega_value),
+                rho_value = COALESCE(VALUES(rho_value), rho_value),
+                implied_volatility = COALESCE(VALUES(implied_volatility), implied_volatility),
+                data_source = VALUES(data_source),
+                source_url = COALESCE(VALUES(source_url), source_url),
+                raw_json = COALESCE(VALUES(raw_json), raw_json)
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def backfill_exchange_option_pre_settle_prices(self):
+        await self.ensure_exchange_option_tables()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE option_exchange_contract_daily_data
+                    SET
+                        pre_settle_price = close_price - CAST(
+                            JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$[5]'))
+                            AS DECIMAL(18, 6)
+                        ),
+                        pre_settle_source = 'szse_official_dayk_change'
+                    WHERE exchange = 'SZSE'
+                      AND data_source = 'szse_official_dayk'
+                      AND pre_settle_price IS NULL
+                      AND close_price IS NOT NULL
+                      AND JSON_VALID(raw_json)
+                      AND JSON_EXTRACT(raw_json, '$[5]') IS NOT NULL
+                    """
+                )
+                szse_exact_rows = cursor.rowcount
+
+                await cursor.execute(
+                    """
+                    UPDATE option_exchange_contract_daily_data
+                    SET
+                        pre_settle_price = pre_close_price,
+                        pre_settle_source = 'legacy_realtime_pre_settle'
+                    WHERE pre_settle_price IS NULL
+                      AND pre_close_price IS NOT NULL
+                    """
+                )
+                legacy_exact_rows = cursor.rowcount
+
+                await cursor.execute(
+                    """
+                    UPDATE option_exchange_contract_daily_data target
+                    INNER JOIN (
+                        SELECT
+                            id,
+                            LAG(close_price) OVER (
+                                PARTITION BY exchange, contract_code
+                                ORDER BY trade_date
+                            ) AS previous_close
+                        FROM option_exchange_contract_daily_data
+                    ) previous
+                      ON previous.id = target.id
+                    SET
+                        target.pre_settle_price = previous.previous_close,
+                        target.pre_settle_source = 'derived_previous_close'
+                    WHERE target.pre_settle_price IS NULL
+                      AND previous.previous_close IS NOT NULL
+                    """
+                )
+                derived_rows = cursor.rowcount
+                await conn.commit()
+                return {
+                    'szse_exact_rows': szse_exact_rows,
+                    'legacy_exact_rows': legacy_exact_rows,
+                    'derived_rows': derived_rows,
+                }
+
+    async def upsert_cn_risk_free_rate_daily(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_cn_risk_free_rate_table()
+        values = []
+        for row in rows:
+            trade_date = str(row.get('trade_date') or '').split(' ')[0].strip()
+            tenor_code = str(row.get('tenor_code') or '').strip().upper()
+            tenor_days = int(row.get('tenor_days') or 0)
+            rate_pct = self._normalize_numeric(
+                'price_change_rate',
+                row.get('rate_pct'),
+            )
+            rate_decimal = self._normalize_numeric(
+                'price_change_rate',
+                row.get('rate_decimal'),
+            )
+            if (
+                not trade_date
+                or not tenor_code
+                or tenor_days <= 0
+                or rate_pct is None
+                or rate_decimal is None
+            ):
+                continue
+            values.append(
+                (
+                    trade_date,
+                    tenor_code,
+                    tenor_days,
+                    round(float(rate_pct), 8),
+                    round(float(rate_decimal), 10),
+                    str(row.get('data_source') or 'chinamoney_shibor').strip(),
+                    str(row.get('source_url') or '').strip() or None,
+                    self._serialize_json_field(row.get('raw_json')),
+                )
+            )
+        if not values:
+            return 0
+        query = """
+            INSERT INTO cn_risk_free_rate_daily (
+                trade_date,
+                tenor_code,
+                tenor_days,
+                rate_pct,
+                rate_decimal,
+                data_source,
+                source_url,
+                raw_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                tenor_days = VALUES(tenor_days),
+                rate_pct = VALUES(rate_pct),
+                rate_decimal = VALUES(rate_decimal),
+                data_source = VALUES(data_source),
+                source_url = VALUES(source_url),
+                raw_json = VALUES(raw_json),
+                updated_at = CURRENT_TIMESTAMP
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def get_cn_risk_free_rate_rows(self, start_date, end_date):
+        await self.ensure_cn_risk_free_rate_table()
+        query = """
+            SELECT
+                trade_date,
+                tenor_code,
+                tenor_days,
+                rate_pct,
+                rate_decimal,
+                data_source
+            FROM cn_risk_free_rate_daily
+            WHERE trade_date BETWEEN %s AND %s
+            ORDER BY trade_date ASC, tenor_days ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, (start_date, end_date))
+                return list(await cursor.fetchall())
+
+    async def batch_exchange_option_contract_info(self, rows):
+        if not rows:
+            return 0
+
+        await self.ensure_exchange_option_tables()
+        sanitized_rows = [
+            self._sanitize_exchange_option_contract_info_row(row)
+            for row in rows
+        ]
+        sanitized_rows = [
+            row
+            for row in sanitized_rows
+            if row['exchange'] in {'SSE', 'SZSE'} and row['contract_code']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped = {
+            (row['exchange'], row['contract_code']): row
+            for row in sanitized_rows
+        }
+        values = [
+            (
+                row['exchange'],
+                row['contract_code'],
+                row['contract_trade_code'],
+                row['contract_name'],
+                row['underlying_code'],
+                row['underlying_name'],
+                row['option_type'],
+                row['contract_month'],
+                row['strike_price'],
+                row['contract_unit'],
+                row['listed_date'],
+                row['last_trade_date'],
+                row['exercise_date'],
+                row['expire_date'],
+                row['delivery_date'],
+                row['listing_reason'],
+                row['data_source'],
+                row['source_url'],
+                row['raw_json'],
+            )
+            for row in deduped.values()
+        ]
+        query = """
+            INSERT INTO option_exchange_contract_info (
+                exchange,
+                contract_code,
+                contract_trade_code,
+                contract_name,
+                underlying_code,
+                underlying_name,
+                option_type,
+                contract_month,
+                strike_price,
+                contract_unit,
+                listed_date,
+                last_trade_date,
+                exercise_date,
+                expire_date,
+                delivery_date,
+                listing_reason,
+                data_source,
+                source_url,
+                raw_json
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON DUPLICATE KEY UPDATE
+                contract_trade_code = COALESCE(VALUES(contract_trade_code), contract_trade_code),
+                contract_name = COALESCE(VALUES(contract_name), contract_name),
+                underlying_code = COALESCE(VALUES(underlying_code), underlying_code),
+                underlying_name = COALESCE(VALUES(underlying_name), underlying_name),
+                option_type = COALESCE(VALUES(option_type), option_type),
+                contract_month = COALESCE(VALUES(contract_month), contract_month),
+                strike_price = COALESCE(VALUES(strike_price), strike_price),
+                contract_unit = COALESCE(VALUES(contract_unit), contract_unit),
+                listed_date = COALESCE(VALUES(listed_date), listed_date),
+                last_trade_date = COALESCE(VALUES(last_trade_date), last_trade_date),
+                exercise_date = COALESCE(VALUES(exercise_date), exercise_date),
+                expire_date = COALESCE(VALUES(expire_date), expire_date),
+                delivery_date = COALESCE(VALUES(delivery_date), delivery_date),
+                listing_reason = COALESCE(VALUES(listing_reason), listing_reason),
+                data_source = VALUES(data_source),
+                source_url = COALESCE(VALUES(source_url), source_url),
+                raw_json = COALESCE(VALUES(raw_json), raw_json)
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def batch_exchange_option_daily_stats(self, rows):
+        if not rows:
+            return 0
+
+        await self.ensure_exchange_option_tables()
+        sanitized_rows = [
+            self._sanitize_exchange_option_daily_stats_row(row)
+            for row in rows
+        ]
+        sanitized_rows = [
+            row
+            for row in sanitized_rows
+            if row['exchange'] in {'SSE', 'SZSE'}
+            and row['underlying_code']
+            and row['trade_date']
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped = {
+            (row['exchange'], row['underlying_code'], row['trade_date']): row
+            for row in sanitized_rows
+        }
+        values = [
+            (
+                row['exchange'],
+                row['underlying_code'],
+                row['underlying_name'],
+                row['trade_date'],
+                row['contract_count'],
+                row['turnover_amount'],
+                row['total_volume'],
+                row['call_volume'],
+                row['put_volume'],
+                row['put_call_volume_ratio'],
+                row['open_interest'],
+                row['call_open_interest'],
+                row['put_open_interest'],
+                row['data_source'],
+                row['source_url'],
+                row['raw_json'],
+            )
+            for row in deduped.values()
+        ]
+        query = """
+            INSERT INTO option_exchange_daily_stats (
+                exchange,
+                underlying_code,
+                underlying_name,
+                trade_date,
+                contract_count,
+                turnover_amount,
+                total_volume,
+                call_volume,
+                put_volume,
+                put_call_volume_ratio,
+                open_interest,
+                call_open_interest,
+                put_open_interest,
+                data_source,
+                source_url,
+                raw_json
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON DUPLICATE KEY UPDATE
+                underlying_name = COALESCE(VALUES(underlying_name), underlying_name),
+                contract_count = COALESCE(VALUES(contract_count), contract_count),
+                turnover_amount = COALESCE(VALUES(turnover_amount), turnover_amount),
+                total_volume = COALESCE(VALUES(total_volume), total_volume),
+                call_volume = COALESCE(VALUES(call_volume), call_volume),
+                put_volume = COALESCE(VALUES(put_volume), put_volume),
+                put_call_volume_ratio = COALESCE(
+                    VALUES(put_call_volume_ratio),
+                    put_call_volume_ratio
+                ),
+                open_interest = COALESCE(VALUES(open_interest), open_interest),
+                call_open_interest = COALESCE(
+                    VALUES(call_open_interest),
+                    call_open_interest
+                ),
+                put_open_interest = COALESCE(
+                    VALUES(put_open_interest),
+                    put_open_interest
+                ),
+                data_source = VALUES(data_source),
+                source_url = COALESCE(VALUES(source_url), source_url),
+                raw_json = COALESCE(VALUES(raw_json), raw_json)
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def list_exchange_option_contract_codes(self):
+        await self.ensure_exchange_option_tables()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT exchange, contract_code
+                    FROM option_exchange_contract_info
+                    ORDER BY exchange, contract_code
+                    """
+                )
+                return [
+                    (str(row[0]).strip().upper(), str(row[1]).strip())
+                    for row in await cursor.fetchall()
+                ]
+
+    async def list_exchange_option_active_contract_rows(self, target_date):
+        await self.ensure_exchange_option_tables()
+        target_text = str(target_date).split(" ")[0]
+        query = """
+        SELECT
+            info.exchange,
+            info.contract_code,
+            info.contract_trade_code,
+            info.contract_name,
+            info.underlying_code,
+            info.underlying_name,
+            info.option_type,
+            info.contract_month,
+            info.strike_price,
+            daily.open_price,
+            daily.high_price,
+            daily.low_price,
+            daily.close_price,
+            daily.volume,
+            daily.turnover,
+            daily.data_source AS daily_data_source
+        FROM option_exchange_contract_info info
+        LEFT JOIN option_exchange_contract_daily_data daily
+          ON daily.exchange = info.exchange
+         AND daily.contract_code = info.contract_code
+         AND daily.trade_date = %s
+        WHERE info.listed_date <= %s
+          AND info.last_trade_date >= %s
+          AND info.underlying_code IS NOT NULL
+        ORDER BY info.exchange, info.contract_code
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [target_text, target_text, target_text])
+                rows = list(await cursor.fetchall())
+        return [
+            {
+                **row,
+                'trade_date': target_text,
+                'data_source': f"{str(row.get('exchange') or '').strip().lower()}_official_dayk",
+                'official_complete': (
+                    row.get('close_price') is not None
+                    and row.get('volume') is not None
+                    and row.get('turnover') is not None
+                    and str(row.get('daily_data_source') or '').strip()
+                    in {'sse_official_dayk', 'szse_official_dayk'}
+                ),
+            }
+            for row in rows
+        ]
+
+    async def count_exchange_option_contract_info(self, exchange):
+        await self.ensure_exchange_option_tables()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM option_exchange_contract_info
+                    WHERE exchange = %s
+                    """,
+                    [str(exchange).strip().upper()],
+                )
+                row = await cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+
+    async def list_exchange_option_stats_dates(self, exchange, start_date, end_date):
+        await self.ensure_exchange_option_tables()
+        normalized_exchange = str(exchange or '').strip().upper()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT DISTINCT trade_date
+                    FROM option_exchange_daily_stats
+                    WHERE exchange = %s
+                      AND trade_date BETWEEN %s AND %s
+                    ORDER BY trade_date
+                    """,
+                    [normalized_exchange, str(start_date), str(end_date)],
+                )
+                return {
+                    row[0] if isinstance(row[0], date) else datetime.strptime(
+                        str(row[0]).split(" ")[0],
+                        "%Y-%m-%d",
+                    ).date()
+                    for row in await cursor.fetchall()
+                }
+
+    async def list_exchange_option_risk_dates(self, exchange, start_date, end_date):
+        await self.ensure_exchange_option_tables()
+        normalized_exchange = str(exchange or '').strip().upper()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT DISTINCT trade_date
+                    FROM option_exchange_contract_daily_data
+                    WHERE exchange = %s
+                      AND trade_date BETWEEN %s AND %s
+                      AND delta_value IS NOT NULL
+                    ORDER BY trade_date
+                    """,
+                    [normalized_exchange, str(start_date), str(end_date)],
+                )
+                return {
+                    row[0] if isinstance(row[0], date) else datetime.strptime(
+                        str(row[0]).split(" ")[0],
+                        "%Y-%m-%d",
+                    ).date()
+                    for row in await cursor.fetchall()
+                }
+
+    async def list_cn_trade_dates(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT DISTINCT trade_date
+                    FROM index_daily_data
+                    WHERE trade_date BETWEEN %s AND %s
+                    ORDER BY trade_date
+                    """,
+                    [str(start_date), str(end_date)],
+                )
+                return [
+                    row[0] if isinstance(row[0], date) else datetime.strptime(
+                        str(row[0]).split(" ")[0],
+                        "%Y-%m-%d",
+                    ).date()
+                    for row in await cursor.fetchall()
+                ]
 
     async def upsert_forex_daily_snapshots(self, rows):
         if not rows:
@@ -3916,12 +4988,20 @@ class DbTools:
                 'option_turnover_pc_ratio',
                 "ADD COLUMN option_turnover_pc_ratio DECIMAL(18, 6) NULL COMMENT '股指期权成交额Put/Call比' AFTER option_volume_pc_ratio",
             ),
+            (
+                'exchange_option_pc_json',
+                "ADD COLUMN exchange_option_pc_json JSON NULL COMMENT '沪深交易所期权分产品Put/Call指标' AFTER option_turnover_pc_ratio",
+            ),
+            (
+                'option_vix_json',
+                "ADD COLUMN option_vix_json JSON NULL COMMENT '按交易所和期权产品独立计算的30日VIX' AFTER exchange_option_pc_json",
+            ),
         ]
         source_label_by_prefix = {
             'top20': '前20机构',
             'citic': '中信代客',
         }
-        previous_column = 'option_turnover_pc_ratio'
+        previous_column = 'option_vix_json'
         for field in self.QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS:
             parts = field.split('_')
             source_prefix = parts[1] if len(parts) > 1 else ''
@@ -3978,17 +5058,112 @@ class DbTools:
         placeholders = ','.join(['%s'] * len(normalized_prefixes))
         query = (
             f"SELECT trade_date, product_prefix, index_type, contract_month, option_type, "
-            f"strike_price, close_price, volume, turnover "
+            f"strike_price, open_price, close_price, settle_price, pre_settle_price, "
+            f"volume, turnover "
             f"FROM option_cffex_rtj_daily_data "
             f"WHERE product_prefix IN ({placeholders}) "
             f"AND trade_date BETWEEN %s AND %s "
             f"AND option_type IN ('CALL', 'PUT') "
             f"AND strike_price IS NOT NULL "
-            f"AND close_price IS NOT NULL "
             f"ORDER BY trade_date ASC, product_prefix ASC, contract_month ASC, strike_price ASC"
         )
         params = [*normalized_prefixes, str(start_date), str(end_date)]
 
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_exchange_option_rows(
+        self,
+        underlying_codes,
+        start_date,
+        end_date,
+    ):
+        await self.ensure_exchange_option_tables()
+        normalized_codes = [
+            str(code).strip()
+            for code in (underlying_codes or [])
+            if str(code).strip()
+        ]
+        if not normalized_codes:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_codes))
+        query = f"""
+        SELECT
+            daily.trade_date,
+            daily.exchange,
+            daily.contract_code,
+            COALESCE(daily.contract_trade_code, info.contract_trade_code) AS contract_trade_code,
+            COALESCE(daily.contract_name, info.contract_name) AS contract_name,
+            COALESCE(daily.underlying_code, info.underlying_code) AS underlying_code,
+            COALESCE(daily.underlying_name, info.underlying_name) AS underlying_name,
+            COALESCE(daily.option_type, info.option_type) AS option_type,
+            COALESCE(daily.contract_month, info.contract_month) AS contract_month,
+            COALESCE(daily.strike_price, info.strike_price) AS strike_price,
+            daily.open_price,
+            daily.close_price,
+            daily.settle_price,
+            daily.pre_settle_price,
+            daily.pre_settle_source,
+            daily.volume,
+            daily.turnover,
+            info.last_trade_date,
+            info.expire_date
+        FROM option_exchange_contract_daily_data daily
+        INNER JOIN option_exchange_contract_info info
+          ON info.exchange = daily.exchange
+         AND info.contract_code = daily.contract_code
+        WHERE COALESCE(daily.underlying_code, info.underlying_code) IN ({placeholders})
+          AND daily.trade_date BETWEEN %s AND %s
+          AND COALESCE(daily.option_type, info.option_type) IN ('CALL', 'PUT')
+        ORDER BY
+            daily.trade_date ASC,
+            daily.exchange ASC,
+            COALESCE(daily.underlying_code, info.underlying_code) ASC,
+            COALESCE(daily.contract_month, info.contract_month) ASC,
+            COALESCE(daily.strike_price, info.strike_price) ASC
+        """
+        params = [*normalized_codes, str(start_date), str(end_date)]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_etf_closes(
+        self,
+        etf_codes,
+        start_date,
+        end_date,
+    ):
+        if self.pool is None:
+            await self.init_pool()
+        normalized_codes = [
+            str(code).strip()
+            for code in (etf_codes or [])
+            if str(code).strip()
+        ]
+        if not normalized_codes:
+            return []
+
+        placeholders = ','.join(['%s'] * len(normalized_codes))
+        query = f"""
+        SELECT etf_code, trade_date, close_price, data_source
+        FROM etf_daily_data_sina
+        WHERE etf_code IN ({placeholders})
+          AND trade_date BETWEEN %s AND %s
+          AND close_price IS NOT NULL
+        ORDER BY
+            etf_code ASC,
+            trade_date ASC,
+            CASE data_source
+                WHEN 'fund_etf_hist_sina' THEN 0
+                WHEN 'fund_etf_category_sina' THEN 1
+                ELSE 2
+            END ASC
+        """
+        params = [*normalized_codes, str(start_date), str(end_date)]
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, params)
@@ -4044,6 +5219,8 @@ class DbTools:
                 row['option_pc_quarter_2_special_note'],
                 row['option_volume_pc_ratio'],
                 row['option_turnover_pc_ratio'],
+                row['exchange_option_pc_json'],
+                row['option_vix_json'],
                 *[row[field] for field in optional_metric_columns],
             )
             for row in sanitized_rows
@@ -4085,8 +5262,10 @@ class DbTools:
                     option_pc_quarter_2_special_note,
                     option_volume_pc_ratio,
                     option_turnover_pc_ratio,
+                    exchange_option_pc_json,
+                    option_vix_json,
                     {optional_metric_insert_columns}
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {optional_metric_placeholders})
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {optional_metric_placeholders})
                 ON DUPLICATE KEY UPDATE
                     index_name = VALUES(index_name),
                     emotion_value = VALUES(emotion_value),
@@ -4113,6 +5292,8 @@ class DbTools:
                     option_pc_quarter_2_special_note = VALUES(option_pc_quarter_2_special_note),
                     option_volume_pc_ratio = VALUES(option_volume_pc_ratio),
                     option_turnover_pc_ratio = VALUES(option_turnover_pc_ratio),
+                    exchange_option_pc_json = VALUES(exchange_option_pc_json),
+                    option_vix_json = VALUES(option_vix_json),
                     {optional_metric_update_assignments},
                     updated_at = CURRENT_TIMESTAMP
                 """

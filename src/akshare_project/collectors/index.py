@@ -84,6 +84,7 @@ QVIX_HTTP_HEADERS = {
     'Pragma': 'no-cache',
     'Referer': 'http://1.optbbs.com/s/vix.shtml',
 }
+QVIX_DAILY_RECENT_BACKFILL_ROWS = 30
 CNN_HTTP_HEADERS = {
     **DEFAULT_HTTP_HEADERS,
     'Accept': 'application/json,text/plain,*/*',
@@ -640,9 +641,29 @@ def build_qvix_basic_rows():
 
 
 def build_qvix_daily_rows(index_code, history_df, source_name):
+    if history_df is None or history_df.empty:
+        return []
+
+    normalized_df = history_df.copy()
+    normalized_df['date'] = pd.to_datetime(normalized_df['date'], errors='coerce')
+    normalized_df.dropna(subset=['date'], inplace=True)
+    normalized_df = normalized_df[normalized_df['date'].dt.weekday < 5].copy()
+    normalized_df['date'] = normalized_df['date'].dt.date
+
+    for row_index, row in normalized_df.iterrows():
+        prices = [
+            to_float(row.get(column_name))
+            for column_name in ('open', 'high', 'low', 'close')
+        ]
+        valid_prices = [value for value in prices if value is not None]
+        if not valid_prices:
+            continue
+        normalized_df.at[row_index, 'high'] = max(valid_prices)
+        normalized_df.at[row_index, 'low'] = min(valid_prices)
+
     return build_calculated_history_rows(
         index_code,
-        history_df,
+        normalized_df,
         source_name,
         volume_candidates=['volume'],
         turnover_candidates=[],
@@ -1384,9 +1405,9 @@ async def process_qvix_index(index_row, source_df, db_tools):
             print(f'index qvix backfill skipped {index_code}: no valid rows built')
             return 0
 
-        inserted = await db_tools.batch_index_qvix_daily_data(daily_rows)
-        print(f'index qvix backfill {index_code} inserted: {inserted}')
-        return inserted
+        upserted = await db_tools.upsert_index_qvix_daily_snapshots(daily_rows)
+        print(f'index qvix backfill {index_code} upserted: {upserted}')
+        return upserted
     except Exception as exc:
         error_message = f'index qvix backfill failed for {index_code}: {exc}'
         print(error_message)
@@ -1547,16 +1568,16 @@ async def backfill_qvix_history():
         source_df = await asyncio.to_thread(fetch_qvix_daily_source)
         basic_rows = build_qvix_basic_rows()
         basic_upserted = await db_tools.upsert_index_qvix_basic_info(basic_rows)
-        inserted_rows = await asyncio.gather(
-            *[process_qvix_index(index_row, source_df, db_tools) for index_row in QVIX_DEFINITIONS]
-        )
-        total_inserted = sum(inserted_rows)
+        inserted_rows = []
+        for index_row in QVIX_DEFINITIONS:
+            inserted_rows.append(await process_qvix_index(index_row, source_df, db_tools))
+        total_upserted = sum(inserted_rows)
         print(
             'index qvix history backfill finished, '
             f'index_qvix_basic_info upserted: {basic_upserted}, '
-            f'index_qvix_daily_data inserted: {total_inserted}'
+            f'index_qvix_daily_data upserted: {total_upserted}'
         )
-        return total_inserted
+        return total_upserted
     finally:
         await db_tools.close()
 
@@ -1568,7 +1589,7 @@ async def sync_daily_qvix():
     try:
         source_df = await asyncio.to_thread(fetch_qvix_daily_source)
         basic_rows = build_qvix_basic_rows()
-        latest_rows = []
+        recent_rows = []
         trade_dates = set()
 
         for index_row in QVIX_DEFINITIONS:
@@ -1580,12 +1601,12 @@ async def sync_daily_qvix():
             if not daily_rows:
                 raise ValueError(f'No valid rows built for {index_row["index_code"]}')
 
-            latest_row = daily_rows[-1]
-            latest_rows.append(latest_row)
-            trade_dates.add(latest_row['trade_date'])
+            rows_to_upsert = daily_rows[-QVIX_DAILY_RECENT_BACKFILL_ROWS:]
+            recent_rows.extend(rows_to_upsert)
+            trade_dates.update(row['trade_date'] for row in rows_to_upsert)
 
         basic_upserted = await db_tools.upsert_index_qvix_basic_info(basic_rows)
-        daily_upserted = await db_tools.upsert_index_qvix_daily_snapshots(latest_rows)
+        daily_upserted = await db_tools.upsert_index_qvix_daily_snapshots(recent_rows)
         latest_trade_date = max(trade_dates) if trade_dates else ''
         today = datetime.now().strftime('%Y-%m-%d')
         source_is_behind = bool(latest_trade_date and latest_trade_date < today)
@@ -1598,6 +1619,7 @@ async def sync_daily_qvix():
             'index qvix daily finished, '
             f'index_qvix_basic_info upserted: {basic_upserted}, '
             f'index_qvix_daily_data upserted: {daily_upserted}, '
+            f'recent_backfill_rows_per_index: {QVIX_DAILY_RECENT_BACKFILL_ROWS}, '
             f'trade_dates: {",".join(sorted(trade_dates))}'
         )
         return {

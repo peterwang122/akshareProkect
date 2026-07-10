@@ -10,7 +10,20 @@ from typing import Awaitable, Callable, Dict
 
 import requests
 
-from akshare_project.collectors import cffex, etf, excel_emotion, forex, futures, index, option, quant_index, stock
+from akshare_project.collectors import (
+    cffex,
+    douyin_emotion,
+    etf,
+    exchange_option,
+    excel_emotion,
+    forex,
+    futures,
+    index,
+    option,
+    quant_index,
+    risk_free_rate,
+    stock,
+)
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.network import without_proxy_env
 from akshare_project.core.paths import ensure_runtime_layout, get_config_dir
@@ -171,6 +184,20 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             handler=lambda: option.sync_daily(headless=True),
             direct_network=True,
         ),
+        "/collect-exchange-option-daily": DailyRoute(
+            path="/collect-exchange-option-daily",
+            task_name="exchange_option_daily",
+            handler=lambda target_date=None: exchange_option.sync_daily(target_date=target_date),
+            direct_network=True,
+        ),
+        "/collect-cn-risk-free-rate-daily": DailyRoute(
+            path="/collect-cn-risk-free-rate-daily",
+            task_name="cn_risk_free_rate_daily",
+            handler=lambda target_date=None: risk_free_rate.sync_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
         "/collect-quant-index-daily": DailyRoute(
             path="/collect-quant-index-daily",
             task_name="quant_index_daily",
@@ -193,6 +220,12 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             path="/import-emotion-excel",
             task_name="excel_emotion_import",
             handler=lambda: excel_emotion.import_excel("情绪指标.xlsx"),
+        ),
+        "/collect-douyin-coze-emotion-daily": DailyRoute(
+            path="/collect-douyin-coze-emotion-daily",
+            task_name="douyin_coze_emotion_daily",
+            handler=lambda target_date=None: douyin_emotion.sync_daily(target_date=target_date),
+            direct_network=True,
         ),
         "/collect-index-us-vix-daily": DailyRoute(
             path="/collect-index-us-vix-daily",
@@ -290,7 +323,13 @@ class StockTempHandler(BaseHTTPRequestHandler):
         return payload
 
     def _run_daily_route(self, route: DailyRoute, payload: dict):
-        if payload and route.task_name != "stock_exchange_official_daily":
+        payload_task_names = {
+            "stock_exchange_official_daily",
+            "douyin_coze_emotion_daily",
+            "exchange_option_daily",
+            "cn_risk_free_rate_daily",
+        }
+        if payload and route.task_name not in payload_task_names:
             self._send_json(
                 400,
                 {
@@ -305,7 +344,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
         try:
             context = without_proxy_env() if route.direct_network else nullcontext()
             with context:
-                if route.task_name == "stock_exchange_official_daily":
+                if route.task_name in payload_task_names:
                     allowed_keys = {"target_date"}
                     unexpected_keys = sorted(set(payload) - allowed_keys)
                     if unexpected_keys:
@@ -313,7 +352,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
                             400,
                             {
                                 "status": "INVALID_REQUEST",
-                                "error": f"unsupported stock_exchange_official_daily fields: {unexpected_keys}",
+                                "error": f"unsupported {route.task_name} fields: {unexpected_keys}",
                             },
                         )
                         return

@@ -1,6 +1,7 @@
 import pytest
 
 from akshare_project.collectors.quant_index import (
+    build_exchange_option_pc_map,
     build_index_option_flow_pc_map,
     build_index_option_pc_map,
     build_option_flow_pc_payload_for_product,
@@ -293,3 +294,118 @@ def test_index_option_flow_pc_map_builds_core_indexes_and_shanghai_average_only(
     assert result[("2026-05-08", "上证指数")]["option_volume_pc_ratio"] == pytest.approx((0.5 + 0.5 + 0.5) / 3)
     assert result[("2026-05-08", "上证指数")]["option_turnover_pc_ratio"] == pytest.approx((0.5 + 0.5 + 0.25) / 3)
     assert ("2026-05-08", "中证500") not in result
+
+
+def _exchange_option_row(
+    exchange,
+    underlying_code,
+    contract_code,
+    contract_trade_code,
+    contract_month,
+    option_type,
+    strike_price,
+    close_price,
+    *,
+    trade_date="2026-05-08",
+    last_trade_date="2026-05-27",
+    volume=10,
+    turnover=100,
+):
+    return {
+        "trade_date": trade_date,
+        "exchange": exchange,
+        "underlying_code": underlying_code,
+        "contract_code": contract_code,
+        "contract_trade_code": contract_trade_code,
+        "contract_month": contract_month,
+        "option_type": option_type,
+        "strike_price": strike_price,
+        "close_price": close_price,
+        "last_trade_date": last_trade_date,
+        "volume": volume,
+        "turnover": turnover,
+    }
+
+
+def test_exchange_option_series_uses_etf_close_and_keeps_products_separate():
+    rows = [
+        _exchange_option_row("SSE", "510300", "1001", "510300P2605M004000", "2605", "PUT", 4.0, 0.10),
+        _exchange_option_row("SSE", "510300", "1002", "510300P2605M004200", "2605", "PUT", 4.2, 0.30),
+        _exchange_option_row("SSE", "510300", "1003", "510300C2605M004000", "2605", "CALL", 4.0, 0.30),
+        _exchange_option_row("SSE", "510300", "1004", "510300C2605M004200", "2605", "CALL", 4.2, 0.10),
+        _exchange_option_row("SZSE", "159919", "9001", "159919P2605M004000", "2605", "PUT", 4.0, 0.20),
+        _exchange_option_row("SZSE", "159919", "9002", "159919P2605M004200", "2605", "PUT", 4.2, 0.40),
+        _exchange_option_row("SZSE", "159919", "9003", "159919C2605M004000", "2605", "CALL", 4.0, 0.40),
+        _exchange_option_row("SZSE", "159919", "9004", "159919C2605M004200", "2605", "CALL", 4.2, 0.20),
+    ]
+
+    result = build_exchange_option_pc_map(
+        rows,
+        {
+            ("2026-05-08", "510300"): 4.1,
+            ("2026-05-08", "159919"): 4.1,
+        },
+    )
+
+    sources = result[("2026-05-08", "沪深300")]
+    assert set(sources) == {"sse:510300", "szse:159919"}
+    assert sources["sse:510300"]["option_pc_current_month"] == pytest.approx(1)
+    assert sources["szse:159919"]["option_pc_current_month"] == pytest.approx(1)
+    assert sources["sse:510300"]["product_code"] == "510300"
+    assert sources["szse:159919"]["exchange_label"] == "深交所"
+
+
+def test_exchange_option_price_excludes_adjusted_contract_but_flow_includes_it():
+    rows = [
+        _exchange_option_row("SSE", "510050", "1001", "510050P2605M003000", "2605", "PUT", 3.0, 0.10, volume=10, turnover=100),
+        _exchange_option_row("SSE", "510050", "1002", "510050P2605M003200", "2605", "PUT", 3.2, 0.30, volume=10, turnover=100),
+        _exchange_option_row("SSE", "510050", "1003", "510050C2605M003000", "2605", "CALL", 3.0, 0.30, volume=20, turnover=200),
+        _exchange_option_row("SSE", "510050", "1004", "510050C2605M003200", "2605", "CALL", 3.2, 0.10, volume=20, turnover=200),
+        _exchange_option_row("SSE", "510050", "1005", "510050P2605A003100", "2605", "PUT", 3.1, 99, volume=30, turnover=300),
+    ]
+
+    payload = build_exchange_option_pc_map(
+        rows,
+        {("2026-05-08", "510050"): 3.1},
+    )[("2026-05-08", "上证50")]["sse:510050"]
+
+    assert payload["option_pc_current_month"] == pytest.approx(1)
+    assert payload["option_volume_pc_ratio"] == pytest.approx(50 / 40)
+    assert payload["option_turnover_pc_ratio"] == pytest.approx(500 / 400)
+
+
+def test_exchange_option_uses_real_last_trade_date_and_does_not_extrapolate():
+    rows = [
+        _exchange_option_row(
+            "SSE",
+            "588000",
+            "1001",
+            "588000P2605M001000",
+            "2605",
+            "PUT",
+            1.0,
+            0.10,
+            trade_date="2026-05-27",
+            last_trade_date="2026-05-27",
+        ),
+        _exchange_option_row(
+            "SSE",
+            "588000",
+            "1002",
+            "588000C2605M001000",
+            "2605",
+            "CALL",
+            1.0,
+            0.10,
+            trade_date="2026-05-27",
+            last_trade_date="2026-05-27",
+        ),
+    ]
+
+    payload = build_exchange_option_pc_map(
+        rows,
+        {("2026-05-27", "588000"): 1.2},
+    )[("2026-05-27", "科创50")]["sse:588000"]
+
+    assert payload["option_pc_current_month"] is None
+    assert payload["option_volume_pc_ratio"] is None
