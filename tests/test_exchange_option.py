@@ -57,6 +57,10 @@ def test_parse_sina_quote_payload_reads_daily_fields():
     result = exchange_option.parse_sina_quote_payload(payload)["90007051"]
 
     assert result["trade_date"] == "2026-07-03"
+    assert result["bid1_volume"] == "1"
+    assert result["bid1_price"] == "0.7927"
+    assert result["ask1_price"] == "0.8469"
+    assert result["ask1_volume"] == "1"
     assert result["open_price"] == "0.7800"
     assert result["close_price"] == "0.8000"
     assert result["high_price"] == "0.8965"
@@ -362,4 +366,134 @@ def test_sync_daily_keeps_successful_exchange_rows_when_other_exchange_fails(
 
     assert len(fake_db.info_rows) == 5
     assert len(fake_db.daily_rows) == 10
+    assert len(fake_db.stats_rows) == 5
+
+
+def test_sync_daily_succeeds_when_product_stats_are_not_published(monkeypatch):
+    class FakeDb:
+        def __init__(self):
+            self.daily_rows = []
+
+        async def init_pool(self):
+            return None
+
+        async def ensure_exchange_option_tables(self):
+            return None
+
+        async def batch_exchange_option_contract_info(self, rows):
+            return len(rows)
+
+        async def batch_exchange_option_contract_daily_data(self, rows):
+            self.daily_rows.extend(rows)
+            return len(rows)
+
+        async def batch_exchange_option_daily_stats(self, rows):
+            return len(rows)
+
+        async def close(self):
+            return None
+
+    fake_db = FakeDb()
+    monkeypatch.setattr(exchange_option, "DbTools", lambda: fake_db)
+
+    rows = {
+        exchange: [
+            exchange_option.build_contract_row(
+                exchange=exchange,
+                contract_code=f"{exchange}{index}",
+                contract_trade_code=f"{underlying}C2607M03000",
+                contract_name=f"{underlying} test",
+                trade_date="2026-07-14",
+            )
+            for index, underlying in enumerate(products, start=1)
+        ]
+        for exchange, products in exchange_option.EXCHANGE_OPTION_PRODUCTS.items()
+    }
+    monkeypatch.setattr(
+        exchange_option,
+        "fetch_sse_current_contract_rows_sync",
+        lambda target: rows["SSE"],
+    )
+    monkeypatch.setattr(
+        exchange_option,
+        "fetch_szse_current_contract_rows_sync",
+        lambda target: rows["SZSE"],
+    )
+    monkeypatch.setattr(exchange_option, "fetch_sse_stats_rows_sync", lambda target: [])
+    monkeypatch.setattr(exchange_option, "fetch_szse_stats_rows_sync", lambda target: [])
+    monkeypatch.setattr(
+        exchange_option,
+        "fetch_sina_quotes_sync",
+        lambda codes: {
+            code: {"trade_date": "2026-07-14", "close_price": 1}
+            for code in codes
+        },
+    )
+
+    async def fake_official_target_rows(contract_rows, _target):
+        return (
+            {
+                exchange: [
+                    {
+                        **row,
+                        "trade_date": "2026-07-14",
+                        "close_price": 1,
+                        "volume": 1,
+                        "turnover": 1,
+                    }
+                    for row in contract_rows
+                    if row.get("exchange") == exchange
+                ]
+                for exchange in exchange_option.EXCHANGE_OPTION_PRODUCTS
+            },
+            {"SSE": [], "SZSE": []},
+        )
+
+    monkeypatch.setattr(
+        exchange_option,
+        "fetch_official_target_rows",
+        fake_official_target_rows,
+    )
+
+    result = asyncio.run(exchange_option.sync_daily("2026-07-14"))
+
+    assert result["status"] == "SUCCESS"
+    assert result["stats_status"] == "source_pending"
+    assert "期权产品覆盖不完整" in result["warnings"][0]
+    assert len(fake_db.daily_rows) == 18
+
+
+def test_sync_stats_daily_requires_complete_product_coverage(monkeypatch):
+    class FakeDb:
+        def __init__(self):
+            self.stats_rows = []
+
+        async def init_pool(self):
+            return None
+
+        async def ensure_exchange_option_tables(self):
+            return None
+
+        async def batch_exchange_option_daily_stats(self, rows):
+            self.stats_rows.extend(rows)
+            return len(rows)
+
+        async def close(self):
+            return None
+
+    fake_db = FakeDb()
+    monkeypatch.setattr(exchange_option, "DbTools", lambda: fake_db)
+    monkeypatch.setattr(
+        exchange_option,
+        "fetch_sse_stats_rows_sync",
+        lambda target: [
+            {"exchange": "SSE", "underlying_code": code, "trade_date": "2026-07-14"}
+            for code in exchange_option.EXCHANGE_OPTION_PRODUCTS["SSE"]
+        ],
+    )
+    monkeypatch.setattr(exchange_option, "fetch_szse_stats_rows_sync", lambda target: [])
+
+    with pytest.raises(RuntimeError, match="SZSE缺少"):
+        asyncio.run(exchange_option.sync_stats_daily("2026-07-14"))
+
     assert len(fake_db.stats_rows) == 5

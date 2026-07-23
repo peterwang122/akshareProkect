@@ -16,9 +16,13 @@ from akshare_project.collectors import (  # noqa: E402
     excel_emotion,
     failed_tasks,
     forex,
+    fund_purchase_limit,
     futures,
     index,
+    macro,
+    margin_trading,
     option,
+    option_minute,
     quant_index,
     risk_free_rate,
     runner,
@@ -38,7 +42,8 @@ async def dispatch():
         raise ValueError(
             "usage: python run.py <domain> <command> [args]\n"
             "domains: stock, index, quant-index, cffex, douyin, forex, futures, etf, "
-            "option, exchange-option, risk-free-rate, runner, emotion-excel"
+            "option, option-minute, exchange-option, risk-free-rate, macro, margin-trading, fund-purchase-limit, "
+            "runner, emotion-excel"
         )
 
     domain = sys.argv[1].strip().lower()
@@ -81,6 +86,10 @@ async def dispatch():
         set_argv("option", [command, *args])
         await option.main()
         return
+    if domain == "option-minute":
+        set_argv("option_minute", [command, *args])
+        await option_minute.main()
+        return
     if domain == "exchange-option":
         set_argv("exchange-option", [command, *args])
         await exchange_option.main()
@@ -88,6 +97,18 @@ async def dispatch():
     if domain == "risk-free-rate":
         set_argv("risk-free-rate", [command, *args])
         await risk_free_rate.main()
+        return
+    if domain == "macro":
+        set_argv("macro", [command, *args])
+        await macro.main()
+        return
+    if domain == "margin-trading":
+        set_argv("margin-trading", [command, *args])
+        await margin_trading.main()
+        return
+    if domain == "fund-purchase-limit":
+        set_argv("fund-purchase-limit", [command, *args])
+        await fund_purchase_limit.main()
         return
     if domain == "runner":
         if command == "daily":

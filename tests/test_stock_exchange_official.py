@@ -76,6 +76,37 @@ def test_build_szse_official_row_merges_daily_and_key_metrics():
     assert row["raw_metrics_json"] == metrics_payload
 
 
+def test_build_szse_official_row_keeps_historical_trade_data_when_metrics_are_newer():
+    stock_row = {
+        "stock_code": "000001",
+        "prefixed_code": "sz000001",
+        "stock_name": "平安银行",
+    }
+    daily_row = stock.normalize_szse_history_row(
+        ["2026-07-10", "11.00", "11.20", "10.90", "11.35", "0.20", "1.82", "936958", "1048807160.00"]
+    )
+    metrics_payload = {
+        "lastDate": "2026-07-13",
+        "data": [{"now_sjzz": "2173.91", "now_syl": "4.87"}],
+    }
+
+    row = stock.build_szse_official_row(
+        stock_row,
+        "2026-07-10",
+        daily_row,
+        metrics_payload,
+        allow_historical_metrics_fallback=True,
+    )
+
+    assert row["trade_date"] == "2026-07-10"
+    assert row["turnover_amount"] == "1048807160.00"
+    assert row["total_market_value"] is None
+    assert row["pe_rate"] is None
+    assert row["data_source"] == "szse_official_daily_history_no_metrics"
+    assert row["raw_metrics_json"]["status"] == "metrics_not_available_for_target_date"
+    assert row["raw_metrics_json"]["source_latest_date"] == "2026-07-13"
+
+
 def test_official_exchange_rate_limiter_spacing():
     current = [100.0]
     sleeps = []
@@ -102,6 +133,44 @@ def test_official_exchange_rate_limiter_spacing():
     asyncio.run(run_waits())
 
     assert sleeps == pytest.approx([2.0, 0.75])
+
+
+def test_official_exchange_http_client_retries_transient_connection_error(monkeypatch):
+    sleeps = []
+    attempts = []
+    client = stock.OfficialExchangeHttpClient(
+        "SH",
+        limiter=stock.OfficialExchangeRateLimiter(interval_seconds=0),
+        max_attempts=3,
+        retry_backoff_seconds=2,
+        sleep_func=lambda seconds: _record_sleep(sleeps, seconds),
+    )
+
+    def fake_get_text_sync(_url, _params, _headers):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise stock.requests.ConnectionError("temporary disconnect")
+        return "ok"
+
+    async def run_request():
+        monkeypatch.setattr(client, "_get_text_sync", fake_get_text_sync)
+        try:
+            return await client.get_text("https://example.test")
+        finally:
+            client.close()
+
+    async def _unused():
+        return None
+
+    result = asyncio.run(run_request())
+
+    assert result == "ok"
+    assert len(attempts) == 2
+    assert sleeps == [2.0]
+
+
+async def _record_sleep(target, seconds):
+    target.append(seconds)
 
 
 def test_sync_exchange_official_daily_starts_sh_and_sz_collectors_concurrently(monkeypatch):
@@ -138,6 +207,7 @@ def test_sync_exchange_official_daily_starts_sh_and_sz_collectors_concurrently(m
             "row_count": 1,
             "upserted_count": 1,
             "turnover_amount_count": 1,
+            "collected_codes": [stock_rows[0]["prefixed_code"]],
             "missing_codes": [],
             "missing_count": 0,
             "failed_items": [],
@@ -160,6 +230,61 @@ def test_sync_exchange_official_daily_starts_sh_and_sz_collectors_concurrently(m
     assert result["upserted"] == 2
     assert result["turnover_amount_count"] == 2
     assert len(db_tools.upserted_rows) == 2
+
+
+def test_sync_exchange_official_daily_resumes_only_missing_codes(monkeypatch):
+    class FakeDbTools:
+        async def ensure_stock_exchange_official_daily_table(self):
+            return None
+
+        async def get_all_stock_info_rows(self):
+            return [
+                {"stock_code": "600000", "prefixed_code": "sh600000", "exchange": "SH", "security_type": "A"},
+                {"stock_code": "600004", "prefixed_code": "sh600004", "exchange": "SH", "security_type": "A"},
+                {"stock_code": "000001", "prefixed_code": "sz000001", "exchange": "SZ", "security_type": "A"},
+            ]
+
+        async def get_stock_exchange_official_daily_coverage_by_date(self, _trade_date, exchange):
+            if exchange == "SH":
+                return {"sh600000": True}
+            return {"sz000001": True}
+
+    collected = {}
+
+    async def fake_collect(exchange, stock_rows, target_date, db_tools=None, request_interval_seconds=2.0):
+        collected[exchange] = [row["prefixed_code"] for row in stock_rows]
+        return {
+            "exchange": exchange,
+            "target_count": len(stock_rows),
+            "row_count": len(stock_rows),
+            "upserted_count": len(stock_rows),
+            "turnover_amount_count": len(stock_rows),
+            "collected_codes": collected[exchange],
+            "missing_codes": [],
+            "missing_count": 0,
+            "failed_items": [],
+            "failed_count": 0,
+            "latest_source_date": target_date if stock_rows else None,
+        }
+
+    monkeypatch.setattr(stock, "collect_exchange_official_rows", fake_collect)
+
+    result = asyncio.run(
+        stock.sync_exchange_official_daily(
+            db_tools=FakeDbTools(),
+            target_date="2026-04-30",
+            request_interval_seconds=2,
+        )
+    )
+
+    assert collected == {"SH": ["sh600004"], "SZ": []}
+    assert result["upserted"] == 1
+    assert result["sh"]["row_count"] == 2
+    assert result["sh"]["resumed_count"] == 1
+    assert result["sh"]["pending_count"] == 1
+    assert result["sz"]["row_count"] == 1
+    assert result["sz"]["resumed_count"] == 1
+    assert result["sz"]["pending_count"] == 0
 
 
 def test_collect_exchange_official_rows_upserts_each_row_immediately(monkeypatch):

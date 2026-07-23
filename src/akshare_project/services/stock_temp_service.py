@@ -4,7 +4,7 @@ import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Awaitable, Callable, Dict
 
@@ -17,9 +17,13 @@ from akshare_project.collectors import (
     exchange_option,
     excel_emotion,
     forex,
+    fund_purchase_limit,
     futures,
     index,
+    macro,
+    margin_trading,
     option,
+    option_minute,
     quant_index,
     risk_free_rate,
     stock,
@@ -42,6 +46,85 @@ class DailyRoute:
     task_name: str
     handler: AsyncHandler
     direct_network: bool = False
+
+
+class DouyinPersistentBrowserRunner:
+    def __init__(self):
+        self._state_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._thread = None
+        self._loop = None
+        self._session = None
+
+    def _thread_main(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._session = douyin_emotion.PersistentDouyinBrowserSession(headless=True)
+        self._ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    def _ensure_started(self):
+        with self._state_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._ready.clear()
+            self._thread = threading.Thread(
+                target=self._thread_main,
+                name="douyin-persistent-browser",
+                daemon=True,
+            )
+            self._thread.start()
+        if not self._ready.wait(timeout=10):
+            raise RuntimeError("抖音常驻浏览器后台线程启动超时")
+
+    async def _run(self, target_date, keep_browser_open, browser_close_at):
+        normalized_target_date = (
+            date.fromisoformat(str(target_date))
+            if target_date
+            else datetime.now(douyin_emotion.SHANGHAI_TZ).date()
+        )
+        close_at = None
+        if browser_close_at:
+            close_at = datetime.fromisoformat(str(browser_close_at))
+            if close_at.tzinfo is None:
+                close_at = close_at.replace(tzinfo=douyin_emotion.SHANGHAI_TZ)
+        return await self._session.run(
+            normalized_target_date,
+            keep_browser_open=bool(keep_browser_open),
+            close_at=close_at,
+        )
+
+    def run(self, *, target_date=None, keep_browser_open=False, browser_close_at=None):
+        self._ensure_started()
+        future = asyncio.run_coroutine_threadsafe(
+            self._run(target_date, keep_browser_open, browser_close_at),
+            self._loop,
+        )
+        return future.result(timeout=1800)
+
+    def close(self):
+        with self._state_lock:
+            thread = self._thread
+            loop = self._loop
+            session = self._session
+        if thread is None or loop is None or not thread.is_alive():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(session.close(), loop).result(timeout=30)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=10)
+            with self._state_lock:
+                self._thread = None
+                self._loop = None
+                self._session = None
+
+
+DOUYIN_BROWSER_RUNNER = DouyinPersistentBrowserRunner()
 
 
 def print(*args, **kwargs):
@@ -190,10 +273,48 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             handler=lambda target_date=None: exchange_option.sync_daily(target_date=target_date),
             direct_network=True,
         ),
+        "/collect-exchange-option-stats-daily": DailyRoute(
+            path="/collect-exchange-option-stats-daily",
+            task_name="exchange_option_stats_daily",
+            handler=lambda target_date=None: exchange_option.sync_stats_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
+        "/collect-option-minute-daily": DailyRoute(
+            path="/collect-option-minute-daily",
+            task_name="option_minute_daily",
+            handler=lambda target_date=None: option_minute.run_daily_session(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
         "/collect-cn-risk-free-rate-daily": DailyRoute(
             path="/collect-cn-risk-free-rate-daily",
             task_name="cn_risk_free_rate_daily",
             handler=lambda target_date=None: risk_free_rate.sync_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
+        "/collect-cn-macro-daily": DailyRoute(
+            path="/collect-cn-macro-daily",
+            task_name="cn_macro_daily",
+            handler=lambda target_date=None: macro.sync_daily(target_date=target_date),
+            direct_network=True,
+        ),
+        "/collect-margin-trading-daily": DailyRoute(
+            path="/collect-margin-trading-daily",
+            task_name="margin_trading_daily",
+            handler=lambda target_date=None: margin_trading.sync_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
+        "/collect-fund-purchase-limit-daily": DailyRoute(
+            path="/collect-fund-purchase-limit-daily",
+            task_name="fund_purchase_limit_daily",
+            handler=lambda target_date=None: fund_purchase_limit.sync_daily(
                 target_date=target_date
             ),
             direct_network=True,
@@ -327,7 +448,12 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "stock_exchange_official_daily",
             "douyin_coze_emotion_daily",
             "exchange_option_daily",
+            "exchange_option_stats_daily",
+            "option_minute_daily",
             "cn_risk_free_rate_daily",
+            "cn_macro_daily",
+            "margin_trading_daily",
+            "fund_purchase_limit_daily",
         }
         if payload and route.task_name not in payload_task_names:
             self._send_json(
@@ -346,6 +472,8 @@ class StockTempHandler(BaseHTTPRequestHandler):
             with context:
                 if route.task_name in payload_task_names:
                     allowed_keys = {"target_date"}
+                    if route.task_name == "douyin_coze_emotion_daily":
+                        allowed_keys.update({"keep_browser_open", "browser_close_at"})
                     unexpected_keys = sorted(set(payload) - allowed_keys)
                     if unexpected_keys:
                         self._send_json(
@@ -356,7 +484,14 @@ class StockTempHandler(BaseHTTPRequestHandler):
                             },
                         )
                         return
-                    result = asyncio.run(route.handler(target_date=payload.get("target_date")))
+                    if route.task_name == "douyin_coze_emotion_daily":
+                        result = DOUYIN_BROWSER_RUNNER.run(
+                            target_date=payload.get("target_date"),
+                            keep_browser_open=payload.get("keep_browser_open", False),
+                            browser_close_at=payload.get("browser_close_at"),
+                        )
+                    else:
+                        result = asyncio.run(route.handler(target_date=payload.get("target_date")))
                 else:
                     result = asyncio.run(route.handler())
         except Exception as exc:
@@ -450,6 +585,7 @@ def run_stock_temp_service():
     except KeyboardInterrupt:
         print("stock temp service stopped by keyboard interrupt")
     finally:
+        DOUYIN_BROWSER_RUNNER.close()
         server.server_close()
 
 

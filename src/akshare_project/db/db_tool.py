@@ -1,6 +1,7 @@
 import json
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 
 import aiomysql
 
@@ -20,6 +21,12 @@ QUANT_INDEX_BASIS_DELTA_FIELDS = tuple(
     f"basis_{basis_kind}_delta_{window}d"
     for basis_kind in BASIS_DELTA_KINDS
     for window in BASIS_DELTA_WINDOWS
+)
+QUANT_INDEX_MARGIN_TRADING_FIELDS = (
+    "margin_financing_balance",
+    "margin_securities_lending_balance",
+    "margin_total_balance",
+    "margin_financing_net_buy_amount",
 )
 
 
@@ -89,6 +96,8 @@ class DbTools:
         'option_pc_quarter_2': 9999999999.9999,
         'option_volume_pc_ratio': 9999999999.9999,
         'option_turnover_pc_ratio': 9999999999.9999,
+        'fund_purchase_limit_pct': 100.0,
+        **{field: 9999999999999999999999.99 for field in QUANT_INDEX_MARGIN_TRADING_FIELDS},
         **{field: 99999999999999.99 for field in QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS},
         **{field: 99999999999999.99 for field in QUANT_INDEX_BASIS_DELTA_FIELDS},
     }
@@ -122,6 +131,12 @@ class DbTools:
     )
     QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS = QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS
     QUANT_INDEX_BASIS_DELTA_FIELDS = QUANT_INDEX_BASIS_DELTA_FIELDS
+    QUANT_INDEX_FUND_PURCHASE_LIMIT_FIELDS = (
+        'fund_purchase_limit_count',
+        'fund_purchase_limit_total_count',
+        'fund_purchase_limit_pct',
+    )
+    QUANT_INDEX_MARGIN_TRADING_FIELDS = QUANT_INDEX_MARGIN_TRADING_FIELDS
     INDEX_BASIC_TABLES = {'index_basic_info', 'index_us_basic_info', 'index_hk_basic_info', 'index_qvix_basic_info'}
     INDEX_DAILY_TABLES = {'index_daily_data', 'index_us_daily_data', 'index_hk_daily_data', 'index_qvix_daily_data'}
     INDEX_FUTURES_CONTRACT_TABLES = {
@@ -139,7 +154,11 @@ class DbTools:
         self._stock_hfq_change_columns_ready = False
         self._stock_exchange_official_daily_table_ready = False
         self._exchange_option_tables_ready = False
+        self._option_minute_tables_ready = False
         self._cn_risk_free_rate_table_ready = False
+        self._cn_macro_tables_ready = False
+        self._fund_purchase_limit_daily_table_ready = False
+        self._margin_trading_daily_table_ready = False
         self._quant_index_dashboard_option_pc_columns_ready = False
 
     def load_db_info(self):
@@ -613,6 +632,21 @@ class DbTools:
         for field in self.QUANT_INDEX_BASIS_DELTA_FIELDS:
             value = self._normalize_numeric(field, row.get(field))
             sanitized[field] = round(float(value), 6) if value is not None else None
+        for field in ('fund_purchase_limit_count', 'fund_purchase_limit_total_count'):
+            raw_value = row.get(field)
+            sanitized[field] = int(raw_value) if raw_value is not None else None
+        fund_purchase_limit_pct = self._normalize_numeric(
+            'fund_purchase_limit_pct',
+            row.get('fund_purchase_limit_pct'),
+        )
+        sanitized['fund_purchase_limit_pct'] = (
+            round(max(0.0, min(100.0, float(fund_purchase_limit_pct))), 6)
+            if fund_purchase_limit_pct is not None
+            else None
+        )
+        for field in self.QUANT_INDEX_MARGIN_TRADING_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(float(value), 2) if value is not None else None
         for field in self.QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS:
             raw_value = row.get(field)
             sanitized[field] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
@@ -1123,6 +1157,104 @@ class DbTools:
 
         self._exchange_option_tables_ready = True
 
+    async def ensure_option_minute_tables(self):
+        if self._option_minute_tables_ready:
+            return
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS option_contract_minute_data (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        exchange VARCHAR(16) NOT NULL,
+                        contract_code VARCHAR(32) NOT NULL,
+                        contract_trade_code VARCHAR(64) NULL,
+                        underlying_code VARCHAR(16) NOT NULL,
+                        option_type VARCHAR(16) NOT NULL,
+                        contract_month VARCHAR(8) NOT NULL,
+                        strike_price DECIMAL(18, 6) NOT NULL,
+                        expire_date DATE NOT NULL,
+                        trade_date DATE NOT NULL,
+                        bar_time DATETIME NOT NULL,
+                        open_price DECIMAL(18, 8) NULL,
+                        high_price DECIMAL(18, 8) NULL,
+                        low_price DECIMAL(18, 8) NULL,
+                        close_price DECIMAL(18, 8) NULL,
+                        bid1_price DECIMAL(18, 8) NULL,
+                        bid1_volume DECIMAL(24, 2) NULL,
+                        ask1_price DECIMAL(18, 8) NULL,
+                        ask1_volume DECIMAL(24, 2) NULL,
+                        mid_price DECIMAL(18, 8) NULL,
+                        average_price DECIMAL(18, 8) NULL,
+                        minute_volume DECIMAL(24, 2) NULL,
+                        cumulative_volume DECIMAL(24, 2) NULL,
+                        cumulative_turnover DECIMAL(24, 2) NULL,
+                        open_interest DECIMAL(24, 2) NULL,
+                        quote_count INT NOT NULL DEFAULT 1,
+                        price_basis VARCHAR(32) NOT NULL,
+                        data_source VARCHAR(64) NOT NULL,
+                        source_url VARCHAR(512) NULL,
+                        raw_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_option_contract_minute (
+                            exchange, contract_code, bar_time
+                        ),
+                        KEY idx_option_minute_source_time (
+                            exchange, underlying_code, bar_time
+                        ),
+                        KEY idx_option_minute_trade_date (trade_date, exchange),
+                        KEY idx_option_minute_contract_date (
+                            contract_code, trade_date
+                        )
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS option_vix_minute_data (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        index_name VARCHAR(64) NOT NULL,
+                        source_key VARCHAR(64) NOT NULL,
+                        exchange VARCHAR(16) NOT NULL,
+                        product_code VARCHAR(16) NOT NULL,
+                        trade_date DATE NOT NULL,
+                        bar_time DATETIME NOT NULL,
+                        vix_value DECIMAL(18, 8) NOT NULL,
+                        near_contract_month VARCHAR(8) NULL,
+                        near_expire_date DATE NULL,
+                        near_strike_count INT NULL,
+                        next_contract_month VARCHAR(8) NULL,
+                        next_expire_date DATE NULL,
+                        next_strike_count INT NULL,
+                        risk_free_curve_date DATE NULL,
+                        near_risk_free_rate DECIMAL(18, 10) NULL,
+                        next_risk_free_rate DECIMAL(18, 10) NULL,
+                        price_basis VARCHAR(32) NOT NULL,
+                        calculation_method VARCHAR(64) NOT NULL,
+                        quality_json LONGTEXT NULL,
+                        created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (id),
+                        UNIQUE KEY uk_option_vix_minute (source_key, bar_time),
+                        KEY idx_option_vix_minute_index_time (
+                            index_name, bar_time
+                        ),
+                        KEY idx_option_vix_minute_trade_date (
+                            trade_date, source_key
+                        )
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await conn.commit()
+
+        self._option_minute_tables_ready = True
+
     async def ensure_cn_risk_free_rate_table(self):
         if self._cn_risk_free_rate_table_ready:
             return
@@ -1522,6 +1654,49 @@ class DbTools:
                 await cursor.executemany(query, values)
                 await conn.commit()
                 return len(sanitized_rows)
+
+    async def get_stock_exchange_official_daily_coverage_by_date(
+        self,
+        trade_date,
+        exchange,
+    ):
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_stock_exchange_official_daily_table()
+
+        normalized_trade_date = str(trade_date or '').split(' ')[0].strip()
+        normalized_exchange = str(exchange or '').strip().upper()
+        if not normalized_trade_date or normalized_exchange not in {'SH', 'SZ'}:
+            return {}
+
+        query = """
+        SELECT
+            prefixed_code,
+            CASE
+                WHEN close_price IS NOT NULL
+                 AND turnover_amount IS NOT NULL
+                 AND raw_trading_json IS NOT NULL
+                 AND raw_metrics_json IS NOT NULL
+                THEN 1 ELSE 0
+            END AS is_complete
+        FROM stock_exchange_official_daily_data
+        WHERE trade_date = %s
+          AND exchange = %s
+        ORDER BY prefixed_code ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    query,
+                    (normalized_trade_date, normalized_exchange),
+                )
+                rows = await cursor.fetchall()
+                return {
+                    str(row[0]).strip().lower(): bool(row[1])
+                    for row in rows
+                    if row and row[0]
+                }
 
     async def get_stock_daily_prefixed_codes_by_date(self, trade_date):
         if self.pool is None:
@@ -2615,6 +2790,7 @@ class DbTools:
             zz500_emotion,
             zz1000_emotion,
             sz50_emotion,
+            raw_ocr_text,
             extraction_status
         FROM douyin_index_emotion_daily
         WHERE emotion_date = %s
@@ -3668,6 +3844,413 @@ class DbTools:
             }
             for row in rows
         ]
+
+    async def list_option_minute_exchange_contract_rows(
+        self,
+        start_date,
+        end_date,
+        underlying_codes,
+    ):
+        await self.ensure_exchange_option_tables()
+        normalized_codes = [
+            str(code).strip()
+            for code in (underlying_codes or [])
+            if str(code).strip()
+        ]
+        if not normalized_codes:
+            return []
+        placeholders = ",".join(["%s"] * len(normalized_codes))
+        query = f"""
+        SELECT
+            exchange,
+            contract_code,
+            contract_trade_code,
+            contract_name,
+            underlying_code,
+            underlying_name,
+            option_type,
+            contract_month,
+            strike_price,
+            listed_date,
+            last_trade_date,
+            COALESCE(expire_date, last_trade_date) AS expire_date
+        FROM option_exchange_contract_info
+        WHERE underlying_code IN ({placeholders})
+          AND listed_date <= %s
+          AND COALESCE(last_trade_date, expire_date) >= %s
+          AND option_type IN ('CALL', 'PUT')
+          AND strike_price IS NOT NULL
+        ORDER BY exchange, underlying_code, expire_date, strike_price, option_type
+        """
+        params = [*normalized_codes, str(end_date), str(start_date)]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def batch_option_contract_minute_data(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_option_minute_tables()
+        deduped = {}
+        for raw_row in rows:
+            exchange = str(raw_row.get("exchange") or "").strip().upper()
+            contract_code = str(raw_row.get("contract_code") or "").strip()
+            underlying_code = str(raw_row.get("underlying_code") or "").strip().upper()
+            option_type = str(raw_row.get("option_type") or "").strip().upper()
+            contract_month = str(raw_row.get("contract_month") or "").strip()
+            expire_date = str(raw_row.get("expire_date") or "").split(" ")[0]
+            trade_date = str(raw_row.get("trade_date") or "").split(" ")[0]
+            bar_time = str(raw_row.get("bar_time") or "").strip()
+            strike_price = self._normalize_numeric(
+                "close_price",
+                raw_row.get("strike_price"),
+            )
+            strike_price = round(strike_price, 6) if strike_price is not None else None
+            if (
+                exchange not in {"CFFEX", "SSE", "SZSE"}
+                or not contract_code
+                or not underlying_code
+                or option_type not in {"CALL", "PUT"}
+                or not contract_month
+                or strike_price is None
+                or not expire_date
+                or not trade_date
+                or not bar_time
+            ):
+                continue
+            row = {
+                **raw_row,
+                "exchange": exchange,
+                "contract_code": contract_code,
+                "contract_trade_code": str(
+                    raw_row.get("contract_trade_code") or ""
+                ).strip() or None,
+                "underlying_code": underlying_code,
+                "option_type": option_type,
+                "contract_month": contract_month,
+                "strike_price": strike_price,
+                "expire_date": expire_date,
+                "trade_date": trade_date,
+                "bar_time": bar_time,
+                "price_basis": str(
+                    raw_row.get("price_basis") or "last"
+                ).strip() or "last",
+                "data_source": str(
+                    raw_row.get("data_source") or "unknown"
+                ).strip() or "unknown",
+                "source_url": str(raw_row.get("source_url") or "").strip() or None,
+            }
+            for field in (
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "bid1_price",
+                "bid1_volume",
+                "ask1_price",
+                "ask1_volume",
+                "mid_price",
+                "average_price",
+                "minute_volume",
+                "cumulative_volume",
+                "cumulative_turnover",
+                "open_interest",
+            ):
+                normalize_field = (
+                    "volume"
+                    if field.endswith("volume") or field == "open_interest"
+                    else "turnover"
+                    if field == "cumulative_turnover"
+                    else "close_price"
+                )
+                row[field] = self._normalize_numeric(
+                    normalize_field,
+                    raw_row.get(field),
+                )
+                if row[field] is not None:
+                    row[field] = round(
+                        row[field],
+                        2 if normalize_field in {"volume", "turnover"} else 8,
+                    )
+            raw_json = raw_row.get("raw_json")
+            row["raw_json"] = (
+                json.dumps(raw_json, ensure_ascii=False, default=str)
+                if raw_json is not None and not isinstance(raw_json, str)
+                else raw_json
+            )
+            row["quote_count"] = max(1, int(raw_row.get("quote_count") or 1))
+            deduped[(exchange, contract_code, bar_time)] = row
+
+        if not deduped:
+            return 0
+        values = [
+            (
+                row["exchange"],
+                row["contract_code"],
+                row["contract_trade_code"],
+                row["underlying_code"],
+                row["option_type"],
+                row["contract_month"],
+                row["strike_price"],
+                row["expire_date"],
+                row["trade_date"],
+                row["bar_time"],
+                row["open_price"],
+                row["high_price"],
+                row["low_price"],
+                row["close_price"],
+                row["bid1_price"],
+                row["bid1_volume"],
+                row["ask1_price"],
+                row["ask1_volume"],
+                row["mid_price"],
+                row["average_price"],
+                row["minute_volume"],
+                row["cumulative_volume"],
+                row["cumulative_turnover"],
+                row["open_interest"],
+                row["quote_count"],
+                row["price_basis"],
+                row["data_source"],
+                row["source_url"],
+                row["raw_json"],
+            )
+            for row in deduped.values()
+        ]
+        query = """
+        INSERT INTO option_contract_minute_data (
+            exchange, contract_code, contract_trade_code, underlying_code,
+            option_type, contract_month, strike_price, expire_date,
+            trade_date, bar_time, open_price, high_price, low_price, close_price,
+            bid1_price, bid1_volume, ask1_price, ask1_volume, mid_price,
+            average_price, minute_volume, cumulative_volume, cumulative_turnover,
+            open_interest, quote_count, price_basis, data_source, source_url,
+            raw_json
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON DUPLICATE KEY UPDATE
+            open_price = COALESCE(open_price, VALUES(open_price)),
+            high_price = CASE
+                WHEN VALUES(high_price) IS NULL THEN high_price
+                WHEN high_price IS NULL THEN VALUES(high_price)
+                ELSE GREATEST(high_price, VALUES(high_price))
+            END,
+            low_price = CASE
+                WHEN VALUES(low_price) IS NULL THEN low_price
+                WHEN low_price IS NULL THEN VALUES(low_price)
+                ELSE LEAST(low_price, VALUES(low_price))
+            END,
+            close_price = COALESCE(VALUES(close_price), close_price),
+            bid1_price = COALESCE(VALUES(bid1_price), bid1_price),
+            bid1_volume = COALESCE(VALUES(bid1_volume), bid1_volume),
+            ask1_price = COALESCE(VALUES(ask1_price), ask1_price),
+            ask1_volume = COALESCE(VALUES(ask1_volume), ask1_volume),
+            mid_price = COALESCE(VALUES(mid_price), mid_price),
+            average_price = COALESCE(VALUES(average_price), average_price),
+            minute_volume = COALESCE(VALUES(minute_volume), minute_volume),
+            cumulative_volume = COALESCE(VALUES(cumulative_volume), cumulative_volume),
+            cumulative_turnover = COALESCE(VALUES(cumulative_turnover), cumulative_turnover),
+            open_interest = COALESCE(VALUES(open_interest), open_interest),
+            quote_count = GREATEST(quote_count, VALUES(quote_count)),
+            price_basis = VALUES(price_basis),
+            data_source = VALUES(data_source),
+            source_url = COALESCE(VALUES(source_url), source_url),
+            raw_json = COALESCE(VALUES(raw_json), raw_json)
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for offset in range(0, len(values), 2000):
+                    await cursor.executemany(query, values[offset : offset + 2000])
+                await conn.commit()
+        return len(values)
+
+    async def get_option_contract_minute_rows(self, start_time, end_time):
+        await self.ensure_option_minute_tables()
+        query = """
+        SELECT
+            exchange, contract_code, contract_trade_code, underlying_code,
+            option_type, contract_month, strike_price, expire_date,
+            trade_date, bar_time, open_price, high_price, low_price, close_price,
+            bid1_price, bid1_volume, ask1_price, ask1_volume, mid_price,
+            average_price, minute_volume, cumulative_volume, cumulative_turnover,
+            open_interest, price_basis, data_source
+        FROM option_contract_minute_data
+        WHERE bar_time BETWEEN %s AND %s
+        ORDER BY bar_time, exchange, underlying_code, expire_date, strike_price,
+                 option_type
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, (str(start_time), str(end_time)))
+                return list(await cursor.fetchall())
+
+    async def batch_option_vix_minute_data(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_option_minute_tables()
+        values = []
+        for row in rows:
+            exchange = str(row.get("exchange") or "").strip().upper()
+            product_code = str(row.get("product_code") or "").strip().upper()
+            source_key = f"{exchange.lower()}:{product_code}" if exchange and product_code else ""
+            vix_value = self._normalize_numeric("close_value", row.get("vix_value"))
+            if vix_value is None:
+                continue
+            vix_value = round(vix_value, 8)
+            near_rate = self._normalize_numeric(
+                "close_value", row.get("near_risk_free_rate")
+            )
+            next_rate = self._normalize_numeric(
+                "close_value", row.get("next_risk_free_rate")
+            )
+            quality_json = row.get("quality_json")
+            if quality_json is not None and not isinstance(quality_json, str):
+                quality_json = json.dumps(
+                    quality_json,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            values.append(
+                (
+                    str(row.get("index_name") or "").strip(),
+                    source_key,
+                    exchange,
+                    product_code,
+                    str(row.get("trade_date") or "").split(" ")[0],
+                    str(row.get("bar_time") or "").strip(),
+                    vix_value,
+                    row.get("near_contract_month"),
+                    row.get("near_expire_date"),
+                    row.get("near_strike_count"),
+                    row.get("next_contract_month"),
+                    row.get("next_expire_date"),
+                    row.get("next_strike_count"),
+                    row.get("risk_free_curve_date"),
+                    round(near_rate, 10) if near_rate is not None else None,
+                    round(next_rate, 10) if next_rate is not None else None,
+                    str(row.get("price_basis") or "mid_quote").strip(),
+                    str(row.get("calculation_method") or "ivix_30d_minute").strip(),
+                    quality_json,
+                )
+            )
+        values = [value for value in values if all(value[index] for index in (0, 1, 2, 3, 4, 5))]
+        if not values:
+            return 0
+        query = """
+        INSERT INTO option_vix_minute_data (
+            index_name, source_key, exchange, product_code, trade_date, bar_time,
+            vix_value, near_contract_month, near_expire_date, near_strike_count,
+            next_contract_month, next_expire_date, next_strike_count,
+            risk_free_curve_date, near_risk_free_rate, next_risk_free_rate,
+            price_basis, calculation_method, quality_json
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON DUPLICATE KEY UPDATE
+            vix_value = VALUES(vix_value),
+            near_contract_month = VALUES(near_contract_month),
+            near_expire_date = VALUES(near_expire_date),
+            near_strike_count = VALUES(near_strike_count),
+            next_contract_month = VALUES(next_contract_month),
+            next_expire_date = VALUES(next_expire_date),
+            next_strike_count = VALUES(next_strike_count),
+            risk_free_curve_date = VALUES(risk_free_curve_date),
+            near_risk_free_rate = VALUES(near_risk_free_rate),
+            next_risk_free_rate = VALUES(next_risk_free_rate),
+            price_basis = VALUES(price_basis),
+            calculation_method = VALUES(calculation_method),
+            quality_json = VALUES(quality_json)
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def get_option_vix_minute_daily_ohlc(self, start_date, end_date):
+        await self.ensure_option_minute_tables()
+        query = """
+        SELECT
+            aggregate_rows.trade_date,
+            aggregate_rows.source_key,
+            aggregate_rows.index_name,
+            aggregate_rows.exchange,
+            aggregate_rows.product_code,
+            open_row.vix_value AS vix_open,
+            aggregate_rows.vix_high,
+            aggregate_rows.vix_low,
+            close_row.vix_value AS vix_close,
+            aggregate_rows.minute_count,
+            aggregate_rows.mid_quote_count,
+            close_row.near_contract_month,
+            close_row.near_expire_date,
+            close_row.near_strike_count,
+            close_row.next_contract_month,
+            close_row.next_expire_date,
+            close_row.next_strike_count,
+            close_row.risk_free_curve_date,
+            close_row.near_risk_free_rate,
+            close_row.next_risk_free_rate,
+            close_row.price_basis,
+            close_row.calculation_method
+        FROM (
+            SELECT
+                trade_date,
+                source_key,
+                MAX(index_name) AS index_name,
+                MAX(exchange) AS exchange,
+                MAX(product_code) AS product_code,
+                MIN(bar_time) AS first_bar_time,
+                MAX(bar_time) AS last_bar_time,
+                MAX(vix_value) AS vix_high,
+                MIN(vix_value) AS vix_low,
+                COUNT(*) AS minute_count,
+                SUM(price_basis = 'mid_quote') AS mid_quote_count
+            FROM option_vix_minute_data
+            WHERE trade_date BETWEEN %s AND %s
+            GROUP BY trade_date, source_key
+        ) AS aggregate_rows
+        INNER JOIN option_vix_minute_data AS open_row
+          ON open_row.trade_date = aggregate_rows.trade_date
+         AND open_row.source_key = aggregate_rows.source_key
+         AND open_row.bar_time = aggregate_rows.first_bar_time
+        INNER JOIN option_vix_minute_data AS close_row
+          ON close_row.trade_date = aggregate_rows.trade_date
+         AND close_row.source_key = aggregate_rows.source_key
+         AND close_row.bar_time = aggregate_rows.last_bar_time
+        ORDER BY aggregate_rows.trade_date, aggregate_rows.source_key
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, (str(start_date), str(end_date)))
+                return list(await cursor.fetchall())
+
+    async def summarize_option_minute_trade_date(self, trade_date):
+        await self.ensure_option_minute_tables()
+        query = """
+        SELECT
+            exchange,
+            underlying_code,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT contract_code) AS contract_count,
+            COUNT(DISTINCT bar_time) AS minute_count,
+            SUM(mid_price IS NOT NULL) AS midpoint_count,
+            MIN(bar_time) AS first_bar_time,
+            MAX(bar_time) AS last_bar_time
+        FROM option_contract_minute_data
+        WHERE trade_date = %s
+        GROUP BY exchange, underlying_code
+        ORDER BY exchange, underlying_code
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, (str(trade_date),))
+                return list(await cursor.fetchall())
 
     async def count_exchange_option_contract_info(self, exchange):
         await self.ensure_exchange_option_tables()
@@ -5030,6 +5613,48 @@ class DbTools:
                 )
             )
             previous_column = field
+        fund_purchase_limit_columns = (
+            (
+                'fund_purchase_limit_count',
+                "BIGINT NULL COMMENT 'A股权益类公募基金大额限购产品数'",
+            ),
+            (
+                'fund_purchase_limit_total_count',
+                "BIGINT NULL COMMENT 'A股权益类公募基金产品总数'",
+            ),
+            (
+                'fund_purchase_limit_pct',
+                "DECIMAL(18, 6) NULL COMMENT 'A股权益类公募基金大额限购比例'",
+            ),
+        )
+        for column_name, definition in fund_purchase_limit_columns:
+            column_definitions.append(
+                (column_name, f"ADD COLUMN {column_name} {definition} AFTER {previous_column}")
+            )
+            previous_column = column_name
+        margin_trading_columns = (
+            (
+                "margin_financing_balance",
+                "DECIMAL(30, 2) NULL COMMENT 'A股融资余额，人民币元'",
+            ),
+            (
+                "margin_securities_lending_balance",
+                "DECIMAL(30, 2) NULL COMMENT 'A股融券余额，人民币元'",
+            ),
+            (
+                "margin_total_balance",
+                "DECIMAL(30, 2) NULL COMMENT 'A股融资融券余额，人民币元'",
+            ),
+            (
+                "margin_financing_net_buy_amount",
+                "DECIMAL(30, 2) NULL COMMENT 'A股融资净买入额，人民币元'",
+            ),
+        )
+        for column_name, definition in margin_trading_columns:
+            column_definitions.append(
+                (column_name, f"ADD COLUMN {column_name} {definition} AFTER {previous_column}")
+            )
+            previous_column = column_name
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
@@ -5042,6 +5667,596 @@ class DbTools:
                     existing_columns.add(column_name)
                 await conn.commit()
         self._quant_index_dashboard_option_pc_columns_ready = True
+
+    async def ensure_margin_trading_daily_table(self):
+        if self._margin_trading_daily_table_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        CREATE TABLE IF NOT EXISTS margin_trading_daily_data (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            trade_date DATE NOT NULL,
+            exchange VARCHAR(8) NOT NULL,
+            financing_balance DECIMAL(30, 2) NULL,
+            financing_buy_amount DECIMAL(30, 2) NULL,
+            financing_repayment_amount DECIMAL(30, 2) NULL,
+            financing_net_buy_amount DECIMAL(30, 2) NULL,
+            securities_lending_balance DECIMAL(30, 2) NULL,
+            margin_balance DECIMAL(30, 2) NULL,
+            securities_lending_sell_volume DECIMAL(30, 2) NULL,
+            securities_lending_remaining_volume DECIMAL(30, 2) NULL,
+            data_source VARCHAR(64) NOT NULL,
+            source_url VARCHAR(512) NOT NULL,
+            raw_json JSON NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_margin_trading_date_exchange (trade_date, exchange),
+            KEY idx_margin_trading_exchange_date (exchange, trade_date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                await conn.commit()
+        self._margin_trading_daily_table_ready = True
+
+    async def upsert_margin_trading_daily_rows(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_margin_trading_daily_table()
+        deduped = {}
+        for raw in rows:
+            trade_date = str(raw.get("trade_date") or "").strip()
+            exchange = str(raw.get("exchange") or "").strip().upper()
+            if not trade_date or exchange not in {"SSE", "SZSE", "BSE"}:
+                continue
+            row = dict(raw)
+            row["trade_date"] = trade_date
+            row["exchange"] = exchange
+            deduped[(trade_date, exchange)] = row
+        def decimal_amount(value):
+            if value is None:
+                return None
+            return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        values = [
+            (
+                row["trade_date"],
+                row["exchange"],
+                decimal_amount(row.get("financing_balance")),
+                decimal_amount(row.get("financing_buy_amount")),
+                decimal_amount(row.get("financing_repayment_amount")),
+                decimal_amount(row.get("financing_net_buy_amount")),
+                decimal_amount(row.get("securities_lending_balance")),
+                decimal_amount(row.get("margin_balance")),
+                decimal_amount(row.get("securities_lending_sell_volume")),
+                decimal_amount(row.get("securities_lending_remaining_volume")),
+                str(row.get("data_source") or "exchange_official"),
+                str(row.get("source_url") or ""),
+                self._serialize_json_field(row.get("raw_json")),
+            )
+            for row in deduped.values()
+        ]
+        if not values:
+            return 0
+        query = """
+        INSERT INTO margin_trading_daily_data (
+            trade_date, exchange, financing_balance, financing_buy_amount,
+            financing_repayment_amount, financing_net_buy_amount,
+            securities_lending_balance, margin_balance,
+            securities_lending_sell_volume, securities_lending_remaining_volume,
+            data_source, source_url, raw_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            financing_balance = VALUES(financing_balance),
+            financing_buy_amount = VALUES(financing_buy_amount),
+            financing_repayment_amount = VALUES(financing_repayment_amount),
+            financing_net_buy_amount = COALESCE(
+                VALUES(financing_net_buy_amount),
+                financing_net_buy_amount
+            ),
+            securities_lending_balance = VALUES(securities_lending_balance),
+            margin_balance = VALUES(margin_balance),
+            securities_lending_sell_volume = VALUES(securities_lending_sell_volume),
+            securities_lending_remaining_volume = VALUES(securities_lending_remaining_volume),
+            data_source = VALUES(data_source),
+            source_url = VALUES(source_url),
+            raw_json = VALUES(raw_json),
+            updated_at = CURRENT_TIMESTAMP
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def get_margin_trading_existing_keys(self, start_date, end_date):
+        await self.ensure_margin_trading_daily_table()
+        query = """
+        SELECT exchange, trade_date
+        FROM margin_trading_daily_data
+        WHERE trade_date BETWEEN %s AND %s
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return {
+                    (str(row["exchange"]), str(row["trade_date"]))
+                    for row in await cursor.fetchall()
+                }
+
+    async def recompute_margin_trading_net_buy(self, start_date, end_date):
+        await self.ensure_margin_trading_daily_table()
+        query = """
+        UPDATE margin_trading_daily_data current_row
+        JOIN (
+            SELECT
+                id,
+                financing_balance
+                    - LAG(financing_balance) OVER (
+                        PARTITION BY exchange
+                        ORDER BY trade_date
+                    ) AS computed_net_buy
+            FROM margin_trading_daily_data
+        ) calculated
+          ON calculated.id = current_row.id
+        SET current_row.financing_net_buy_amount = calculated.computed_net_buy
+        WHERE current_row.trade_date BETWEEN %s AND %s
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                affected = cursor.rowcount
+                await conn.commit()
+                return affected
+
+    async def get_margin_trading_coverage_summary(self, start_date, end_date):
+        await self.ensure_margin_trading_daily_table()
+        query = """
+        SELECT
+            trade_date,
+            GROUP_CONCAT(exchange ORDER BY exchange SEPARATOR ',') AS exchanges,
+            COUNT(*) AS exchange_count
+        FROM margin_trading_daily_data
+        WHERE trade_date BETWEEN %s AND %s
+        GROUP BY trade_date
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_margin_trading_daily_summary(self, start_date, end_date):
+        await self.ensure_margin_trading_daily_table()
+        query = """
+        SELECT
+            trade_date,
+            SUM(financing_balance) AS margin_financing_balance,
+            SUM(securities_lending_balance) AS margin_securities_lending_balance,
+            SUM(margin_balance) AS margin_total_balance,
+            SUM(financing_net_buy_amount) AS margin_financing_net_buy_amount,
+            GROUP_CONCAT(exchange ORDER BY exchange SEPARATOR ',') AS exchanges,
+            COUNT(*) AS exchange_count
+        FROM margin_trading_daily_data
+        WHERE trade_date BETWEEN %s AND %s
+        GROUP BY trade_date
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                rows = list(await cursor.fetchall())
+        result = []
+        bse_start = date(2023, 2, 13)
+        for row in rows:
+            trade_date_value = row.get("trade_date")
+            normalized_date = (
+                trade_date_value
+                if isinstance(trade_date_value, date)
+                else datetime.strptime(str(trade_date_value), "%Y-%m-%d").date()
+            )
+            expected = {"SSE", "SZSE"}
+            if normalized_date >= bse_start:
+                expected.add("BSE")
+            actual = {
+                item
+                for item in str(row.get("exchanges") or "").split(",")
+                if item
+            }
+            if expected.issubset(actual):
+                result.append(row)
+        return result
+
+    async def ensure_fund_purchase_limit_daily_table(self):
+        if self._fund_purchase_limit_daily_table_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        CREATE TABLE IF NOT EXISTS fund_purchase_limit_daily_data (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            trade_date DATE NOT NULL,
+            fund_code VARCHAR(16) NOT NULL,
+            fund_name VARCHAR(255) NOT NULL,
+            product_name VARCHAR(255) NOT NULL,
+            product_key CHAR(40) NOT NULL,
+            fund_type VARCHAR(64) NOT NULL,
+            purchase_status VARCHAR(64) NULL,
+            redemption_status VARCHAR(64) NULL,
+            limited_flag TINYINT(1) NOT NULL DEFAULT 0,
+            limited_large_flag TINYINT(1) NOT NULL DEFAULT 0,
+            suspended_purchase_flag TINYINT(1) NOT NULL DEFAULT 0,
+            data_source VARCHAR(64) NOT NULL,
+            raw_json JSON NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_fund_purchase_limit_date_code (trade_date, fund_code),
+            KEY idx_fund_purchase_limit_date_product (trade_date, product_key),
+            KEY idx_fund_purchase_limit_date_limited (trade_date, limited_flag)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                await conn.commit()
+        self._fund_purchase_limit_daily_table_ready = True
+
+    async def replace_fund_purchase_limit_daily_rows(self, trade_date, rows):
+        await self.ensure_fund_purchase_limit_daily_table()
+        normalized_date = str(trade_date).split(' ')[0]
+        values = [
+            (
+                normalized_date,
+                str(row.get('fund_code') or '').strip(),
+                str(row.get('fund_name') or '').strip(),
+                str(row.get('product_name') or '').strip(),
+                str(row.get('product_key') or '').strip(),
+                str(row.get('fund_type') or '').strip(),
+                str(row.get('purchase_status') or '').strip() or None,
+                str(row.get('redemption_status') or '').strip() or None,
+                1 if row.get('limited_flag') else 0,
+                1 if row.get('limited_large_flag') else 0,
+                1 if row.get('suspended_purchase_flag') else 0,
+                str(row.get('data_source') or '').strip(),
+                row.get('raw_json'),
+            )
+            for row in rows
+            if str(row.get('fund_code') or '').strip()
+            and str(row.get('product_key') or '').strip()
+        ]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "DELETE FROM fund_purchase_limit_daily_data WHERE trade_date = %s",
+                    (normalized_date,),
+                )
+                if values:
+                    await cursor.executemany(
+                        """
+                        INSERT INTO fund_purchase_limit_daily_data (
+                            trade_date, fund_code, fund_name, product_name, product_key,
+                            fund_type, purchase_status, redemption_status, limited_flag,
+                            limited_large_flag, suspended_purchase_flag, data_source, raw_json
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        values,
+                    )
+                await conn.commit()
+        return len(values)
+
+    async def upsert_fund_purchase_limit_daily_rows(self, rows, batch_size=1000):
+        await self.ensure_fund_purchase_limit_daily_table()
+        values = [
+            (
+                str(row.get('trade_date') or '').split(' ')[0],
+                str(row.get('fund_code') or '').strip(),
+                str(row.get('fund_name') or '').strip(),
+                str(row.get('product_name') or '').strip(),
+                str(row.get('product_key') or '').strip(),
+                str(row.get('fund_type') or '').strip(),
+                str(row.get('purchase_status') or '').strip() or None,
+                str(row.get('redemption_status') or '').strip() or None,
+                1 if row.get('limited_flag') else 0,
+                1 if row.get('limited_large_flag') else 0,
+                1 if row.get('suspended_purchase_flag') else 0,
+                str(row.get('data_source') or '').strip(),
+                row.get('raw_json'),
+            )
+            for row in rows
+            if str(row.get('trade_date') or '').strip()
+            and str(row.get('fund_code') or '').strip()
+            and str(row.get('product_key') or '').strip()
+        ]
+        if not values:
+            return 0
+
+        normalized_batch_size = max(1, int(batch_size or 1000))
+        query = """
+        INSERT INTO fund_purchase_limit_daily_data (
+            trade_date, fund_code, fund_name, product_name, product_key,
+            fund_type, purchase_status, redemption_status, limited_flag,
+            limited_large_flag, suspended_purchase_flag, data_source, raw_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            fund_name = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                fund_name,
+                VALUES(fund_name)
+            ),
+            product_name = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                product_name,
+                VALUES(product_name)
+            ),
+            product_key = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                product_key,
+                VALUES(product_key)
+            ),
+            fund_type = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                fund_type,
+                VALUES(fund_type)
+            ),
+            purchase_status = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                purchase_status,
+                VALUES(purchase_status)
+            ),
+            redemption_status = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                redemption_status,
+                VALUES(redemption_status)
+            ),
+            limited_flag = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                limited_flag,
+                VALUES(limited_flag)
+            ),
+            limited_large_flag = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                limited_large_flag,
+                VALUES(limited_large_flag)
+            ),
+            suspended_purchase_flag = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                suspended_purchase_flag,
+                VALUES(suspended_purchase_flag)
+            ),
+            raw_json = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                raw_json,
+                VALUES(raw_json)
+            ),
+            data_source = IF(
+                data_source = 'eastmoney_open_fund_daily',
+                data_source,
+                VALUES(data_source)
+            )
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for offset in range(0, len(values), normalized_batch_size):
+                    await cursor.executemany(
+                        query,
+                        values[offset:offset + normalized_batch_size],
+                    )
+                await conn.commit()
+        return len(values)
+
+    async def get_fund_purchase_limit_daily_summary(self, start_date, end_date):
+        await self.ensure_fund_purchase_limit_daily_table()
+        normalized_start = str(start_date).split(' ')[0]
+        normalized_end = str(end_date).split(' ')[0]
+        query = """
+        SELECT
+            trade_date,
+            COUNT(*) AS total_fund_count,
+            SUM(product_limited_flag) AS limited_fund_count,
+            ROUND(SUM(product_limited_flag) / NULLIF(COUNT(*), 0) * 100, 6) AS limited_fund_pct,
+            SUM(product_suspended_flag) AS suspended_fund_count
+        FROM (
+            SELECT
+                fund_rows.trade_date AS trade_date,
+                fund_rows.product_key AS product_key,
+                MAX(limited_flag) AS product_limited_flag,
+                MAX(suspended_purchase_flag) AS product_suspended_flag
+            FROM fund_purchase_limit_daily_data fund_rows
+            INNER JOIN (
+                SELECT DISTINCT trade_date
+                FROM index_daily_data
+                WHERE trade_date BETWEEN %s AND %s
+            ) trade_calendar
+                ON trade_calendar.trade_date = fund_rows.trade_date
+            WHERE fund_rows.trade_date BETWEEN %s AND %s
+            GROUP BY fund_rows.trade_date, fund_rows.product_key
+        ) product_rows
+        GROUP BY trade_date
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                query_start = (
+                    date.fromisoformat(normalized_start) - timedelta(days=45)
+                ).isoformat()
+                await cursor.execute(
+                    query,
+                    (
+                        query_start,
+                        normalized_end,
+                        query_start,
+                        normalized_end,
+                    ),
+                )
+                rows = list(await cursor.fetchall())
+
+        effective_previous = None
+        results = []
+        for row in rows:
+            total_count = int(row.get('total_fund_count') or 0)
+            suspended_count = int(row.get('suspended_fund_count') or 0)
+            market_wide_pause = (
+                total_count >= 100
+                and suspended_count / total_count >= 0.08
+            )
+            if market_wide_pause and effective_previous:
+                effective = {
+                    **row,
+                    'total_fund_count': effective_previous['total_fund_count'],
+                    'limited_fund_count': effective_previous['limited_fund_count'],
+                    'limited_fund_pct': effective_previous['limited_fund_pct'],
+                    'market_wide_pause': True,
+                }
+            else:
+                effective = {
+                    **row,
+                    'market_wide_pause': market_wide_pause,
+                }
+            effective_previous = effective
+            if str(row.get('trade_date')) >= normalized_start:
+                results.append(effective)
+        return results
+
+    async def get_previous_fund_purchase_limit_flags(self, trade_date):
+        await self.ensure_fund_purchase_limit_daily_table()
+        normalized_date = str(trade_date).split(' ')[0]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT MAX(trade_date) AS previous_date
+                    FROM index_daily_data
+                    WHERE trade_date < %s
+                    """,
+                    (normalized_date,),
+                )
+                date_row = await cursor.fetchone()
+                previous_date = date_row.get('previous_date') if date_row else None
+                if not previous_date:
+                    return {}
+                await cursor.execute(
+                    """
+                    SELECT fund_code, MAX(limited_flag) AS limited_flag
+                    FROM fund_purchase_limit_daily_data
+                    WHERE trade_date = %s
+                    GROUP BY fund_code
+                    """,
+                    (previous_date,),
+                )
+                rows = await cursor.fetchall()
+                return {
+                    str(row.get('fund_code') or '').strip(): (
+                        1 if row.get('limited_flag') else 0
+                    )
+                    for row in rows
+                    if str(row.get('fund_code') or '').strip()
+                }
+
+    async def normalize_fund_purchase_limit_indicator_flags(
+        self,
+        start_date,
+        end_date,
+        pause_ratio=0.08,
+        min_products=100,
+    ):
+        await self.ensure_fund_purchase_limit_daily_table()
+        normalized_start = str(start_date).split(' ')[0]
+        normalized_end = str(end_date).split(' ')[0]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE fund_purchase_limit_daily_data
+                    SET limited_flag = limited_large_flag
+                    WHERE trade_date BETWEEN %s AND %s
+                      AND limited_flag <> limited_large_flag
+                    """,
+                    (normalized_start, normalized_end),
+                )
+                reset_rows = int(cursor.rowcount or 0)
+                await conn.commit()
+
+                await cursor.execute(
+                    """
+                    SELECT
+                        trade_date,
+                        COUNT(*) AS total_products,
+                        SUM(product_suspended) AS suspended_products
+                    FROM (
+                        SELECT
+                            fund_rows.trade_date AS trade_date,
+                            fund_rows.product_key AS product_key,
+                            MAX(suspended_purchase_flag) AS product_suspended
+                        FROM fund_purchase_limit_daily_data fund_rows
+                        INNER JOIN (
+                            SELECT DISTINCT trade_date
+                            FROM index_daily_data
+                            WHERE trade_date BETWEEN %s AND %s
+                        ) trade_calendar
+                            ON trade_calendar.trade_date = fund_rows.trade_date
+                        WHERE fund_rows.trade_date BETWEEN %s AND %s
+                        GROUP BY fund_rows.trade_date, fund_rows.product_key
+                    ) product_rows
+                    GROUP BY trade_date
+                    HAVING COUNT(*) >= %s
+                       AND SUM(product_suspended) / COUNT(*) >= %s
+                    ORDER BY trade_date ASC
+                    """,
+                    (
+                        normalized_start,
+                        normalized_end,
+                        normalized_start,
+                        normalized_end,
+                        int(min_products),
+                        float(pause_ratio),
+                    ),
+                )
+                pause_dates = [
+                    row.get('trade_date')
+                    for row in await cursor.fetchall()
+                    if row.get('trade_date')
+                ]
+
+                carried_rows = 0
+                for pause_date in pause_dates:
+                    await cursor.execute(
+                        """
+                        SELECT MAX(trade_date) AS previous_date
+                        FROM index_daily_data
+                        WHERE trade_date < %s
+                        """,
+                        (pause_date,),
+                    )
+                    previous_row = await cursor.fetchone()
+                    previous_date = (
+                        previous_row.get('previous_date') if previous_row else None
+                    )
+                    if not previous_date:
+                        continue
+                    await cursor.execute(
+                        """
+                        UPDATE fund_purchase_limit_daily_data current_row
+                        INNER JOIN fund_purchase_limit_daily_data previous_row
+                            ON previous_row.trade_date = %s
+                           AND previous_row.fund_code = current_row.fund_code
+                        SET current_row.limited_flag = previous_row.limited_flag
+                        WHERE current_row.trade_date = %s
+                          AND current_row.suspended_purchase_flag = 1
+                          AND current_row.limited_large_flag = 0
+                          AND current_row.limited_flag <> previous_row.limited_flag
+                        """,
+                        (previous_date, pause_date),
+                    )
+                    carried_rows += int(cursor.rowcount or 0)
+                    await conn.commit()
+
+                return {
+                    'reset_rows': reset_rows,
+                    'market_wide_pause_dates': len(pause_dates),
+                    'carried_limit_rows': carried_rows,
+                }
 
     async def get_quant_index_dashboard_option_closes(self, product_prefixes, start_date, end_date):
         if self.pool is None:
@@ -5189,7 +6404,14 @@ class DbTools:
 
         cffex_delta_columns = list(self.QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS)
         basis_delta_columns = list(self.QUANT_INDEX_BASIS_DELTA_FIELDS)
-        optional_metric_columns = [*cffex_delta_columns, *basis_delta_columns]
+        fund_purchase_limit_columns = list(self.QUANT_INDEX_FUND_PURCHASE_LIMIT_FIELDS)
+        margin_trading_columns = list(self.QUANT_INDEX_MARGIN_TRADING_FIELDS)
+        optional_metric_columns = [
+            *cffex_delta_columns,
+            *basis_delta_columns,
+            *fund_purchase_limit_columns,
+            *margin_trading_columns,
+        ]
         values = [
             (
                 row['trade_date'],
@@ -6162,3 +7384,403 @@ class DbTools:
                     await cursor.execute(query, (str(error_message or '').strip() or None, task_id))
                 await conn.commit()
                 return cursor.rowcount
+
+    async def ensure_cn_macro_tables(self):
+        if self._cn_macro_tables_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS cn_index_valuation_daily (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                trade_date DATE NOT NULL,
+                index_code VARCHAR(16) NOT NULL,
+                index_name VARCHAR(64) NOT NULL,
+                pe_ttm DECIMAL(20, 8) NULL,
+                earnings_yield_pct DECIMAL(20, 8) NULL,
+                data_source VARCHAR(64) NOT NULL,
+                source_url VARCHAR(512) NULL,
+                raw_json LONGTEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_cn_index_valuation_date_code (trade_date, index_code),
+                KEY idx_cn_index_valuation_code_date (index_code, trade_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_government_bond_yield_daily (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                trade_date DATE NOT NULL,
+                tenor_years INT NOT NULL,
+                maturity_yield_pct DECIMAL(20, 8) NULL,
+                spot_yield_pct DECIMAL(20, 8) NULL,
+                forward_yield_pct DECIMAL(20, 8) NULL,
+                data_source VARCHAR(64) NOT NULL,
+                source_url VARCHAR(512) NULL,
+                raw_json LONGTEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_cn_gov_bond_yield_date_tenor (trade_date, tenor_years),
+                KEY idx_cn_gov_bond_yield_date (trade_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_stock_market_cap_daily (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                trade_date DATE NOT NULL,
+                exchange VARCHAR(16) NOT NULL,
+                total_market_cap_cny DECIMAL(30, 2) NULL,
+                circulating_market_cap_cny DECIMAL(30, 2) NULL,
+                reference_gdp_cny DECIMAL(30, 2) NULL,
+                data_source VARCHAR(64) NOT NULL,
+                source_url VARCHAR(512) NULL,
+                raw_json LONGTEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_cn_market_cap_date_exchange (trade_date, exchange),
+                KEY idx_cn_market_cap_date (trade_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_gdp_quarterly (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                period_end DATE NOT NULL,
+                year INT NOT NULL,
+                quarter INT NOT NULL,
+                nominal_gdp_cny DECIMAL(30, 2) NULL,
+                cumulative_gdp_cny DECIMAL(30, 2) NULL,
+                release_date DATE NULL,
+                data_source VARCHAR(64) NOT NULL,
+                source_url VARCHAR(512) NULL,
+                raw_json LONGTEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_cn_gdp_period_end (period_end),
+                KEY idx_cn_gdp_release_date (release_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_household_deposit_monthly (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                period_end DATE NOT NULL,
+                household_deposit_cny DECIMAL(30, 2) NULL,
+                demand_deposit_cny DECIMAL(30, 2) NULL,
+                time_other_deposit_cny DECIMAL(30, 2) NULL,
+                source_updated_at DATE NULL,
+                data_source VARCHAR(64) NOT NULL,
+                source_url VARCHAR(512) NULL,
+                raw_json LONGTEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_cn_household_deposit_period_end (period_end),
+                KEY idx_cn_household_deposit_updated (source_updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_macro_indicator_daily (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                trade_date DATE NOT NULL,
+                hs300_pe_ttm DECIMAL(20, 8) NULL,
+                csi1000_pe_ttm DECIMAL(20, 8) NULL,
+                cn_gov_bond_10y_yield_pct DECIMAL(20, 8) NULL,
+                a_share_total_market_cap_cny DECIMAL(30, 2) NULL,
+                trailing_4q_nominal_gdp_cny DECIMAL(30, 2) NULL,
+                household_deposit_cny DECIMAL(30, 2) NULL,
+                hs300_equity_bond_spread_pp DECIMAL(20, 8) NULL,
+                csi1000_equity_bond_spread_pp DECIMAL(20, 8) NULL,
+                buffett_indicator_pct DECIMAL(20, 8) NULL,
+                household_deposit_market_cap_ratio_pct DECIMAL(20, 8) NULL,
+                gdp_period_end DATE NULL,
+                deposit_period_end DATE NULL,
+                market_cap_source VARCHAR(64) NULL,
+                market_cap_adjustment_factor DECIMAL(20, 10) NULL,
+                gdp_source VARCHAR(64) NULL,
+                data_source VARCHAR(64) NOT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uk_cn_macro_indicator_date (trade_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        ]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for statement in statements:
+                    await cursor.execute(statement)
+                await cursor.execute(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name IN "
+                    "('cn_stock_market_cap_daily', 'cn_macro_indicator_daily')"
+                )
+                existing_columns = {}
+                for table_name, column_name in await cursor.fetchall():
+                    existing_columns.setdefault(table_name, set()).add(column_name)
+                alter_columns = {
+                    'cn_stock_market_cap_daily': {
+                        'reference_gdp_cny': (
+                            "ADD COLUMN reference_gdp_cny DECIMAL(30, 2) NULL "
+                            "AFTER circulating_market_cap_cny"
+                        ),
+                    },
+                    'cn_macro_indicator_daily': {
+                        'market_cap_source': (
+                            "ADD COLUMN market_cap_source VARCHAR(64) NULL "
+                            "AFTER deposit_period_end"
+                        ),
+                        'market_cap_adjustment_factor': (
+                            "ADD COLUMN market_cap_adjustment_factor DECIMAL(20, 10) NULL "
+                            "AFTER market_cap_source"
+                        ),
+                        'gdp_source': (
+                            "ADD COLUMN gdp_source VARCHAR(64) NULL "
+                            "AFTER market_cap_adjustment_factor"
+                        ),
+                    },
+                }
+                for table_name, definitions in alter_columns.items():
+                    known = existing_columns.get(table_name, set())
+                    for column_name, clause in definitions.items():
+                        if column_name not in known:
+                            await cursor.execute(f"ALTER TABLE {table_name} {clause}")
+                await conn.commit()
+        self._cn_macro_tables_ready = True
+
+    async def get_cn_trade_dates(self, start_date, end_date):
+        query = """
+            SELECT DISTINCT trade_date
+            FROM index_daily_data
+            WHERE trade_date BETWEEN %s AND %s
+            ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, (start_date, end_date))
+                return [row[0] for row in await cursor.fetchall()]
+
+    async def _upsert_cn_macro_rows(self, query, values):
+        if not values:
+            return 0
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def upsert_cn_index_valuation_daily(self, rows):
+        await self.ensure_cn_macro_tables()
+        values = [(
+            row.get('trade_date'), row.get('index_code'), row.get('index_name'),
+            round(float(row.get('pe_ttm')), 8), round(float(row.get('earnings_yield_pct')), 8), row.get('data_source'),
+            row.get('source_url'), self._serialize_json_field(row.get('raw_json')),
+        ) for row in rows if row.get('trade_date') and row.get('index_code')]
+        return await self._upsert_cn_macro_rows("""
+            INSERT INTO cn_index_valuation_daily (
+                trade_date, index_code, index_name, pe_ttm, earnings_yield_pct,
+                data_source, source_url, raw_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE index_name=VALUES(index_name), pe_ttm=VALUES(pe_ttm),
+                earnings_yield_pct=VALUES(earnings_yield_pct), data_source=VALUES(data_source),
+                source_url=VALUES(source_url), raw_json=VALUES(raw_json), updated_at=CURRENT_TIMESTAMP
+        """, values)
+
+    async def upsert_cn_government_bond_yield_daily(self, rows):
+        await self.ensure_cn_macro_tables()
+        values = [(
+            row.get('trade_date'), row.get('tenor_years'), round(float(row.get('maturity_yield_pct')), 8),
+            round(float(row.get('spot_yield_pct')), 8) if row.get('spot_yield_pct') is not None else None,
+            round(float(row.get('forward_yield_pct')), 8) if row.get('forward_yield_pct') is not None else None,
+            row.get('data_source'),
+            row.get('source_url'), self._serialize_json_field(row.get('raw_json')),
+        ) for row in rows if row.get('trade_date') and row.get('tenor_years')]
+        return await self._upsert_cn_macro_rows("""
+            INSERT INTO cn_government_bond_yield_daily (
+                trade_date, tenor_years, maturity_yield_pct, spot_yield_pct,
+                forward_yield_pct, data_source, source_url, raw_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE maturity_yield_pct=VALUES(maturity_yield_pct),
+                spot_yield_pct=VALUES(spot_yield_pct), forward_yield_pct=VALUES(forward_yield_pct),
+                data_source=VALUES(data_source), source_url=VALUES(source_url),
+                raw_json=VALUES(raw_json), updated_at=CURRENT_TIMESTAMP
+        """, values)
+
+    async def upsert_cn_stock_market_cap_daily(self, rows):
+        await self.ensure_cn_macro_tables()
+        values = [(
+            row.get('trade_date'), row.get('exchange'), round(float(row.get('total_market_cap_cny')), 2),
+            round(float(row.get('circulating_market_cap_cny')), 2) if row.get('circulating_market_cap_cny') is not None else None,
+            round(float(row.get('reference_gdp_cny')), 2) if row.get('reference_gdp_cny') is not None else None,
+            row.get('data_source'), row.get('source_url'),
+            self._serialize_json_field(row.get('raw_json')),
+        ) for row in rows if row.get('trade_date') and row.get('exchange')]
+        return await self._upsert_cn_macro_rows("""
+            INSERT INTO cn_stock_market_cap_daily (
+                trade_date, exchange, total_market_cap_cny, circulating_market_cap_cny,
+                reference_gdp_cny, data_source, source_url, raw_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE total_market_cap_cny=VALUES(total_market_cap_cny),
+                circulating_market_cap_cny=VALUES(circulating_market_cap_cny),
+                reference_gdp_cny=VALUES(reference_gdp_cny),
+                data_source=VALUES(data_source), source_url=VALUES(source_url),
+                raw_json=VALUES(raw_json), updated_at=CURRENT_TIMESTAMP
+        """, values)
+
+    async def upsert_cn_gdp_quarterly(self, rows):
+        await self.ensure_cn_macro_tables()
+        values = [(
+            row.get('period_end'), row.get('year'), row.get('quarter'), round(float(row.get('nominal_gdp_cny')), 2),
+            round(float(row.get('cumulative_gdp_cny')), 2) if row.get('cumulative_gdp_cny') is not None else None,
+            row.get('release_date'), row.get('data_source'),
+            row.get('source_url'), self._serialize_json_field(row.get('raw_json')),
+        ) for row in rows if row.get('period_end')]
+        return await self._upsert_cn_macro_rows("""
+            INSERT INTO cn_gdp_quarterly (
+                period_end, year, quarter, nominal_gdp_cny, cumulative_gdp_cny,
+                release_date, data_source, source_url, raw_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE year=VALUES(year), quarter=VALUES(quarter),
+                nominal_gdp_cny=VALUES(nominal_gdp_cny), cumulative_gdp_cny=VALUES(cumulative_gdp_cny),
+                release_date=VALUES(release_date), data_source=VALUES(data_source),
+                source_url=VALUES(source_url), raw_json=VALUES(raw_json), updated_at=CURRENT_TIMESTAMP
+        """, values)
+
+    async def upsert_cn_household_deposit_monthly(self, rows):
+        await self.ensure_cn_macro_tables()
+        values = [(
+            row.get('period_end'), round(float(row.get('household_deposit_cny')), 2),
+            round(float(row.get('demand_deposit_cny')), 2) if row.get('demand_deposit_cny') is not None else None,
+            round(float(row.get('time_other_deposit_cny')), 2) if row.get('time_other_deposit_cny') is not None else None,
+            str(row.get('source_updated_at') or '')[:10] or None, row.get('data_source'),
+            row.get('source_url'), self._serialize_json_field(row.get('raw_json')),
+        ) for row in rows if row.get('period_end')]
+        return await self._upsert_cn_macro_rows("""
+            INSERT INTO cn_household_deposit_monthly (
+                period_end, household_deposit_cny, demand_deposit_cny,
+                time_other_deposit_cny, source_updated_at, data_source, source_url, raw_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE household_deposit_cny=VALUES(household_deposit_cny),
+                demand_deposit_cny=VALUES(demand_deposit_cny),
+                time_other_deposit_cny=VALUES(time_other_deposit_cny),
+                source_updated_at=VALUES(source_updated_at), data_source=VALUES(data_source),
+                source_url=VALUES(source_url), raw_json=VALUES(raw_json), updated_at=CURRENT_TIMESTAMP
+        """, values)
+
+    async def upsert_cn_macro_indicator_daily(self, rows):
+        await self.ensure_cn_macro_tables()
+        fields = (
+            'trade_date', 'hs300_pe_ttm', 'csi1000_pe_ttm',
+            'cn_gov_bond_10y_yield_pct', 'a_share_total_market_cap_cny',
+            'trailing_4q_nominal_gdp_cny', 'household_deposit_cny',
+            'hs300_equity_bond_spread_pp', 'csi1000_equity_bond_spread_pp',
+            'buffett_indicator_pct', 'household_deposit_market_cap_ratio_pct',
+            'gdp_period_end', 'deposit_period_end', 'market_cap_source',
+            'market_cap_adjustment_factor', 'gdp_source', 'data_source',
+        )
+        date_fields = {'trade_date', 'gdp_period_end', 'deposit_period_end'}
+        text_fields = {'market_cap_source', 'gdp_source', 'data_source'}
+        values = [tuple(
+            row.get(field)
+            if field in date_fields or field in text_fields or row.get(field) is None
+            else round(
+                float(row.get(field)),
+                10 if field == 'market_cap_adjustment_factor'
+                else 8 if field.endswith(('_pct', '_pp', '_ttm'))
+                else 2,
+            )
+            for field in fields
+        ) for row in rows if row.get('trade_date')]
+        return await self._upsert_cn_macro_rows("""
+            INSERT INTO cn_macro_indicator_daily (
+                trade_date, hs300_pe_ttm, csi1000_pe_ttm, cn_gov_bond_10y_yield_pct,
+                a_share_total_market_cap_cny, trailing_4q_nominal_gdp_cny,
+                household_deposit_cny, hs300_equity_bond_spread_pp,
+                csi1000_equity_bond_spread_pp, buffett_indicator_pct,
+                household_deposit_market_cap_ratio_pct, gdp_period_end,
+                deposit_period_end, market_cap_source,
+                market_cap_adjustment_factor, gdp_source, data_source
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE hs300_pe_ttm=VALUES(hs300_pe_ttm),
+                csi1000_pe_ttm=VALUES(csi1000_pe_ttm),
+                cn_gov_bond_10y_yield_pct=VALUES(cn_gov_bond_10y_yield_pct),
+                a_share_total_market_cap_cny=VALUES(a_share_total_market_cap_cny),
+                trailing_4q_nominal_gdp_cny=VALUES(trailing_4q_nominal_gdp_cny),
+                household_deposit_cny=VALUES(household_deposit_cny),
+                hs300_equity_bond_spread_pp=VALUES(hs300_equity_bond_spread_pp),
+                csi1000_equity_bond_spread_pp=VALUES(csi1000_equity_bond_spread_pp),
+                buffett_indicator_pct=VALUES(buffett_indicator_pct),
+                household_deposit_market_cap_ratio_pct=VALUES(household_deposit_market_cap_ratio_pct),
+                gdp_period_end=VALUES(gdp_period_end), deposit_period_end=VALUES(deposit_period_end),
+                market_cap_source=VALUES(market_cap_source),
+                market_cap_adjustment_factor=VALUES(market_cap_adjustment_factor),
+                gdp_source=VALUES(gdp_source),
+                data_source=VALUES(data_source), updated_at=CURRENT_TIMESTAMP
+        """, values)
+
+    async def get_cn_official_market_cap_complete_dates(self, start_date, end_date):
+        await self.ensure_cn_macro_tables()
+        query = """
+            SELECT trade_date
+            FROM cn_stock_market_cap_daily
+            WHERE trade_date BETWEEN %s AND %s
+              AND exchange IN ('SSE', 'SZSE', 'BSE')
+            GROUP BY trade_date
+            HAVING COUNT(DISTINCT exchange) = 3
+            ORDER BY trade_date
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, (start_date, end_date))
+                return {row[0] for row in await cursor.fetchall()}
+
+    async def get_cn_macro_source_rows(self, start_date, end_date):
+        await self.ensure_cn_macro_tables()
+        market_cap_start = (
+            start_date if isinstance(start_date, date)
+            else date.fromisoformat(str(start_date)[:10])
+        )
+        market_cap_start = min(market_cap_start, date(2022, 1, 4))
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                async def fetch(query, params):
+                    await cursor.execute(query, params)
+                    return list(await cursor.fetchall())
+
+                trade_dates = await fetch(
+                    "SELECT DISTINCT trade_date FROM index_daily_data "
+                    "WHERE trade_date BETWEEN %s AND %s ORDER BY trade_date",
+                    (start_date, end_date),
+                )
+                valuations = await fetch(
+                    "SELECT * FROM cn_index_valuation_daily WHERE trade_date BETWEEN %s AND %s ORDER BY trade_date",
+                    (start_date, end_date),
+                )
+                yields = await fetch(
+                    "SELECT * FROM cn_government_bond_yield_daily WHERE trade_date BETWEEN %s AND %s AND tenor_years=10 ORDER BY trade_date",
+                    (start_date, end_date),
+                )
+                market_caps = await fetch(
+                    "SELECT * FROM cn_stock_market_cap_daily WHERE trade_date BETWEEN %s AND %s ORDER BY trade_date, exchange",
+                    (market_cap_start, end_date),
+                )
+                gdp = await fetch(
+                    "SELECT * FROM cn_gdp_quarterly WHERE period_end <= %s ORDER BY period_end",
+                    (end_date,),
+                )
+                deposits = await fetch(
+                    "SELECT * FROM cn_household_deposit_monthly WHERE period_end <= %s ORDER BY period_end",
+                    (end_date,),
+                )
+        return {
+            'trade_dates': [row['trade_date'] for row in trade_dates],
+            'valuations': valuations,
+            'yields': yields,
+            'market_caps': market_caps,
+            'gdp': gdp,
+            'deposits': deposits,
+        }

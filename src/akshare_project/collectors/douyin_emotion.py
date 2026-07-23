@@ -6,7 +6,8 @@ import re
 import sys
 from collections import Counter
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from difflib import SequenceMatcher
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -42,7 +43,10 @@ VIDEO_INDEX_PATH = get_state_path("douyin_video_index", "json")
 LOGGER = get_logger("douyin_emotion")
 PAGE_TIMEOUT_MS = 60_000
 COZE_RESPONSE_TIMEOUT_SECONDS = 300
+COZE_TRANSCRIPT_MAX_ATTEMPTS = 3
+COZE_RETRY_BACKOFF_SECONDS = (5, 15)
 MAX_VIDEO_CARDS = 16
+EMOTION_CONTENT_MIN_PUBLISH_TIME = time(hour=15)
 DOUYIN_CONTENT_PATH_PATTERN = re.compile(r"/(?P<content_type>video|note)/(?P<content_id>\d+)")
 NOTE_IMAGE_URL_MARKER = "biz_tag=aweme_images"
 NOTE_VALUE_CROP_START_RATIO = 0.82
@@ -67,12 +71,71 @@ class AuthenticationRequiredError(RuntimeError):
     pass
 
 
+class NonEmotionContentError(RuntimeError):
+    pass
+
+
+class DuplicateTranscriptError(RuntimeError):
+    pass
+
+
 def print(*args, **kwargs):
     echo_and_log(LOGGER, *args, **kwargs)
 
 
 def clean_text(value):
     return re.sub(r"[ \t\u00a0]+", " ", str(value or "")).strip()
+
+
+def normalize_transcript_for_comparison(value):
+    text = str(value or "").split("\n\nERROR:\n", 1)[0]
+    text = re.sub(r"https?://\S+", "", text)
+    for marker in (
+        "以下为新对话",
+        "短视频提取文案",
+        "本工具支持国内大多数短视频平台的链接，欢迎使用",
+        "点击下方链接，领取《AIGC 搞钱工具箱》",
+        "以下是从该短视频中提取的完整文案",
+    ):
+        text = text.replace(marker, "")
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", text).lower()
+
+
+def transcripts_are_duplicates(candidate, previous):
+    candidate_text = normalize_transcript_for_comparison(candidate)
+    previous_text = normalize_transcript_for_comparison(previous)
+    if min(len(candidate_text), len(previous_text)) < 200:
+        return False
+    if previous_text in candidate_text or candidate_text in previous_text:
+        return True
+    return SequenceMatcher(None, candidate_text, previous_text).ratio() >= 0.88
+
+
+async def assert_transcript_is_new(video_card, transcript):
+    published_at = video_card.get("published_at")
+    if not isinstance(published_at, datetime):
+        return
+    emotion_date = published_at.astimezone(SHANGHAI_TZ).date()
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        for days_back in range(1, 8):
+            previous_date = emotion_date - timedelta(days=days_back)
+            previous = await db_tools.get_douyin_emotion_by_date(previous_date.isoformat())
+            if not previous:
+                continue
+            if str(previous.get("extraction_status") or "").upper() != "SUCCESS":
+                continue
+            if str(previous.get("video_id") or "") == str(video_card.get("video_id") or ""):
+                continue
+            previous_transcript = str(previous.get("raw_ocr_text") or "").strip()
+            if transcripts_are_duplicates(transcript, previous_transcript):
+                raise DuplicateTranscriptError(
+                    f"Coze 返回了 {previous_date.isoformat()} 作品 "
+                    f"{previous.get('video_id') or '-'} 的旧文案"
+                )
+    finally:
+        await db_tools.close()
 
 
 def normalize_date_text(value):
@@ -115,6 +178,61 @@ def parse_douyin_content_url(raw_url):
             else urljoin("https://www.douyin.com", href)
         ),
     }
+
+
+def is_profile_works_card(raw_card):
+    href = str(raw_card.get("href") or "").strip().lower()
+    return (
+        not bool(raw_card.get("inside_footer"))
+        and "source=baiduspider" not in href
+    )
+
+
+def build_update_found_failed_result(selected, error):
+    published_at = selected.get("published_at")
+    target_date = (
+        published_at.astimezone(SHANGHAI_TZ).date().isoformat()
+        if isinstance(published_at, datetime)
+        else str(selected.get("emotion_date") or "")
+    )
+    return {
+        "status": "UPDATE_FOUND_FAILED",
+        "target_date": target_date,
+        "video_id": str(selected.get("video_id") or ""),
+        "video_url": str(selected.get("video_url") or ""),
+        "error": str(error),
+    }
+
+
+def build_update_found_retryable_result(selected, error):
+    result = build_update_found_failed_result(selected, error)
+    result["status"] = "UPDATE_FOUND_RETRYABLE"
+    return result
+
+
+def is_retryable_processing_error(error):
+    if isinstance(error, AuthenticationRequiredError):
+        return False
+    error_text = str(error or "").lower()
+    error_type = type(error).__name__.lower()
+    return (
+        isinstance(error, (TimeoutError, ConnectionError, DuplicateTranscriptError))
+        or "timeout" in error_type
+        or any(
+            marker in error_text
+            for marker in (
+                "超时",
+                "timeout",
+                "gateway timeout",
+                "http 504",
+                "connection",
+                "连接失败",
+                "连接被重置",
+                "网络错误",
+                "temporarily unavailable",
+            )
+        )
+    )
 
 
 def _get_note_ocr_engine():
@@ -172,18 +290,17 @@ def extract_note_chart_regions(ocr_result, image_height):
     )
     regions = {}
     for index, (center_y, field_name) in enumerate(ordered_titles):
-        previous_y = ordered_titles[index - 1][0] if index else 0
         next_y = (
             ordered_titles[index + 1][0]
             if index + 1 < len(ordered_titles)
             else image_height
         )
-        start_y = 0 if index == 0 else int((previous_y + center_y) / 2)
-        end_y = (
-            image_height
-            if index + 1 == len(ordered_titles)
-            else int((center_y + next_y) / 2)
-        )
+        # Each chart begins at its own title and runs until the next title.
+        # Splitting at the midpoint between titles can cut off a low current
+        # value in the upper chart, which is exactly where its right-edge
+        # label may be rendered.
+        start_y = 0 if index == 0 else int(center_y)
+        end_y = image_height if index + 1 == len(ordered_titles) else int(next_y)
         regions[field_name] = (start_y, end_y)
     return regions
 
@@ -290,7 +407,18 @@ async def request_note_ocr_transcript(page, note_url):
     return "\n".join(normalized_lines + ["", *raw_sections]), values
 
 
-def select_latest_video(video_cards, target_date=None):
+def is_emotion_content_candidate(card, target_date):
+    published_at = card.get("published_at")
+    if not isinstance(published_at, datetime):
+        return False
+    local_published_at = published_at.astimezone(SHANGHAI_TZ)
+    return (
+        local_published_at.date() == target_date
+        and local_published_at.time().replace(tzinfo=None) >= EMOTION_CONTENT_MIN_PUBLISH_TIME
+    )
+
+
+def select_latest_video(video_cards, target_date=None, excluded_video_ids=None):
     valid_cards = [
         card
         for card in video_cards
@@ -303,10 +431,12 @@ def select_latest_video(video_cards, target_date=None):
     if target_date is None:
         return latest, latest
 
+    excluded_ids = {str(video_id) for video_id in (excluded_video_ids or ())}
     target_cards = [
         card
         for card in valid_cards
-        if card["published_at"].astimezone(SHANGHAI_TZ).date() == target_date
+        if is_emotion_content_candidate(card, target_date)
+        and str(card.get("video_id") or "") not in excluded_ids
     ]
     if not target_cards:
         return None, latest
@@ -321,6 +451,17 @@ def video_card_from_existing_record(record):
     if not video_id or not raw_date:
         return None
     emotion_date = raw_date if isinstance(raw_date, date) else date.fromisoformat(str(raw_date))
+    decoded_published_at = decode_video_published_at(video_id)
+    published_at = (
+        decoded_published_at
+        if decoded_published_at is not None
+        and decoded_published_at.astimezone(SHANGHAI_TZ).date() == emotion_date
+        else datetime.combine(
+            emotion_date,
+            datetime.min.time(),
+            tzinfo=SHANGHAI_TZ,
+        )
+    )
     return {
         "video_id": video_id,
         "video_url": str(record.get("video_url") or "").strip()
@@ -329,11 +470,8 @@ def video_card_from_existing_record(record):
             parse_douyin_content_url(record.get("video_url") or "") or {}
         ).get("content_type", "video"),
         "video_title": clean_text(record.get("video_title")) or None,
-        "published_at": datetime.combine(
-            emotion_date,
-            datetime.min.time(),
-            tzinfo=SHANGHAI_TZ,
-        ),
+        "extraction_status": str(record.get("extraction_status") or "").strip().upper(),
+        "published_at": published_at,
     }
 
 
@@ -753,6 +891,7 @@ async def collect_video_cards(page, *, max_cards=MAX_VIDEO_CARDS, stop_before_da
             """
             elements => elements.map(element => ({
                 href: element.href || element.getAttribute('href') || '',
+                inside_footer: Boolean(element.closest('footer, [data-e2e="page-footer"]')),
                 title: (
                     element.getAttribute('aria-label')
                     || element.getAttribute('title')
@@ -763,9 +902,9 @@ async def collect_video_cards(page, *, max_cards=MAX_VIDEO_CARDS, stop_before_da
             """
         )
         for raw_card in raw_cards:
-            href = str(raw_card.get("href") or "").strip()
-            if "source=baiduspider" in href.lower():
+            if not is_profile_works_card(raw_card):
                 continue
+            href = str(raw_card.get("href") or "").strip()
             content = parse_douyin_content_url(href)
             if content is None:
                 continue
@@ -923,18 +1062,19 @@ async def resolve_douyin_share_url(page, video_url):
     return video_url
 
 
-async def request_coze_transcript(page, video_url):
+async def request_coze_transcript(page, video_url, *, reuse_existing=True):
     chat_input, selector = await _open_coze_chat(page)
-    existing_transcript = extract_existing_coze_transcript(
-        await page.locator("body").inner_text(),
-        video_url,
-    )
-    if existing_transcript:
-        try:
-            parse_transcript_emotions(existing_transcript)
-            return existing_transcript
-        except ValueError:
-            pass
+    if reuse_existing:
+        existing_transcript = extract_existing_coze_transcript(
+            await page.locator("body").inner_text(),
+            video_url,
+        )
+        if existing_transcript:
+            try:
+                parse_transcript_emotions(existing_transcript)
+                return existing_transcript
+            except ValueError:
+                pass
 
     clear_context_button = page.get_by_test_id("chat-input-clear-context-button")
     if await clear_context_button.count() == 1 and await clear_context_button.is_visible():
@@ -1000,6 +1140,31 @@ async def request_coze_transcript(page, video_url):
     raise TimeoutError("等待 Coze 视频文案超时")
 
 
+async def request_coze_transcript_with_retry(page, video_url, transcript_validator=None):
+    for attempt in range(1, COZE_TRANSCRIPT_MAX_ATTEMPTS + 1):
+        try:
+            transcript = await request_coze_transcript(
+                page,
+                video_url,
+                reuse_existing=attempt == 1,
+            )
+            if transcript_validator is not None:
+                await transcript_validator(transcript)
+            return transcript
+        except Exception as exc:
+            if (
+                not is_retryable_processing_error(exc)
+                or attempt >= COZE_TRANSCRIPT_MAX_ATTEMPTS
+            ):
+                raise
+            backoff_seconds = COZE_RETRY_BACKOFF_SECONDS[attempt - 1]
+            print(
+                f"Coze 文案提取第 {attempt} 次失败：{exc}；"
+                f"{backoff_seconds} 秒后重试。"
+            )
+            await page.wait_for_timeout(backoff_seconds * 1000)
+
+
 def _build_raw_row(video_card, values, transcript, status):
     return {
         "emotion_date": video_card["published_at"].astimezone(SHANGHAI_TZ).date().isoformat(),
@@ -1046,13 +1211,30 @@ async def _persist_success(video_card, values, transcript):
     return normalized, dashboard_rows
 
 
-async def _persist_failed(video_card, values, transcript, error):
+def is_non_emotion_content_failure(video_card, values, error):
+    error_text = str(error or "")
+    return (
+        video_card.get("content_type", "video") == "note"
+        and not any(values.get(field_name) is not None for field_name in INDEX_SPECS)
+        and "图文 OCR 缺少情绪指标" in error_text
+        and all(label in error_text for label in ("上证50", "沪深300", "中证500", "中证1000"))
+    )
+
+
+async def _persist_failed(video_card, values, transcript, error, *, status=None):
     db_tools = DbTools()
     await db_tools.init_pool()
     try:
         raw_text = f"{transcript or ''}\n\nERROR:\n{error}".strip()
         await db_tools.upsert_douyin_emotion_daily(
-            [_build_raw_row(video_card, values, raw_text, build_extraction_status(values))]
+            [
+                _build_raw_row(
+                    video_card,
+                    values,
+                    raw_text,
+                    status or build_extraction_status(values),
+                )
+            ]
         )
     finally:
         await db_tools.close()
@@ -1089,8 +1271,9 @@ async def _recover_existing_transcript(video_card):
     if not transcript:
         return None
     try:
+        await assert_transcript_is_new(video_card, transcript)
         return transcript, parse_transcript_emotions(transcript)
-    except ValueError:
+    except (ValueError, DuplicateTranscriptError):
         return None
 
 
@@ -1142,7 +1325,15 @@ async def _process_video_card(coze_page, selected, douyin_page=None):
                     douyin_page,
                     selected["video_url"],
                 )
-            transcript = await request_coze_transcript(coze_page, coze_video_url)
+            async def validate_transcript(candidate):
+                await assert_transcript_is_new(selected, candidate)
+                parse_transcript_emotions(candidate)
+
+            transcript = await request_coze_transcript_with_retry(
+                coze_page,
+                coze_video_url,
+                transcript_validator=validate_transcript,
+            )
         transcript_date = extract_labeled_transcript_date(transcript)
         if transcript_date and transcript_date != emotion_date:
             raise ValueError(
@@ -1152,6 +1343,15 @@ async def _process_video_card(coze_page, selected, douyin_page=None):
             values = parse_transcript_emotions(transcript)
         normalized, dashboard_rows = await _persist_success(selected, values, transcript)
     except Exception as exc:
+        if is_non_emotion_content_failure(selected, values, exc):
+            await _persist_failed(
+                selected,
+                values,
+                transcript,
+                str(exc),
+                status="IGNORED",
+            )
+            raise NonEmotionContentError(str(exc)) from exc
         await _persist_failed(selected, values, transcript, str(exc))
         raise
 
@@ -1166,6 +1366,206 @@ async def _process_video_card(coze_page, selected, douyin_page=None):
     }
 
 
+async def run_pipeline_with_context(context, target_date=None, douyin_page=None):
+    owns_douyin_page = douyin_page is None
+    if douyin_page is None:
+        douyin_page = await context.new_page()
+    try:
+        await _open_douyin_account(douyin_page)
+        await persist_browser_storage_state(context)
+        excluded_video_ids = set()
+        selected = (
+            await _existing_video_card_for_date(target_date)
+            if target_date is not None
+            else None
+        )
+        if selected is not None and selected.get("extraction_status") == "IGNORED":
+            excluded_video_ids.add(str(selected["video_id"]))
+            selected = None
+        if (
+            selected is not None
+            and target_date is not None
+            and not is_emotion_content_candidate(selected, target_date)
+        ):
+            selected = None
+        if selected is None and target_date is not None:
+            selected = load_cached_video_card(target_date)
+            if (
+                selected is not None
+                and (
+                    not is_emotion_content_candidate(selected, target_date)
+                    or str(selected.get("video_id") or "") in excluded_video_ids
+                )
+            ):
+                selected = None
+        if selected is not None:
+            latest = selected
+        else:
+            today = datetime.now(SHANGHAI_TZ).date()
+            is_historical_run = target_date is not None and target_date < today
+            video_cards = await collect_video_cards(
+                douyin_page,
+                max_cards=100 if is_historical_run else MAX_VIDEO_CARDS,
+                stop_before_date=target_date if is_historical_run else None,
+            )
+            cache_video_cards(video_cards)
+            selected, latest = select_latest_video(
+                video_cards,
+                target_date=target_date,
+                excluded_video_ids=excluded_video_ids,
+            )
+        latest_date = latest["published_at"].astimezone(SHANGHAI_TZ).date().isoformat()
+        if selected is None:
+            return {
+                "status": "NO_UPDATE",
+                "target_date": target_date.isoformat(),
+                "latest_video_date": latest_date,
+                "latest_video_id": latest["video_id"],
+                "minimum_publish_time": EMOTION_CONTENT_MIN_PUBLISH_TIME.strftime("%H:%M"),
+            }
+        coze_page = await context.new_page()
+        try:
+            try:
+                result = await _process_video_card(coze_page, selected, douyin_page=douyin_page)
+            except NonEmotionContentError:
+                await persist_browser_storage_state(context)
+                return {
+                    "status": "NO_UPDATE",
+                    "target_date": target_date.isoformat(),
+                    "latest_video_date": latest_date,
+                    "latest_video_id": latest["video_id"],
+                    "ignored_video_id": selected["video_id"],
+                    "minimum_publish_time": EMOTION_CONTENT_MIN_PUBLISH_TIME.strftime("%H:%M"),
+                }
+            except Exception as exc:
+                await persist_browser_storage_state(context)
+                if is_retryable_processing_error(exc):
+                    return build_update_found_retryable_result(selected, exc)
+                return build_update_found_failed_result(selected, exc)
+            await persist_browser_storage_state(context)
+            return result
+        finally:
+            await coze_page.close()
+    finally:
+        if owns_douyin_page:
+            await douyin_page.close()
+
+
+class PersistentDouyinBrowserSession:
+    KEEP_OPEN_STATUSES = {"NO_UPDATE", "UPDATE_FOUND_RETRYABLE"}
+
+    def __init__(self, *, headless=True):
+        self.headless = bool(headless)
+        self._operation_lock = None
+        self._playwright = None
+        self._context = None
+        self._douyin_page = None
+        self._profile_lock = None
+        self._target_date = None
+        self._scheduled_close_task = None
+
+    async def _ensure_started(self, target_date):
+        if self._context is not None and self._target_date == target_date:
+            return
+        if self._context is not None:
+            await self._close_browser()
+
+        self._profile_lock = single_instance_lock()
+        self._profile_lock.__enter__()
+        try:
+            self._playwright = await async_playwright().start()
+            self._context = await launch_browser_context(
+                self._playwright,
+                headless=self.headless,
+            )
+            self._douyin_page = await self._context.new_page()
+            self._target_date = target_date
+            print(f"douyin persistent browser started: target_date={target_date}")
+        except Exception:
+            await self._close_browser()
+            raise
+
+    def _cancel_scheduled_close(self):
+        task = self._scheduled_close_task
+        self._scheduled_close_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _close_browser(self):
+        self._cancel_scheduled_close()
+        context = self._context
+        playwright = self._playwright
+        profile_lock = self._profile_lock
+        self._context = None
+        self._playwright = None
+        self._douyin_page = None
+        self._profile_lock = None
+        self._target_date = None
+        try:
+            if context is not None:
+                await context.close()
+        finally:
+            try:
+                if playwright is not None:
+                    await playwright.stop()
+            finally:
+                if profile_lock is not None:
+                    profile_lock.__exit__(None, None, None)
+        print("douyin persistent browser stopped")
+
+    async def _close_at(self, close_at):
+        delay_seconds = max(
+            0.0,
+            (close_at - datetime.now(SHANGHAI_TZ)).total_seconds(),
+        )
+        try:
+            await asyncio.sleep(delay_seconds)
+            await self._close_browser()
+        except asyncio.CancelledError:
+            return
+
+    def _schedule_close(self, close_at):
+        self._cancel_scheduled_close()
+        self._scheduled_close_task = asyncio.create_task(self._close_at(close_at))
+
+    async def run(self, target_date, *, keep_browser_open=False, close_at=None):
+        if self._operation_lock is None:
+            self._operation_lock = asyncio.Lock()
+        async with self._operation_lock:
+            self._cancel_scheduled_close()
+            await self._ensure_started(target_date)
+            try:
+                result = await run_pipeline_with_context(
+                    self._context,
+                    target_date=target_date,
+                    douyin_page=self._douyin_page,
+                )
+            except Exception:
+                await self._close_browser()
+                raise
+
+            status = str((result or {}).get("status") or "").strip().upper()
+            now = datetime.now(SHANGHAI_TZ)
+            should_keep_open = (
+                bool(keep_browser_open)
+                and status in self.KEEP_OPEN_STATUSES
+                and isinstance(close_at, datetime)
+                and now < close_at
+            )
+            if should_keep_open:
+                self._schedule_close(close_at)
+            else:
+                await self._close_browser()
+            return result
+
+    async def close(self):
+        if self._operation_lock is None:
+            await self._close_browser()
+            return
+        async with self._operation_lock:
+            await self._close_browser()
+
+
 async def run_pipeline(target_date=None):
     if not LOGIN_STATE_PATH.exists() or not STORAGE_STATE_PATH.exists():
         raise AuthenticationRequiredError("尚未初始化抖音和 Coze 登录，请运行 python run.py douyin login")
@@ -1176,41 +1576,8 @@ async def run_pipeline(target_date=None):
                 playwright,
                 headless=os.getenv("DOUYIN_COZE_HEADLESS", "0").strip() == "1",
             )
-            douyin_page = await context.new_page()
-            coze_page = await context.new_page()
             try:
-                await _open_douyin_account(douyin_page)
-                await persist_browser_storage_state(context)
-                selected = (
-                    await _existing_video_card_for_date(target_date)
-                    if target_date is not None
-                    else None
-                )
-                if selected is None and target_date is not None:
-                    selected = load_cached_video_card(target_date)
-                if selected is not None:
-                    latest = selected
-                else:
-                    today = datetime.now(SHANGHAI_TZ).date()
-                    is_historical_run = target_date is not None and target_date < today
-                    video_cards = await collect_video_cards(
-                        douyin_page,
-                        max_cards=100 if is_historical_run else MAX_VIDEO_CARDS,
-                        stop_before_date=target_date if is_historical_run else None,
-                    )
-                    cache_video_cards(video_cards)
-                    selected, latest = select_latest_video(video_cards, target_date=target_date)
-                latest_date = latest["published_at"].astimezone(SHANGHAI_TZ).date().isoformat()
-                if selected is None:
-                    return {
-                        "status": "NO_UPDATE",
-                        "target_date": target_date.isoformat(),
-                        "latest_video_date": latest_date,
-                        "latest_video_id": latest["video_id"],
-                    }
-                result = await _process_video_card(coze_page, selected, douyin_page=douyin_page)
-                await persist_browser_storage_state(context)
-                return result
+                return await run_pipeline_with_context(context, target_date=target_date)
             finally:
                 await context.close()
 

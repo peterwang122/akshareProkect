@@ -908,10 +908,21 @@ class OfficialExchangeRateLimiter:
 
 
 class OfficialExchangeHttpClient:
-    def __init__(self, exchange, limiter=None, timeout=30):
+    def __init__(
+        self,
+        exchange,
+        limiter=None,
+        timeout=30,
+        max_attempts=3,
+        retry_backoff_seconds=2,
+        sleep_func=asyncio.sleep,
+    ):
         self.exchange = str(exchange or "").strip().upper()
         self.limiter = limiter or OfficialExchangeRateLimiter()
         self.timeout = timeout
+        self.max_attempts = max(1, int(max_attempts or 1))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds or 0))
+        self.sleep_func = sleep_func
         self.session = requests.Session()
         self.session.trust_env = False
 
@@ -919,8 +930,30 @@ class OfficialExchangeHttpClient:
         self.session.close()
 
     async def get_text(self, url, params=None, headers=None):
-        await self.limiter.wait()
-        return await asyncio.to_thread(self._get_text_sync, url, params or {}, headers or {})
+        last_error = None
+        for attempt in range(1, self.max_attempts + 1):
+            await self.limiter.wait()
+            try:
+                return await asyncio.to_thread(
+                    self._get_text_sync,
+                    url,
+                    params or {},
+                    headers or {},
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = (
+                    isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                    or status_code == 429
+                    or (status_code is not None and status_code >= 500)
+                )
+                if not retryable or attempt >= self.max_attempts:
+                    raise
+                await self.sleep_func(
+                    min(8.0, self.retry_backoff_seconds * (2 ** (attempt - 1)))
+                )
+        raise last_error
 
     def _get_text_sync(self, url, params, headers):
         request_headers = dict(OFFICIAL_HTTP_HEADERS)
@@ -1059,7 +1092,13 @@ def extract_szse_now_metrics(metrics_payload):
     return now_metrics
 
 
-def build_szse_official_row(stock_row, target_date, daily_row, metrics_payload):
+def build_szse_official_row(
+    stock_row,
+    target_date,
+    daily_row,
+    metrics_payload,
+    allow_historical_metrics_fallback=False,
+):
     trade_date = normalize_trade_date_text(daily_row.get("trade_date") if daily_row else None)
     target_date_text = normalize_trade_date_text(target_date)
     if trade_date != target_date_text:
@@ -1067,9 +1106,22 @@ def build_szse_official_row(stock_row, target_date, daily_row, metrics_payload):
 
     metrics_date = normalize_trade_date_text((metrics_payload or {}).get("lastDate"))
     if metrics_date != target_date_text:
-        raise ValueError(f"SZSE metrics latest date {metrics_date or '-'} does not match target {target_date_text}")
+        if not allow_historical_metrics_fallback:
+            raise ValueError(
+                f"SZSE metrics latest date {metrics_date or '-'} "
+                f"does not match target {target_date_text}"
+            )
+        stored_metrics_payload = {
+            "status": "metrics_not_available_for_target_date",
+            "target_date": target_date_text,
+            "source_latest_date": metrics_date,
+            "latest_response": metrics_payload,
+        }
+        now_metrics = {}
+    else:
+        stored_metrics_payload = metrics_payload
+        now_metrics = extract_szse_now_metrics(metrics_payload)
 
-    now_metrics = extract_szse_now_metrics(metrics_payload)
     close_price = normalize_numeric(daily_row.get("close_price"))
     price_change_amount = normalize_numeric(daily_row.get("price_change_amount"))
     pre_close_price = subtract_metric(close_price, price_change_amount)
@@ -1102,9 +1154,13 @@ def build_szse_official_row(stock_row, target_date, daily_row, metrics_payload):
         "pe_rate": now_metrics.get("now_syl"),
         "turnover_rate": now_metrics.get("now_hsl"),
         "amplitude": amplitude,
-        "data_source": SZSE_OFFICIAL_DAILY_SOURCE,
+        "data_source": (
+            SZSE_OFFICIAL_DAILY_SOURCE
+            if metrics_date == target_date_text
+            else f"{SZSE_OFFICIAL_DAILY_SOURCE}_history_no_metrics"
+        ),
         "raw_trading_json": daily_row.get("raw"),
-        "raw_metrics_json": metrics_payload,
+        "raw_metrics_json": stored_metrics_payload,
     }
 
 
@@ -1149,7 +1205,21 @@ async def fetch_szse_official_daily_row(client, stock_row, target_date):
         headers={"Referer": f"{SZSE_OFFICIAL_REFERER_URL}?code={stock_code}"},
     )
     metrics_payload = parse_json_or_jsonp(metrics_text)
-    return build_szse_official_row(stock_row, target_date, daily_row, metrics_payload), history_payload, metrics_payload
+    target_date_text = normalize_trade_date_text(target_date)
+    return (
+        build_szse_official_row(
+            stock_row,
+            target_date,
+            daily_row,
+            metrics_payload,
+            allow_historical_metrics_fallback=(
+                bool(target_date_text)
+                and target_date_text < date.today().isoformat()
+            ),
+        ),
+        history_payload,
+        metrics_payload,
+    )
 
 
 async def collect_exchange_official_rows(
@@ -1167,6 +1237,7 @@ async def collect_exchange_official_rows(
     row_count = 0
     upserted_count = 0
     turnover_amount_count = 0
+    collected_codes = []
     try:
         for index, stock_row in enumerate(stock_rows, start=1):
             stock_code = normalize_stock_code(stock_row.get("stock_code"))
@@ -1191,6 +1262,7 @@ async def collect_exchange_official_rows(
                     if db_tools is not None:
                         upserted_count += await db_tools.upsert_stock_exchange_official_daily_data([row])
                     row_count += 1
+                    collected_codes.append(normalize_prefixed_code(row.get("prefixed_code")))
                     if normalize_numeric(row.get("turnover_amount")) is not None:
                         turnover_amount_count += 1
                     if row_count % 100 == 0:
@@ -1213,6 +1285,7 @@ async def collect_exchange_official_rows(
         "row_count": row_count,
         "upserted_count": upserted_count,
         "turnover_amount_count": turnover_amount_count,
+        "collected_codes": collected_codes,
         "missing_codes": missing_codes,
         "missing_count": len(missing_codes),
         "failed_items": failed_items,
@@ -1355,23 +1428,109 @@ async def sync_exchange_official_daily(selected_codes=None, db_tools=None, targe
         if not sh_rows and not sz_rows:
             raise ValueError("stock_exchange_official_daily found no SH/SZ stock_info_all rows")
 
-        sh_result, sz_result = await asyncio.gather(
+        async def load_existing_coverage(exchange):
+            loader = getattr(
+                db_tools,
+                "get_stock_exchange_official_daily_coverage_by_date",
+                None,
+            )
+            if loader is None:
+                return {}
+            return await loader(target_date_text, exchange)
+
+        existing_sh, existing_sz = await asyncio.gather(
+            load_existing_coverage("SH"),
+            load_existing_coverage("SZ"),
+        )
+
+        def pending_rows(rows, existing_coverage):
+            return [
+                row
+                for row in rows
+                if not existing_coverage.get(
+                    normalize_prefixed_code(row.get("prefixed_code")),
+                    False,
+                )
+            ]
+
+        pending_sh_rows = pending_rows(sh_rows, existing_sh)
+        pending_sz_rows = pending_rows(sz_rows, existing_sz)
+        print(
+            "stock exchange official daily resume: "
+            f"target_date={target_date_text}, "
+            f"sh_existing={len(sh_rows) - len(pending_sh_rows)}, sh_pending={len(pending_sh_rows)}, "
+            f"sz_existing={len(sz_rows) - len(pending_sz_rows)}, sz_pending={len(pending_sz_rows)}"
+        )
+
+        sh_pending_result, sz_pending_result = await asyncio.gather(
             collect_exchange_official_rows(
                 "SH",
-                sh_rows,
+                pending_sh_rows,
                 target_date_text,
                 db_tools=db_tools,
                 request_interval_seconds=request_interval_seconds,
             ),
             collect_exchange_official_rows(
                 "SZ",
-                sz_rows,
+                pending_sz_rows,
                 target_date_text,
                 db_tools=db_tools,
                 request_interval_seconds=request_interval_seconds,
             ),
         )
-        upserted = sh_result["upserted_count"] + sz_result["upserted_count"]
+        upserted = (
+            sh_pending_result["upserted_count"]
+            + sz_pending_result["upserted_count"]
+        )
+
+        def merge_resume_result(exchange, rows, existing_coverage, pending_result):
+            target_codes = {
+                normalize_prefixed_code(row.get("prefixed_code"))
+                for row in rows
+                if normalize_prefixed_code(row.get("prefixed_code"))
+            }
+            existing_codes = {
+                code
+                for code, is_complete in existing_coverage.items()
+                if is_complete and code in target_codes
+            }
+            collected_codes = {
+                normalize_prefixed_code(code)
+                for code in pending_result.get("collected_codes") or []
+                if normalize_prefixed_code(code) in target_codes
+            }
+            final_codes = existing_codes | collected_codes
+            missing_codes = sorted(
+                normalize_stock_code(code)
+                for code in target_codes - final_codes
+            )
+            return {
+                "exchange": exchange,
+                "target_count": len(rows),
+                "row_count": len(final_codes),
+                "upserted_count": pending_result["upserted_count"],
+                "turnover_amount_count": (
+                    len(existing_codes)
+                    + pending_result["turnover_amount_count"]
+                ),
+                "missing_codes": missing_codes,
+                "missing_count": len(missing_codes),
+                "failed_items": pending_result["failed_items"],
+                "failed_count": pending_result["failed_count"],
+                "latest_source_date": (
+                    pending_result.get("latest_source_date")
+                    or (target_date_text if existing_codes else None)
+                ),
+                "resumed_count": len(existing_codes),
+                "pending_count": pending_result["target_count"],
+            }
+
+        sh_result = merge_resume_result(
+            "SH", sh_rows, existing_sh, sh_pending_result
+        )
+        sz_result = merge_resume_result(
+            "SZ", sz_rows, existing_sz, sz_pending_result
+        )
 
         exchange_failures = []
         for result in (sh_result, sz_result):
@@ -1391,6 +1550,8 @@ async def sync_exchange_official_daily(selected_codes=None, db_tools=None, targe
                 "failed_count": sh_result["failed_count"],
                 "turnover_amount_count": sh_result["turnover_amount_count"],
                 "latest_source_date": sh_result.get("latest_source_date"),
+                "resumed_count": sh_result["resumed_count"],
+                "pending_count": sh_result["pending_count"],
                 "missing_samples": sh_result["missing_codes"][:10],
                 "failed_samples": sh_result["failed_items"][:5],
             },
@@ -1401,6 +1562,8 @@ async def sync_exchange_official_daily(selected_codes=None, db_tools=None, targe
                 "failed_count": sz_result["failed_count"],
                 "turnover_amount_count": sz_result["turnover_amount_count"],
                 "latest_source_date": sz_result.get("latest_source_date"),
+                "resumed_count": sz_result["resumed_count"],
+                "pending_count": sz_result["pending_count"],
                 "missing_samples": sz_result["missing_codes"][:10],
                 "failed_samples": sz_result["failed_items"][:5],
             },

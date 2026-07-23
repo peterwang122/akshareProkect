@@ -123,6 +123,7 @@ OPTION_VIX_PRODUCT_NAMES = {
 }
 OPTION_VIX_ROLL_DAYS = 7
 OPTION_VIX_TARGET_DAYS = 30
+OPTION_VIX_MINUTE_MINIMUM_COUNT = 220
 MINUTES_PER_YEAR = 365 * 24 * 60
 OPTION_PC_INDEX_CLOSE_OVERRIDES = {
     ("2024-09-30", "MO"): 5700.0,
@@ -1059,6 +1060,9 @@ def build_option_vix_payload(
         "price_basis_counts": basis_counts,
         "pre_settle_sources": sorted(pre_settle_sources),
         "calculation_method": "ivix_30d_option_open_and_close",
+        "uses_minute_ohlc": False,
+        "minute_count": None,
+        "minute_mid_quote_count": None,
     }
 
 
@@ -1114,6 +1118,81 @@ def build_option_vix_map(cffex_rows, exchange_rows, rate_rows):
             result.setdefault((trade_date, index_name), {})[
                 payload["source_key"]
             ] = payload
+    return result
+
+
+def merge_option_vix_minute_ohlc(option_vix_map, minute_rows):
+    result = option_vix_map or {}
+    for row in minute_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        exchange = str(row.get("exchange") or "").strip().upper()
+        product_code = str(row.get("product_code") or "").strip().upper()
+        index_name = str(row.get("index_name") or "").strip()
+        source_key = (
+            f"{exchange.lower()}:{product_code}"
+            if exchange and product_code
+            else ""
+        )
+        if not index_name:
+            index_name = next(
+                (
+                    name
+                    for name, sources in OPTION_VIX_SOURCES_BY_INDEX.items()
+                    if (exchange, product_code) in sources
+                ),
+                "",
+            )
+        if not trade_date or not source_key or not index_name:
+            continue
+        existing = result.setdefault((trade_date, index_name), {}).get(
+            source_key,
+            {},
+        )
+        price_basis = str(row.get("price_basis") or "").strip() or "mid_quote"
+        minute_count = int(row.get("minute_count") or 0)
+        mid_quote_count = int(row.get("mid_quote_count") or 0)
+        if (
+            minute_count < OPTION_VIX_MINUTE_MINIMUM_COUNT
+            or mid_quote_count / minute_count < 0.8
+        ):
+            continue
+        result[(trade_date, index_name)][source_key] = {
+            **existing,
+            "source_key": source_key,
+            "exchange": exchange,
+            "exchange_label": EXCHANGE_LABELS.get(exchange, exchange),
+            "product_code": product_code,
+            "product_name": OPTION_VIX_PRODUCT_NAMES.get(
+                (exchange, product_code),
+                product_code,
+            ),
+            "vix_open": to_float(row.get("vix_open")),
+            "vix_high": to_float(row.get("vix_high")),
+            "vix_low": to_float(row.get("vix_low")),
+            "vix_close": to_float(row.get("vix_close")),
+            "near_contract_month": row.get("near_contract_month"),
+            "near_expiry_date": normalize_date_text(row.get("near_expire_date")),
+            "near_strike_count": row.get("near_strike_count"),
+            "next_contract_month": row.get("next_contract_month"),
+            "next_expiry_date": normalize_date_text(row.get("next_expire_date")),
+            "next_strike_count": row.get("next_strike_count"),
+            "risk_free_curve_date": normalize_date_text(
+                row.get("risk_free_curve_date")
+            ),
+            "near_risk_free_rate": to_float(row.get("near_risk_free_rate")),
+            "next_risk_free_rate": to_float(row.get("next_risk_free_rate")),
+            "price_basis_counts": {
+                "mid_quote": mid_quote_count,
+                "last_trade": minute_count - mid_quote_count,
+            },
+            "pre_settle_sources": [],
+            "calculation_method": str(
+                row.get("calculation_method") or "ivix_30d_minute"
+            ).strip(),
+            "uses_minute_ohlc": True,
+            "minute_count": minute_count,
+            "minute_mid_quote_count": mid_quote_count,
+        }
     return result
 
 
@@ -1388,6 +1467,8 @@ def build_dashboard_rows(
     option_vix_map=None,
     cffex_net_short_delta_map=None,
     basis_delta_trade_dates=None,
+    fund_purchase_limit_map=None,
+    margin_trading_map=None,
 ):
     rows = []
     option_pc_map = option_pc_map or {}
@@ -1395,6 +1476,8 @@ def build_dashboard_rows(
     exchange_option_pc_map = exchange_option_pc_map or {}
     option_vix_map = option_vix_map or {}
     cffex_net_short_delta_map = cffex_net_short_delta_map or {}
+    fund_purchase_limit_map = fund_purchase_limit_map or {}
+    margin_trading_map = margin_trading_map or {}
     basis_delta_dates = basis_delta_trade_dates or trade_dates
     raw_core_basis_by_date = build_raw_core_basis_by_date(basis_delta_dates, index_close_map, futures_close_map)
     basis_delta_map = build_index_basis_delta_map(raw_core_basis_by_date, basis_delta_dates)
@@ -1453,6 +1536,12 @@ def build_dashboard_rows(
                 or empty_cffex_net_short_delta_payload()
             )
             basis_delta_payload = basis_delta_map.get((trade_date, index_name)) or empty_basis_delta_payload()
+            fund_purchase_limit_payload = (
+                fund_purchase_limit_map.get(trade_date) or {}
+                if index_name == "上证指数"
+                else {}
+            )
+            margin_trading_payload = margin_trading_map.get(trade_date) or {}
             rows.append({
                 "trade_date": trade_date,
                 "index_code": index_code_map.get(index_name) or INDEX_CODE_FALLBACKS[index_name],
@@ -1469,6 +1558,27 @@ def build_dashboard_rows(
                 "option_vix_json": option_vix_map.get((trade_date, index_name)) or {},
                 **cffex_delta_payload,
                 **basis_delta_payload,
+                "fund_purchase_limit_count": fund_purchase_limit_payload.get(
+                    "fund_purchase_limit_count"
+                ),
+                "fund_purchase_limit_total_count": fund_purchase_limit_payload.get(
+                    "fund_purchase_limit_total_count"
+                ),
+                "fund_purchase_limit_pct": fund_purchase_limit_payload.get(
+                    "fund_purchase_limit_pct"
+                ),
+                "margin_financing_balance": margin_trading_payload.get(
+                    "margin_financing_balance"
+                ),
+                "margin_securities_lending_balance": margin_trading_payload.get(
+                    "margin_securities_lending_balance"
+                ),
+                "margin_total_balance": margin_trading_payload.get(
+                    "margin_total_balance"
+                ),
+                "margin_financing_net_buy_amount": margin_trading_payload.get(
+                    "margin_financing_net_buy_amount"
+                ),
             })
 
     return rows
@@ -1600,10 +1710,51 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         exchange_option_rows,
         rate_rows,
     )
+    option_vix_minute_rows = await db_tools.get_option_vix_minute_daily_ohlc(
+        start_date,
+        end_date,
+    )
+    option_vix_map = merge_option_vix_minute_ohlc(
+        option_vix_map,
+        option_vix_minute_rows,
+    )
     cffex_position_rows = await db_tools.get_quant_index_dashboard_cffex_net_short_positions(
         shift_date_text(start_date, -CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS),
         end_date,
     )
+    fund_purchase_limit_rows = await db_tools.get_fund_purchase_limit_daily_summary(
+        start_date,
+        end_date,
+    )
+    fund_purchase_limit_map = {
+        normalize_date_text(item.get("trade_date")): {
+            "fund_purchase_limit_count": int(item.get("limited_fund_count") or 0),
+            "fund_purchase_limit_total_count": int(item.get("total_fund_count") or 0),
+            "fund_purchase_limit_pct": to_float(item.get("limited_fund_pct")),
+        }
+        for item in fund_purchase_limit_rows
+        if normalize_date_text(item.get("trade_date"))
+    }
+    margin_trading_rows = await db_tools.get_margin_trading_daily_summary(
+        start_date,
+        end_date,
+    )
+    margin_trading_map = {
+        normalize_date_text(item.get("trade_date")): {
+            "margin_financing_balance": to_float(
+                item.get("margin_financing_balance")
+            ),
+            "margin_securities_lending_balance": to_float(
+                item.get("margin_securities_lending_balance")
+            ),
+            "margin_total_balance": to_float(item.get("margin_total_balance")),
+            "margin_financing_net_buy_amount": to_float(
+                item.get("margin_financing_net_buy_amount")
+            ),
+        }
+        for item in margin_trading_rows
+        if normalize_date_text(item.get("trade_date"))
+    }
 
     rows = build_dashboard_rows(
         trade_dates=cn_trade_dates,
@@ -1622,6 +1773,8 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
             end_date=end_date,
         ),
         basis_delta_trade_dates=cn_basis_delta_trade_dates,
+        fund_purchase_limit_map=fund_purchase_limit_map,
+        margin_trading_map=margin_trading_map,
     )
     if hk_trade_dates:
         hk_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(

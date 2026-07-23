@@ -2,6 +2,7 @@ from akshare_project.collectors.quant_index import (
     build_option_vix_map,
     build_option_vix_payload,
     interpolate_risk_free_rate,
+    merge_option_vix_minute_ohlc,
 )
 
 
@@ -115,3 +116,114 @@ def test_vix_map_keeps_cffex_and_exchange_products_separate():
         result[("2026-07-03", "沪深300")]["cffex:IO"]["vix_open"]
         != result[("2026-07-03", "沪深300")]["sse:510300"]["vix_open"]
     )
+
+
+def test_minute_ohlc_overrides_daily_two_point_vix_range():
+    daily_map = {
+        ("2026-07-13", "沪深300"): {
+            "cffex:IO": {
+                "source_key": "cffex:IO",
+                "vix_open": 20,
+                "vix_high": 22,
+                "vix_low": 20,
+                "vix_close": 22,
+            }
+        }
+    }
+
+    result = merge_option_vix_minute_ohlc(
+        daily_map,
+        [
+            {
+                "trade_date": "2026-07-13",
+                "source_key": "cffex:IO",
+                "index_name": "沪深300",
+                "exchange": "CFFEX",
+                "product_code": "IO",
+                "vix_open": 21,
+                "vix_high": 29,
+                "vix_low": 18,
+                "vix_close": 24,
+                "minute_count": 242,
+                "mid_quote_count": 242,
+                "near_contract_month": "2608",
+                "near_expire_date": "2026-08-21",
+                "price_basis": "mid_quote",
+            }
+        ],
+    )
+
+    payload = result[("2026-07-13", "沪深300")]["cffex:IO"]
+    assert payload["vix_open"] == 21
+    assert payload["vix_high"] == 29
+    assert payload["vix_low"] == 18
+    assert payload["vix_close"] == 24
+    assert payload["minute_count"] == 242
+
+
+def test_last_trade_only_minute_vix_does_not_override_daily_candle():
+    daily_payload = {
+        "source_key": "sse:510500",
+        "vix_open": 26,
+        "vix_high": 28,
+        "vix_low": 25,
+        "vix_close": 27,
+    }
+    daily_map = {
+        ("2026-07-08", "中证500"): {"sse:510500": daily_payload.copy()}
+    }
+
+    result = merge_option_vix_minute_ohlc(
+        daily_map,
+        [
+            {
+                "trade_date": "2026-07-08",
+                "index_name": "中证500",
+                "exchange": "SSE",
+                "product_code": "510500",
+                "vix_open": 27,
+                "vix_high": 58,
+                "vix_low": 26,
+                "vix_close": 28,
+                "minute_count": 241,
+                "mid_quote_count": 0,
+                "price_basis": "last_trade",
+            }
+        ],
+    )
+
+    assert result[("2026-07-08", "中证500")]["sse:510500"] == daily_payload
+
+
+def test_incomplete_minute_session_does_not_override_daily_candle():
+    daily_payload = {
+        "source_key": "cffex:IO",
+        "vix_open": 20,
+        "vix_high": 22,
+        "vix_low": 19,
+        "vix_close": 21,
+    }
+    daily_map = {
+        ("2026-07-13", "沪深300"): {"cffex:IO": daily_payload.copy()}
+    }
+
+    result = merge_option_vix_minute_ohlc(
+        daily_map,
+        [
+            {
+                "trade_date": "2026-07-13",
+                "index_name": "沪深300",
+                "exchange": "CFFEX",
+                "product_code": "IO",
+                "vix_open": 24,
+                "vix_high": 27,
+                "vix_low": 23,
+                "vix_close": 25,
+                "minute_count": 100,
+                "mid_quote_count": 100,
+                "price_basis": "mid_quote",
+            }
+        ],
+    )
+
+    assert result[("2026-07-13", "沪深300")]["cffex:IO"] == daily_payload

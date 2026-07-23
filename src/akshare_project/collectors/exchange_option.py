@@ -685,6 +685,10 @@ def parse_sina_quote_payload(text):
             continue
         quote_time = str(values[32] or "").strip()
         rows[match.group("code")] = {
+            "bid1_volume": values[0],
+            "bid1_price": values[1],
+            "ask1_price": values[3],
+            "ask1_volume": values[4],
             "open_interest": values[5],
             "strike_price": values[7],
             "pre_settle_price": values[8],
@@ -1061,6 +1065,48 @@ def validate_product_coverage(rows, target_date):
     return coverage
 
 
+async def sync_stats_daily(target_date=None):
+    target = parse_date(target_date or date.today())
+    db = DbTools()
+    await db.init_pool()
+    try:
+        await db.ensure_exchange_option_tables()
+        source_results = await asyncio.gather(
+            asyncio.to_thread(fetch_sse_stats_rows_sync, target),
+            asyncio.to_thread(fetch_szse_stats_rows_sync, target),
+            return_exceptions=True,
+        )
+        failures = []
+        stats_rows = []
+        for source_name, result in zip(("SSE统计", "SZSE统计"), source_results):
+            if isinstance(result, Exception):
+                failures.append(f"{source_name}：{result}")
+            else:
+                stats_rows.extend(result)
+
+        inserted_stats = await db.batch_exchange_option_daily_stats(stats_rows)
+        try:
+            coverage = validate_product_coverage(stats_rows, target)
+        except RuntimeError as exc:
+            failures.append(str(exc))
+            coverage = {exchange: set() for exchange in EXCHANGE_OPTION_PRODUCTS}
+
+        if failures:
+            raise RuntimeError(
+                f"{target.isoformat()}沪深期权官方统计未完整发布；"
+                f"已保留统计{inserted_stats}行；" + "；".join(failures)
+            )
+        return {
+            "status": "SUCCESS",
+            "target_date": target.isoformat(),
+            "stats_rows": inserted_stats,
+            "sse_products": len(coverage["SSE"]),
+            "szse_products": len(coverage["SZSE"]),
+        }
+    finally:
+        await db.close()
+
+
 async def sync_daily(target_date=None):
     target = parse_date(target_date or date.today())
     db = DbTools()
@@ -1081,10 +1127,15 @@ async def sync_daily(target_date=None):
             "SZSE统计",
         )
         failures = []
+        warnings = []
         normalized_results = []
         for source_name, result in zip(source_names, source_results):
             if isinstance(result, Exception):
-                failures.append(f"{source_name}：{result}")
+                message = f"{source_name}：{result}"
+                if source_name.endswith("统计"):
+                    warnings.append(message)
+                else:
+                    failures.append(message)
                 normalized_results.append([])
             else:
                 normalized_results.append(result)
@@ -1137,10 +1188,12 @@ async def sync_daily(target_date=None):
             validate_product_coverage(contract_rows, target)
         except RuntimeError as exc:
             failures.append(str(exc))
+        stats_complete = True
         try:
             validate_product_coverage(stats_rows, target)
         except RuntimeError as exc:
-            failures.append(str(exc))
+            stats_complete = False
+            warnings.append(str(exc))
         official_coverage = {
             exchange: {
                 str(row.get("contract_code") or "").strip()
@@ -1198,6 +1251,8 @@ async def sync_daily(target_date=None):
                 exchange: len(codes)
                 for exchange, codes in official_coverage.items()
             },
+            "stats_status": "complete" if stats_complete else "source_pending",
+            "warnings": warnings,
             "sse_products": len(EXCHANGE_OPTION_PRODUCTS["SSE"]),
             "szse_products": len(EXCHANGE_OPTION_PRODUCTS["SZSE"]),
         }
