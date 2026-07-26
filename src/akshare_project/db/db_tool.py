@@ -27,6 +27,7 @@ QUANT_INDEX_MARGIN_TRADING_FIELDS = (
     "margin_securities_lending_balance",
     "margin_total_balance",
     "margin_financing_net_buy_amount",
+    "margin_leverage_ratio_pct",
 )
 
 
@@ -646,7 +647,8 @@ class DbTools:
         )
         for field in self.QUANT_INDEX_MARGIN_TRADING_FIELDS:
             value = self._normalize_numeric(field, row.get(field))
-            sanitized[field] = round(float(value), 2) if value is not None else None
+            precision = 6 if field == "margin_leverage_ratio_pct" else 2
+            sanitized[field] = round(float(value), precision) if value is not None else None
         for field in self.QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS:
             raw_value = row.get(field)
             sanitized[field] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
@@ -5649,6 +5651,10 @@ class DbTools:
                 "margin_financing_net_buy_amount",
                 "DECIMAL(30, 2) NULL COMMENT 'A股融资净买入额，人民币元'",
             ),
+            (
+                "margin_leverage_ratio_pct",
+                "DECIMAL(18, 6) NULL COMMENT 'A股融资融券余额占沪深北流通市值比例，百分比'",
+            ),
         )
         for column_name, definition in margin_trading_columns:
             column_definitions.append(
@@ -5830,23 +5836,55 @@ class DbTools:
 
     async def get_margin_trading_daily_summary(self, start_date, end_date):
         await self.ensure_margin_trading_daily_table()
+        await self.ensure_cn_macro_tables()
         query = """
         SELECT
-            trade_date,
-            SUM(financing_balance) AS margin_financing_balance,
-            SUM(securities_lending_balance) AS margin_securities_lending_balance,
-            SUM(margin_balance) AS margin_total_balance,
-            SUM(financing_net_buy_amount) AS margin_financing_net_buy_amount,
-            GROUP_CONCAT(exchange ORDER BY exchange SEPARATOR ',') AS exchanges,
-            COUNT(*) AS exchange_count
-        FROM margin_trading_daily_data
-        WHERE trade_date BETWEEN %s AND %s
-        GROUP BY trade_date
-        ORDER BY trade_date ASC
+            margin_summary.trade_date,
+            margin_summary.margin_financing_balance,
+            margin_summary.margin_securities_lending_balance,
+            margin_summary.margin_total_balance,
+            margin_summary.margin_financing_net_buy_amount,
+            CASE
+                WHEN market_cap_summary.a_share_circulating_market_cap_cny > 0
+                THEN margin_summary.margin_total_balance
+                    / market_cap_summary.a_share_circulating_market_cap_cny * 100
+                ELSE NULL
+            END AS margin_leverage_ratio_pct,
+            margin_summary.exchanges,
+            margin_summary.exchange_count
+        FROM (
+            SELECT
+                trade_date,
+                SUM(financing_balance) AS margin_financing_balance,
+                SUM(securities_lending_balance) AS margin_securities_lending_balance,
+                SUM(margin_balance) AS margin_total_balance,
+                SUM(financing_net_buy_amount) AS margin_financing_net_buy_amount,
+                GROUP_CONCAT(exchange ORDER BY exchange SEPARATOR ',') AS exchanges,
+                COUNT(*) AS exchange_count
+            FROM margin_trading_daily_data
+            WHERE trade_date BETWEEN %s AND %s
+            GROUP BY trade_date
+        ) AS margin_summary
+        LEFT JOIN (
+            SELECT
+                trade_date,
+                SUM(circulating_market_cap_cny) AS a_share_circulating_market_cap_cny
+            FROM cn_stock_market_cap_daily
+            WHERE trade_date BETWEEN %s AND %s
+              AND exchange IN ('SSE', 'SZSE', 'BSE')
+              AND circulating_market_cap_cny IS NOT NULL
+            GROUP BY trade_date
+            HAVING COUNT(DISTINCT exchange) = 3
+        ) AS market_cap_summary
+          ON market_cap_summary.trade_date = margin_summary.trade_date
+        ORDER BY margin_summary.trade_date ASC
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
-                await cursor.execute(query, [str(start_date), str(end_date)])
+                await cursor.execute(
+                    query,
+                    [str(start_date), str(end_date), str(start_date), str(end_date)],
+                )
                 rows = list(await cursor.fetchall())
         result = []
         bse_start = date(2023, 2, 13)

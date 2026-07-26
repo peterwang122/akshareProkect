@@ -1579,6 +1579,9 @@ def build_dashboard_rows(
                 "margin_financing_net_buy_amount": margin_trading_payload.get(
                     "margin_financing_net_buy_amount"
                 ),
+                "margin_leverage_ratio_pct": margin_trading_payload.get(
+                    "margin_leverage_ratio_pct"
+                ),
             })
 
     return rows
@@ -1750,6 +1753,9 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
             "margin_total_balance": to_float(item.get("margin_total_balance")),
             "margin_financing_net_buy_amount": to_float(
                 item.get("margin_financing_net_buy_amount")
+            ),
+            "margin_leverage_ratio_pct": to_float(
+                item.get("margin_leverage_ratio_pct")
             ),
         }
         for item in margin_trading_rows

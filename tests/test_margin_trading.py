@@ -86,6 +86,29 @@ def test_exchange_coverage_changes_from_bse_launch_date():
     }
 
 
+def test_dashboard_writes_margin_leverage_ratio_for_all_cn_indices():
+    rows = quant_index.build_dashboard_rows(
+        trade_dates=["2026-07-16"],
+        index_code_map={},
+        emotion_map={},
+        index_close_map={},
+        futures_close_map={},
+        breadth_map={},
+        margin_trading_map={
+            "2026-07-16": {
+                "margin_financing_balance": 2_829_025_453_142,
+                "margin_securities_lending_balance": 20_454_339_987,
+                "margin_total_balance": 2_849_479_793_129,
+                "margin_financing_net_buy_amount": -28_586_475_046,
+                "margin_leverage_ratio_pct": 2.991798,
+            }
+        },
+    )
+
+    assert rows
+    assert all(row["margin_leverage_ratio_pct"] == 2.991798 for row in rows)
+
+
 def test_source_date_mismatch_is_not_accepted():
     payload = [
         {

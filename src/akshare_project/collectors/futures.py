@@ -1426,7 +1426,7 @@ async def backfill_us_index_futures_official(start_date=None, end_date=None, roo
         await db_tools.close()
 
 
-async def sync_hk_index_futures_daily(trade_date=None, roots=None):
+async def sync_hk_index_futures_daily(trade_date=None, roots=None, return_details=False):
     selected_roots = select_roots(roots, HK_INDEX_FUTURES_PRODUCTS)
     if not selected_roots:
         print("No valid HK index futures roots selected.")
@@ -1438,6 +1438,8 @@ async def sync_hk_index_futures_daily(trade_date=None, roots=None):
     try:
         total_contracts = 0
         total_rows = 0
+        available_products = []
+        failed_products = {}
         for root_symbol in selected_roots:
             try:
                 if target_date:
@@ -1455,12 +1457,30 @@ async def sync_hk_index_futures_daily(trade_date=None, roots=None):
                 )
                 total_contracts += contract_count
                 total_rows += daily_count
+                if daily_count > 0:
+                    available_products.append(root_symbol)
                 print(
                     f"hk index futures {root_symbol} daily saved contracts={contract_count}, rows={daily_count}"
                 )
             except Exception as exc:
+                failed_products[root_symbol] = str(exc)
                 print(f"hk index futures {root_symbol} daily failed: {exc}")
         print(f"hk index futures daily finished, contracts={total_contracts}, rows={total_rows}")
+        if return_details:
+            expected_products = list(selected_roots)
+            return {
+                "status": (
+                    "SUCCESS"
+                    if sorted(available_products) == sorted(expected_products)
+                    else "SOURCE_NOT_READY"
+                ),
+                "target_date": target_date.isoformat() if target_date else None,
+                "collection": total_rows,
+                "contract_count": total_contracts,
+                "available_products": available_products,
+                "expected_products": expected_products,
+                "failed_products": failed_products,
+            }
         return total_rows
     finally:
         await db_tools.close()

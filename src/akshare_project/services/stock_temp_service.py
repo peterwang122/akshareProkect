@@ -4,7 +4,7 @@ import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Awaitable, Callable, Dict
 
@@ -167,6 +167,36 @@ async def run_index_futures_handler_for_previous_trade_day(handler, market: str)
     }
 
 
+async def run_hk_index_futures_handler(target_date=None):
+    if target_date:
+        if isinstance(target_date, datetime):
+            resolved_trade_date = target_date.date()
+        elif isinstance(target_date, date):
+            resolved_trade_date = target_date
+        else:
+            resolved_trade_date = datetime.strptime(str(target_date), "%Y-%m-%d").date()
+    else:
+        previous_trade_date = await quant_index.resolve_market_previous_trade_date("hk")
+        if not previous_trade_date:
+            raise RuntimeError("no previous trade date found for market=hk")
+        resolved_trade_date = datetime.strptime(str(previous_trade_date), "%Y-%m-%d").date()
+
+    result = await futures.sync_hk_index_futures_daily(
+        trade_date=resolved_trade_date,
+        return_details=True,
+    )
+    if result.get("status") != "SUCCESS":
+        result["quant_index_refresh"] = 0
+        return result
+
+    refresh_result = await quant_index.repair_market_previous_trade_day(
+        "hk",
+        reference_date=resolved_trade_date + timedelta(days=1),
+    )
+    result["quant_index_refresh"] = refresh_result
+    return result
+
+
 async def run_handler_for_previous_trade_day(handler, market: str):
     previous_trade_date = await quant_index.resolve_market_previous_trade_date(market)
     if not previous_trade_date:
@@ -253,7 +283,7 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
         "/collect-hk-index-futures-daily": DailyRoute(
             path="/collect-hk-index-futures-daily",
             task_name="hk_index_futures_daily",
-            handler=lambda: run_index_futures_handler_for_previous_trade_day(futures.sync_hk_index_futures_daily, "hk"),
+            handler=run_hk_index_futures_handler,
         ),
         "/collect-etf-daily": DailyRoute(
             path="/collect-etf-daily",
@@ -454,6 +484,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "cn_macro_daily",
             "margin_trading_daily",
             "fund_purchase_limit_daily",
+            "hk_index_futures_daily",
         }
         if payload and route.task_name not in payload_task_names:
             self._send_json(
