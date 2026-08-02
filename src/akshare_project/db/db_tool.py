@@ -28,6 +28,17 @@ QUANT_INDEX_MARGIN_TRADING_FIELDS = (
     "margin_total_balance",
     "margin_financing_net_buy_amount",
     "margin_leverage_ratio_pct",
+    "margin_total_market_cap_leverage_ratio_pct",
+)
+MARGIN_FINANCING_NET_BUY_WINDOWS = CFFEX_NET_SHORT_DELTA_WINDOWS
+QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS = tuple(
+    f"margin_financing_net_buy_sum_{window}d"
+    for window in MARGIN_FINANCING_NET_BUY_WINDOWS
+)
+QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS = (
+    "self_sentiment_score",
+    "self_sentiment_core_score",
+    "self_sentiment_derivative_score",
 )
 
 
@@ -97,10 +108,15 @@ class DbTools:
         'option_pc_quarter_2': 9999999999.9999,
         'option_volume_pc_ratio': 9999999999.9999,
         'option_turnover_pc_ratio': 9999999999.9999,
+        **{field: 100.0 for field in QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS},
         'fund_purchase_limit_pct': 100.0,
         **{field: 9999999999999999999999.99 for field in QUANT_INDEX_MARGIN_TRADING_FIELDS},
         **{field: 99999999999999.99 for field in QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS},
         **{field: 99999999999999.99 for field in QUANT_INDEX_BASIS_DELTA_FIELDS},
+        **{
+            field: 9999999999999999999999999999.99
+            for field in QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS
+        },
     }
     QUANT_INDEX_OPTION_PC_RATIO_FIELDS = (
         'option_pc_current_month',
@@ -132,12 +148,14 @@ class DbTools:
     )
     QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS = QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS
     QUANT_INDEX_BASIS_DELTA_FIELDS = QUANT_INDEX_BASIS_DELTA_FIELDS
+    QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS = QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS
     QUANT_INDEX_FUND_PURCHASE_LIMIT_FIELDS = (
         'fund_purchase_limit_count',
         'fund_purchase_limit_total_count',
         'fund_purchase_limit_pct',
     )
     QUANT_INDEX_MARGIN_TRADING_FIELDS = QUANT_INDEX_MARGIN_TRADING_FIELDS
+    QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS = QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS
     INDEX_BASIC_TABLES = {'index_basic_info', 'index_us_basic_info', 'index_hk_basic_info', 'index_qvix_basic_info'}
     INDEX_DAILY_TABLES = {'index_daily_data', 'index_us_daily_data', 'index_hk_daily_data', 'index_qvix_daily_data'}
     INDEX_FUTURES_CONTRACT_TABLES = {
@@ -380,6 +398,24 @@ class DbTools:
         sanitized['fear_greed_value'] = self._normalize_numeric('fear_greed_value', row.get('fear_greed_value'))
         sanitized['sentiment_label'] = str(row.get('sentiment_label', '')).strip().upper() or None
         sanitized['data_source'] = str(row.get('data_source', 'cnn_fear_greed_live')).strip() or 'cnn_fear_greed_live'
+        return sanitized
+
+    def _sanitize_index_cn_market_fear_greed_daily_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        sanitized['fear_greed_value'] = self._normalize_numeric('emotion_value', row.get('fear_greed_value'))
+        sanitized['sentiment_label'] = str(row.get('sentiment_label', '')).strip() or None
+        sanitized['locked'] = 1 if bool(row.get('locked')) else 0
+        sanitized['data_source'] = str(
+            row.get('data_source', 'miumiu_market_fear_greed')
+        ).strip() or 'miumiu_market_fear_greed'
+        raw_json = row.get('raw_json')
+        sanitized['raw_json'] = (
+            raw_json
+            if isinstance(raw_json, str)
+            else json.dumps(raw_json or {}, ensure_ascii=False, separators=(',', ':'))
+        )
         return sanitized
 
     def _sanitize_index_us_hedge_fund_ls_proxy_row(self, row):
@@ -633,6 +669,9 @@ class DbTools:
         for field in self.QUANT_INDEX_BASIS_DELTA_FIELDS:
             value = self._normalize_numeric(field, row.get(field))
             sanitized[field] = round(float(value), 6) if value is not None else None
+        for field in self.QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = round(float(value), 2) if value is not None else None
         for field in ('fund_purchase_limit_count', 'fund_purchase_limit_total_count'):
             raw_value = row.get(field)
             sanitized[field] = int(raw_value) if raw_value is not None else None
@@ -647,8 +686,15 @@ class DbTools:
         )
         for field in self.QUANT_INDEX_MARGIN_TRADING_FIELDS:
             value = self._normalize_numeric(field, row.get(field))
-            precision = 6 if field == "margin_leverage_ratio_pct" else 2
+            precision = 6 if field.endswith("leverage_ratio_pct") else 2
             sanitized[field] = round(float(value), precision) if value is not None else None
+        for field in self.QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS:
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = (
+                round(max(0.0, min(100.0, float(value))), 6)
+                if value is not None
+                else None
+            )
         for field in self.QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS:
             raw_value = row.get(field)
             sanitized[field] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
@@ -662,6 +708,9 @@ class DbTools:
         )
         sanitized['option_vix_json'] = self._serialize_json_field(
             row.get('option_vix_json')
+        )
+        sanitized['self_sentiment_components_json'] = self._serialize_json_field(
+            row.get('self_sentiment_components_json')
         )
         return sanitized
 
@@ -4765,6 +4814,62 @@ class DbTools:
                 await conn.commit()
                 return len(sanitized_rows)
 
+    async def ensure_index_cn_market_fear_greed_daily_table(self):
+        if self.pool is None:
+            await self.init_pool()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS index_cn_market_fear_greed_daily (
+                        trade_date DATE NOT NULL PRIMARY KEY,
+                        fear_greed_value DECIMAL(10,4) NOT NULL,
+                        sentiment_label VARCHAR(32) NULL,
+                        locked TINYINT(1) NOT NULL DEFAULT 0,
+                        data_source VARCHAR(64) NOT NULL DEFAULT 'miumiu_market_fear_greed',
+                        raw_json JSON NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_cn_market_fear_greed_source (data_source)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await conn.commit()
+
+    async def upsert_index_cn_market_fear_greed_daily(self, rows):
+        if not rows:
+            return 0
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_cn_market_fear_greed_daily_table()
+        sanitized_rows = [self._sanitize_index_cn_market_fear_greed_daily_row(row) for row in rows]
+        sanitized_rows = [row for row in sanitized_rows if row['trade_date'] and row['fear_greed_value'] is not None]
+        sanitized_rows = list({row['trade_date']: row for row in sanitized_rows}.values())
+        if not sanitized_rows:
+            return 0
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(
+                    """
+                    INSERT INTO index_cn_market_fear_greed_daily (
+                        trade_date, fear_greed_value, sentiment_label, locked, data_source, raw_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        fear_greed_value = VALUES(fear_greed_value),
+                        sentiment_label = VALUES(sentiment_label),
+                        locked = VALUES(locked),
+                        data_source = VALUES(data_source),
+                        raw_json = VALUES(raw_json),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    [(
+                        row['trade_date'], row['fear_greed_value'], row['sentiment_label'],
+                        row['locked'], row['data_source'], row['raw_json'],
+                    ) for row in sanitized_rows],
+                )
+                await conn.commit()
+                return len(sanitized_rows)
+
     async def upsert_index_us_hedge_fund_ls_proxy(self, rows):
         if not rows:
             return 0
@@ -5581,12 +5686,28 @@ class DbTools:
                 'option_vix_json',
                 "ADD COLUMN option_vix_json JSON NULL COMMENT '按交易所和期权产品独立计算的30日VIX' AFTER exchange_option_pc_json",
             ),
+            (
+                'self_sentiment_score',
+                "ADD COLUMN self_sentiment_score DECIMAL(18, 6) NULL COMMENT '自建情绪综合分' AFTER option_vix_json",
+            ),
+            (
+                'self_sentiment_core_score',
+                "ADD COLUMN self_sentiment_core_score DECIMAL(18, 6) NULL COMMENT '自建情绪价格核心分' AFTER self_sentiment_score",
+            ),
+            (
+                'self_sentiment_derivative_score',
+                "ADD COLUMN self_sentiment_derivative_score DECIMAL(18, 6) NULL COMMENT '自建情绪衍生品分' AFTER self_sentiment_core_score",
+            ),
+            (
+                'self_sentiment_components_json',
+                "ADD COLUMN self_sentiment_components_json JSON NULL COMMENT '自建情绪分项、原始值和算法版本' AFTER self_sentiment_derivative_score",
+            ),
         ]
         source_label_by_prefix = {
             'top20': '前20机构',
             'citic': '中信代客',
         }
-        previous_column = 'option_vix_json'
+        previous_column = 'self_sentiment_components_json'
         for field in self.QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS:
             parts = field.split('_')
             source_prefix = parts[1] if len(parts) > 1 else ''
@@ -5655,12 +5776,25 @@ class DbTools:
                 "margin_leverage_ratio_pct",
                 "DECIMAL(18, 6) NULL COMMENT 'A股融资融券余额占沪深北流通市值比例，百分比'",
             ),
+            (
+                "margin_total_market_cap_leverage_ratio_pct",
+                "DECIMAL(18, 6) NULL COMMENT 'A股融资融券余额占A股总市值比例，百分比'",
+            ),
         )
         for column_name, definition in margin_trading_columns:
             column_definitions.append(
                 (column_name, f"ADD COLUMN {column_name} {definition} AFTER {previous_column}")
             )
             previous_column = column_name
+        for field in self.QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS:
+            window = field.split('_')[-1].removesuffix('d')
+            column_definitions.append(
+                (
+                    field,
+                    f"ADD COLUMN {field} DECIMAL(30, 2) NULL COMMENT '近{window}交易日融资净买入累计额，人民币元' AFTER {previous_column}",
+                )
+            )
+            previous_column = field
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
@@ -5706,6 +5840,22 @@ class DbTools:
                 await cursor.execute(query)
                 await conn.commit()
         self._margin_trading_daily_table_ready = True
+
+    async def get_quant_index_dashboard_self_sentiment_history(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_quant_index_dashboard_option_pc_columns()
+        query = """
+        SELECT trade_date, index_name, self_sentiment_components_json
+        FROM quant_index_dashboard_daily
+        WHERE trade_date BETWEEN %s AND %s
+          AND index_name IN ('上证50', '沪深300', '中证500', '中证1000')
+        ORDER BY trade_date ASC, index_name ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
 
     async def upsert_margin_trading_daily_rows(self, rows):
         if not rows:
@@ -5850,6 +6000,12 @@ class DbTools:
                     / market_cap_summary.a_share_circulating_market_cap_cny * 100
                 ELSE NULL
             END AS margin_leverage_ratio_pct,
+            CASE
+                WHEN macro_indicator.a_share_total_market_cap_cny > 0
+                THEN margin_summary.margin_total_balance
+                    / macro_indicator.a_share_total_market_cap_cny * 100
+                ELSE NULL
+            END AS margin_total_market_cap_leverage_ratio_pct,
             margin_summary.exchanges,
             margin_summary.exchange_count
         FROM (
@@ -5877,6 +6033,8 @@ class DbTools:
             HAVING COUNT(DISTINCT exchange) = 3
         ) AS market_cap_summary
           ON market_cap_summary.trade_date = margin_summary.trade_date
+        LEFT JOIN cn_macro_indicator_daily AS macro_indicator
+          ON macro_indicator.trade_date = margin_summary.trade_date
         ORDER BY margin_summary.trade_date ASC
         """
         async with self.pool.acquire() as conn:
@@ -6444,11 +6602,15 @@ class DbTools:
         basis_delta_columns = list(self.QUANT_INDEX_BASIS_DELTA_FIELDS)
         fund_purchase_limit_columns = list(self.QUANT_INDEX_FUND_PURCHASE_LIMIT_FIELDS)
         margin_trading_columns = list(self.QUANT_INDEX_MARGIN_TRADING_FIELDS)
+        margin_financing_net_buy_sum_columns = list(
+            self.QUANT_INDEX_MARGIN_FINANCING_NET_BUY_SUM_FIELDS
+        )
         optional_metric_columns = [
             *cffex_delta_columns,
             *basis_delta_columns,
             *fund_purchase_limit_columns,
             *margin_trading_columns,
+            *margin_financing_net_buy_sum_columns,
         ]
         values = [
             (
@@ -6481,6 +6643,10 @@ class DbTools:
                 row['option_turnover_pc_ratio'],
                 row['exchange_option_pc_json'],
                 row['option_vix_json'],
+                row['self_sentiment_score'],
+                row['self_sentiment_core_score'],
+                row['self_sentiment_derivative_score'],
+                row['self_sentiment_components_json'],
                 *[row[field] for field in optional_metric_columns],
             )
             for row in sanitized_rows
@@ -6524,8 +6690,12 @@ class DbTools:
                     option_turnover_pc_ratio,
                     exchange_option_pc_json,
                     option_vix_json,
+                    self_sentiment_score,
+                    self_sentiment_core_score,
+                    self_sentiment_derivative_score,
+                    self_sentiment_components_json,
                     {optional_metric_insert_columns}
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {optional_metric_placeholders})
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {optional_metric_placeholders})
                 ON DUPLICATE KEY UPDATE
                     index_name = VALUES(index_name),
                     emotion_value = VALUES(emotion_value),
@@ -6554,6 +6724,10 @@ class DbTools:
                     option_turnover_pc_ratio = VALUES(option_turnover_pc_ratio),
                     exchange_option_pc_json = VALUES(exchange_option_pc_json),
                     option_vix_json = VALUES(option_vix_json),
+                    self_sentiment_score = VALUES(self_sentiment_score),
+                    self_sentiment_core_score = VALUES(self_sentiment_core_score),
+                    self_sentiment_derivative_score = VALUES(self_sentiment_derivative_score),
+                    self_sentiment_components_json = VALUES(self_sentiment_components_json),
                     {optional_metric_update_assignments},
                     updated_at = CURRENT_TIMESTAMP
                 """

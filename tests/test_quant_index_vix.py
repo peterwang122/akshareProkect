@@ -1,9 +1,38 @@
 from akshare_project.collectors.quant_index import (
+    black_76_option_price,
     build_option_vix_map,
     build_option_vix_payload,
     interpolate_risk_free_rate,
     merge_option_vix_minute_ohlc,
 )
+
+
+def _skew_term_rows(contract_month, days_to_expiry, risk_free_rate, put_vol, call_vol):
+    time_to_expiry = days_to_expiry / 365
+    rows = []
+    for strike in (85, 90, 95, 100, 105, 110, 115):
+        volatility = put_vol if strike < 100 else call_vol if strike > 100 else 0.25
+        for option_type in ("CALL", "PUT"):
+            price = black_76_option_price(
+                100,
+                strike,
+                time_to_expiry,
+                risk_free_rate,
+                volatility,
+                option_type,
+            )
+            rows.append(
+                {
+                    "option_type": option_type,
+                    "strike_price": strike,
+                    "open_price": price,
+                    "close_price": price,
+                    "settle_price": price,
+                    "pre_settle_price": price,
+                    "contract_month": contract_month,
+                }
+            )
+    return rows
 
 
 def _term_rows(contract_month, multiplier=1.0, **extra):
@@ -54,6 +83,66 @@ def test_vix_payload_calculates_independent_open_and_close_values():
     assert payload["vix_high"] == payload["vix_open"]
     assert payload["vix_low"] == payload["vix_close"]
     assert payload["calculation_method"] == "ivix_30d_option_open_and_close"
+
+
+def test_vix_payload_exposes_term_structure_and_25d_downside_skew():
+    rate = 0.016
+    rows = [
+        *_skew_term_rows("2608", 46, rate, put_vol=0.36, call_vol=0.20),
+        *_skew_term_rows("2609", 74, rate, put_vol=0.32, call_vol=0.18),
+    ]
+    payload = build_option_vix_payload(
+        "2026-07-06",
+        "CFFEX",
+        "IO",
+        rows,
+        "2026-07-03",
+        {7: rate, 30: rate, 90: rate},
+    )
+
+    assert payload is not None
+    assert payload["near_term_vix"] > 0
+    assert payload["next_term_vix"] > 0
+    assert payload["vix_term_structure"] == (
+        payload["next_term_vix"] - payload["near_term_vix"]
+    )
+    assert payload["downside_skew_25d"] > 5
+    assert payload["near_put_25d_implied_volatility"] > payload["near_call_25d_implied_volatility"]
+
+
+def test_vix_term_structure_requires_sufficient_strike_coverage():
+    payload = build_option_vix_payload(
+        "2026-07-06",
+        "CFFEX",
+        "IO",
+        [*_term_rows("2608"), *_term_rows("2609")],
+        "2026-07-03",
+        {7: 0.016, 30: 0.016, 90: 0.016},
+    )
+
+    assert payload is not None
+    assert payload["near_term_vix"] is not None
+    assert payload["next_term_vix"] is not None
+    assert payload["vix_term_structure"] is None
+
+
+def test_vix_payload_rejects_implausible_25d_skew():
+    rate = 0.016
+    rows = [
+        *_skew_term_rows("2608", 46, rate, put_vol=1.20, call_vol=0.20),
+        *_skew_term_rows("2609", 74, rate, put_vol=1.10, call_vol=0.20),
+    ]
+    payload = build_option_vix_payload(
+        "2026-07-06",
+        "CFFEX",
+        "IO",
+        rows,
+        "2026-07-03",
+        {7: rate, 30: rate, 90: rate},
+    )
+
+    assert payload is not None
+    assert payload["downside_skew_25d"] is None
 
 
 def test_open_vix_is_not_backfilled_from_close_prices():

@@ -41,6 +41,7 @@ US_HEDGE_PROXY_SOURCE = 'ofr_tff'
 US_PUT_CALL_SOURCE = 'cboe_market_statistics'
 US_TREASURY_YIELD_SOURCE = 'fred_public_csv'
 US_CREDIT_SPREAD_SOURCE = 'fred_public_csv'
+CN_MARKET_FEAR_GREED_SOURCE = 'miumiu_market_fear_greed'
 
 US_VIX_HISTORY_URL = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'
 US_PUT_CALL_HISTORY_URLS = {
@@ -55,6 +56,7 @@ US_PUT_CALL_DAILY_JSON_URL_TEMPLATE = (
 )
 US_PUT_CALL_DAILY_JSON_START_DATE = '2019-10-05'
 US_FEAR_GREED_CNN_URL = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata'
+CN_MARKET_FEAR_GREED_HISTORY_URL = 'https://www.miumiudashuju.com/api/index/history'
 US_FEAR_GREED_HISTORY_START_DATE = '2020-09-19'
 US_FEAR_GREED_MIRROR_URLS = [
     (
@@ -91,6 +93,12 @@ CNN_HTTP_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
     'Referer': 'https://www.cnn.com/markets/fear-and-greed',
     'Origin': 'https://www.cnn.com',
+}
+MIUMIU_HTTP_HEADERS = {
+    **DEFAULT_HTTP_HEADERS,
+    'Accept': 'application/json,text/plain,*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://www.miumiudashuju.com/history',
 }
 US_HEDGE_PROXY_DEFINITIONS = {
     'ES': {
@@ -1582,6 +1590,122 @@ async def backfill_qvix_history():
         await db_tools.close()
 
 
+def fetch_cn_market_fear_greed_history(expected_date=None, max_attempts=5):
+    expected_date = normalize_trade_date(expected_date) if expected_date else ''
+    best_payload = None
+    best_latest_date = ''
+
+    for attempt in range(max(1, int(max_attempts))):
+        response = requests.get(
+            CN_MARKET_FEAR_GREED_HISTORY_URL,
+            params={'days': 10000, '_': int(time.time() * 1000) + attempt},
+            headers={
+                **MIUMIU_HTTP_HEADERS,
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError('MIUMIU fear/greed response must be a JSON object.')
+
+        records = payload.get('records')
+        latest_date = max(
+            (
+                normalize_trade_date(record.get('trade_date'))
+                for record in records
+                if isinstance(record, dict)
+            ),
+            default='',
+        ) if isinstance(records, list) else ''
+        if best_payload is None or latest_date > best_latest_date:
+            best_payload = payload
+            best_latest_date = latest_date
+        if not expected_date or latest_date >= expected_date:
+            return payload
+        if attempt + 1 < max_attempts:
+            LOGGER.warning(
+                'MIUMIU fear/greed response is stale: expected %s, latest %s; retry %s/%s',
+                expected_date,
+                latest_date or '-',
+                attempt + 2,
+                max_attempts,
+            )
+            time.sleep(API_RETRY_SLEEP_SECONDS)
+
+    return best_payload
+
+
+def build_cn_market_fear_greed_rows(payload):
+    records = payload.get('records') if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return []
+    rows = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        trade_date = normalize_trade_date(record.get('trade_date'))
+        try:
+            value = float(record.get('index_value'))
+        except (TypeError, ValueError):
+            continue
+        if not trade_date or not 0 <= value <= 100:
+            continue
+        rows.append(
+            {
+                'trade_date': trade_date,
+                'fear_greed_value': value,
+                'sentiment_label': str(record.get('status_label') or '').strip(),
+                'locked': bool(record.get('locked')),
+                'data_source': CN_MARKET_FEAR_GREED_SOURCE,
+                'raw_json': record,
+            }
+        )
+    return sorted(rows, key=lambda row: row['trade_date'])
+
+
+async def backfill_cn_market_fear_greed_history(expected_date=None):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        payload = await asyncio.to_thread(
+            fetch_cn_market_fear_greed_history,
+            expected_date,
+        )
+        rows = build_cn_market_fear_greed_rows(payload)
+        if not rows:
+            raise ValueError('No valid MIUMIU market fear/greed rows returned.')
+        upserted = await db_tools.upsert_index_cn_market_fear_greed_daily(rows)
+        result = {
+            'status': 'SUCCESS',
+            'upserted': upserted,
+            'row_count': len(rows),
+            'start_date': rows[0]['trade_date'],
+            'end_date': rows[-1]['trade_date'],
+            'data_source': CN_MARKET_FEAR_GREED_SOURCE,
+        }
+        print(
+            'index cn market fear/greed backfill finished, '
+            f'rows: {len(rows)}, range: {rows[0]["trade_date"]} -> {rows[-1]["trade_date"]}'
+        )
+        return result
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_cn_market_fear_greed(target_date=None):
+    expected_date = normalize_trade_date(target_date) if target_date else ''
+    result = await backfill_cn_market_fear_greed_history(expected_date=expected_date)
+    if expected_date and result['end_date'] < expected_date:
+        raise ValueError(
+            'MIUMIU market fear/greed source is not ready, '
+            f'expected {expected_date}, latest {result["end_date"]}'
+        )
+    return result
+
+
 async def sync_daily_qvix():
     db_tools = DbTools()
     await db_tools.init_pool()
@@ -2342,6 +2466,13 @@ async def main():
         return
     if command == 'daily-news-sentiment':
         await sync_daily_news_sentiment_scope()
+        return
+    if command == 'backfill-cn-market-fear-greed':
+        await backfill_cn_market_fear_greed_history()
+        return
+    if command == 'daily-cn-market-fear-greed':
+        target_date = sys.argv[2] if len(sys.argv) > 2 else None
+        await sync_daily_cn_market_fear_greed(target_date=target_date)
         return
     if command == 'backfill-us-vix':
         await backfill_us_vix()

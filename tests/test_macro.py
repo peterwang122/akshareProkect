@@ -145,6 +145,57 @@ def test_build_macro_rows_bridges_aggregate_history_and_prefers_official():
     assert rows[1]["market_cap_source"] == "exchange_official"
 
 
+def test_build_macro_rows_interpolates_short_aggregate_market_cap_gap():
+    trade_dates = [date(2020, 1, 2), date(2020, 1, 3), date(2020, 1, 6)]
+    market_caps = [
+        {
+            "trade_date": "2020-01-02",
+            "exchange": "A_AGGREGATE",
+            "total_market_cap_cny": 100,
+        },
+        {
+            "trade_date": "2020-01-06",
+            "exchange": "A_AGGREGATE",
+            "total_market_cap_cny": 120,
+        },
+    ]
+
+    rows = macro.build_macro_indicator_rows(
+        trade_dates, [], [], market_caps, [], [],
+    )
+
+    assert rows[1]["a_share_total_market_cap_cny"] == pytest.approx(
+        110 * macro.DEFAULT_AGGREGATE_MARKET_CAP_ADJUSTMENT
+    )
+    assert rows[1]["market_cap_source"] == (
+        "legulegu_interpolated_adjusted_to_exchange_official"
+    )
+
+
+def test_build_macro_rows_does_not_interpolate_long_aggregate_market_cap_gap():
+    trade_dates = [date(2020, 1, day) for day in range(2, 10)]
+    market_caps = [
+        {
+            "trade_date": "2020-01-02",
+            "exchange": "A_AGGREGATE",
+            "total_market_cap_cny": 100,
+        },
+        {
+            "trade_date": "2020-01-09",
+            "exchange": "A_AGGREGATE",
+            "total_market_cap_cny": 120,
+        },
+    ]
+
+    rows = macro.build_macro_indicator_rows(
+        trade_dates, [], [], market_caps, [], [],
+    )
+
+    assert all(
+        row["a_share_total_market_cap_cny"] is None for row in rows[1:-1]
+    )
+
+
 def test_csi1000_spread_starts_on_official_launch_date():
     trade_dates = [date(2014, 10, 16), date(2014, 10, 17)]
     valuations = [

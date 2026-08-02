@@ -101,12 +101,42 @@ def test_dashboard_writes_margin_leverage_ratio_for_all_cn_indices():
                 "margin_total_balance": 2_849_479_793_129,
                 "margin_financing_net_buy_amount": -28_586_475_046,
                 "margin_leverage_ratio_pct": 2.991798,
+                "margin_total_market_cap_leverage_ratio_pct": 2.621472,
             }
         },
     )
 
     assert rows
     assert all(row["margin_leverage_ratio_pct"] == 2.991798 for row in rows)
+    assert all(
+        row["margin_total_market_cap_leverage_ratio_pct"] == 2.621472
+        for row in rows
+    )
+
+
+def test_margin_financing_net_buy_sums_require_complete_trading_day_windows():
+    trade_dates = [f"2026-07-{day:02d}" for day in range(1, 9)]
+    margin_map = {
+        trade_date: {"margin_financing_net_buy_amount": day * 100.0}
+        for day, trade_date in enumerate(trade_dates, start=1)
+    }
+
+    result = quant_index.build_margin_financing_net_buy_sum_map(
+        margin_map,
+        trade_dates,
+    )
+
+    assert result[trade_dates[3]]["margin_financing_net_buy_sum_5d"] is None
+    assert result[trade_dates[4]]["margin_financing_net_buy_sum_5d"] == 1_500.0
+    assert result[trade_dates[6]]["margin_financing_net_buy_sum_7d"] == 2_800.0
+    assert result[trade_dates[7]]["margin_financing_net_buy_sum_5d"] == 3_000.0
+
+    margin_map[trade_dates[5]]["margin_financing_net_buy_amount"] = None
+    result_with_gap = quant_index.build_margin_financing_net_buy_sum_map(
+        margin_map,
+        trade_dates,
+    )
+    assert result_with_gap[trade_dates[7]]["margin_financing_net_buy_sum_5d"] is None
 
 
 def test_source_date_mismatch_is_not_accepted():

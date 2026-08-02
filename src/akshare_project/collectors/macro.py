@@ -840,6 +840,40 @@ def latest_available_deposit(deposit_rows, target):
     return max(eligible, key=lambda item: item[0])[1] if eligible else None
 
 
+def interpolate_short_aggregate_market_cap_gaps(trade_dates, market_caps, max_gap=5):
+    targets = sorted({parse_date(item) for item in trade_dates})
+    target_indexes = {target: index for index, target in enumerate(targets)}
+    known_values = {}
+    for target in targets:
+        aggregate = market_caps.get(target, {}).get("A_AGGREGATE")
+        value = (
+            parse_number(aggregate.get("total_market_cap_cny"))
+            if aggregate else None
+        )
+        if value is not None and value > 0:
+            known_values[target] = value
+
+    known_dates = sorted(known_values)
+    interpolated = {}
+    for previous, following in zip(known_dates, known_dates[1:]):
+        previous_index = target_indexes[previous]
+        following_index = target_indexes[following]
+        missing_count = following_index - previous_index - 1
+        if missing_count <= 0 or missing_count > max_gap:
+            continue
+        previous_value = known_values[previous]
+        following_value = known_values[following]
+        for index in range(previous_index + 1, following_index):
+            target = targets[index]
+            if target in known_values:
+                continue
+            progress = (index - previous_index) / (following_index - previous_index)
+            interpolated[target] = previous_value + (
+                following_value - previous_value
+            ) * progress
+    return interpolated
+
+
 def build_macro_indicator_rows(
     trade_dates,
     valuation_rows,
@@ -874,6 +908,9 @@ def build_macro_indicator_rows(
         median(overlap_ratios)
         if overlap_ratios else DEFAULT_AGGREGATE_MARKET_CAP_ADJUSTMENT
     )
+    interpolated_aggregate_values = interpolate_short_aggregate_market_cap_gaps(
+        trade_dates, market_caps
+    )
     gdp_map = {parse_date(row["period_end"]): row for row in gdp_rows}
     gdp_dates = sorted(gdp_map)
     deposit_map = {parse_date(row["period_end"]): row for row in deposit_rows}
@@ -905,9 +942,17 @@ def build_macro_indicator_rows(
                 parse_number(aggregate_row.get("total_market_cap_cny"))
                 if aggregate_row else None
             )
+            aggregate_interpolated = False
+            if aggregate_value is None:
+                aggregate_value = interpolated_aggregate_values.get(target)
+                aggregate_interpolated = aggregate_value is not None
             if aggregate_value is not None and aggregate_value > 0:
                 total_market_cap = aggregate_value * aggregate_adjustment
-                market_cap_source = "legulegu_adjusted_to_exchange_official"
+                market_cap_source = (
+                    "legulegu_interpolated_adjusted_to_exchange_official"
+                    if aggregate_interpolated
+                    else "legulegu_adjusted_to_exchange_official"
+                )
                 market_cap_adjustment_factor = aggregate_adjustment
         latest_gdp = latest_released_gdp(gdp_rows, target)
         latest_deposit = latest_available_deposit(deposit_rows, target)

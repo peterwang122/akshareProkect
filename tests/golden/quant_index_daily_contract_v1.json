@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "request": {
+    "collector_key": "quant_index_daily",
+    "endpoint": "/collect-quant-index-daily",
+    "payload": {}
+  },
+  "provider_response": {
+    "status": "SUCCESS",
+    "task_name": "quant_index_daily",
+    "started_at": "2026-07-31 21:50:00",
+    "finished_at": "2026-07-31 21:50:01",
+    "duration_seconds": 1.234,
+    "result": 28
+  },
+  "consumer_response": {
+    "requested_at": "2026-07-31",
+    "status": "ok",
+    "collector_key": "quant_index_daily",
+    "endpoint": "/collect-quant-index-daily",
+    "upstream_status": "SUCCESS",
+    "upstream_response": {
+      "status": "SUCCESS",
+      "task_name": "quant_index_daily",
+      "started_at": "2026-07-31 21:50:00",
+      "finished_at": "2026-07-31 21:50:01",
+      "duration_seconds": 1.234,
+      "result": 28
+    }
+  }
+}

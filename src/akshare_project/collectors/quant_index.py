@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 import re
 import sys
@@ -76,6 +77,11 @@ BASIS_DELTA_FIELDS = tuple(
     for basis_kind in ("main", "month")
     for window in BASIS_DELTA_WINDOWS
 )
+MARGIN_FINANCING_NET_BUY_WINDOWS = CFFEX_NET_SHORT_DELTA_WINDOWS
+MARGIN_FINANCING_NET_BUY_FIELDS = tuple(
+    (f"margin_financing_net_buy_sum_{window}d", window)
+    for window in MARGIN_FINANCING_NET_BUY_WINDOWS
+)
 INDEX_OPTION_PRODUCTS = {
     "上证50": "HO",
     "沪深300": "IO",
@@ -125,6 +131,14 @@ OPTION_VIX_ROLL_DAYS = 7
 OPTION_VIX_TARGET_DAYS = 30
 OPTION_VIX_MINUTE_MINIMUM_COUNT = 220
 MINUTES_PER_YEAR = 365 * 24 * 60
+SELF_SENTIMENT_LOOKBACK_DAYS = 500
+SELF_SENTIMENT_PERCENTILE_WINDOW = 252
+SELF_SENTIMENT_VERSION = "v4"
+OPTION_SKEW_TARGET_DELTA = 0.25
+OPTION_SKEW_MIN_DELTA = 0.10
+OPTION_SKEW_MAX_DELTA = 0.40
+OPTION_SKEW_MAX_ABS_VOL_POINTS = 50.0
+OPTION_TERM_STRUCTURE_MIN_STRIKES = 5
 OPTION_PC_INDEX_CLOSE_OVERRIDES = {
     ("2024-09-30", "MO"): 5700.0,
     ("2025-04-07", "MO"): 5500.0,
@@ -256,6 +270,283 @@ def average_or_none(values):
     return sum(valid_values) / len(valid_values)
 
 
+def clamp_score(value):
+    numeric = to_float(value)
+    if numeric is None or not math.isfinite(numeric):
+        return None
+    return max(0.0, min(100.0, numeric))
+
+
+def rolling_percentile(values, index, window=SELF_SENTIMENT_PERCENTILE_WINDOW, inverse=False):
+    current = to_float(values[index]) if 0 <= index < len(values) else None
+    if current is None or not math.isfinite(current):
+        return None
+    start = max(0, index - window + 1)
+    sample = [
+        numeric
+        for numeric in (to_float(value) for value in values[start:index + 1])
+        if numeric is not None and math.isfinite(numeric)
+    ]
+    if len(sample) < 20:
+        return None
+    lower_count = sum(1 for value in sample if value < current)
+    equal_count = sum(1 for value in sample if value == current)
+    percentile = (lower_count + equal_count * 0.5) / len(sample) * 100.0
+    return 100.0 - percentile if inverse else percentile
+
+
+def calculate_rsi_series(values, period=14):
+    result = [None] * len(values)
+    if len(values) <= period:
+        return result
+    gains = []
+    losses = []
+    for index in range(1, len(values)):
+        current = to_float(values[index])
+        previous = to_float(values[index - 1])
+        change = current - previous if current is not None and previous is not None else 0.0
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
+    result[period] = 100.0 if average_loss == 0 else 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+    for index in range(period + 1, len(values)):
+        average_gain = (average_gain * (period - 1) + gains[index - 1]) / period
+        average_loss = (average_loss * (period - 1) + losses[index - 1]) / period
+        result[index] = 100.0 if average_loss == 0 else 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+    return result
+
+
+def _first_option_vix_value(option_vix_payload, index_name, field_name, positive_only=False):
+    payload = option_vix_payload or {}
+    for exchange, product_code in OPTION_VIX_SOURCES_BY_INDEX.get(index_name, []):
+        value = to_float(
+            (payload.get(f"{exchange.lower()}:{product_code}") or {}).get(field_name)
+        )
+        if value is not None and (not positive_only or value > 0):
+            return value
+    return None
+
+
+def _self_sentiment_option_payloads(index_name, option_pc_payload, option_flow_payload, exchange_payload):
+    if index_name == "中证500":
+        for exchange, product_code in EXCHANGE_OPTION_PRODUCTS_BY_INDEX.get(index_name, []):
+            payload = (exchange_payload or {}).get(f"{exchange.lower()}:{product_code}")
+            if payload:
+                return payload, payload
+        return {}, {}
+    return option_pc_payload or {}, option_flow_payload or {}
+
+
+def build_self_sentiment_map(
+    trade_dates,
+    index_close_map,
+    futures_close_map,
+    option_pc_map,
+    option_flow_pc_map,
+    exchange_option_pc_map,
+    option_vix_map,
+    margin_financing_net_buy_sum_map=None,
+    history_rows=None,
+    output_start_date=None,
+    output_end_date=None,
+):
+    margin_financing_net_buy_sum_map = margin_financing_net_buy_sum_map or {}
+    raw_history = {}
+    for row in history_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        index_name = str(row.get("index_name") or "").strip()
+        raw_json = row.get("self_sentiment_components_json")
+        try:
+            payload = json.loads(raw_json) if isinstance(raw_json, str) else (raw_json or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        raw_values = payload.get("raw_values") if isinstance(payload, dict) else None
+        if trade_date and index_name and isinstance(raw_values, dict):
+            raw_history[(trade_date, index_name)] = raw_values
+
+    all_dates = sorted({normalize_date_text(value) for value in trade_dates if normalize_date_text(value)})
+    all_dates = sorted(set(all_dates) | {date for date, name in index_close_map if name in CORE_INDEX_NAMES})
+    normalized_output_start_date = normalize_date_text(output_start_date)
+    core_results = {}
+    component_keys = (
+        "rsi14", "momentum20", "price_strength60", "realized_vol20",
+        "vix", "vix_term_structure", "downside_skew_25d",
+        "put_call_price", "put_call_volume", "put_call_turnover", "month_basis",
+        "margin_financing_net_buy_30d",
+    )
+    for index_name in CORE_INDEX_NAMES:
+        dates = [date for date in all_dates if index_close_map.get((date, index_name)) is not None]
+        closes = [index_close_map.get((date, index_name)) for date in dates]
+        rsi_values = calculate_rsi_series(closes)
+        raw_by_component = {key: [] for key in component_keys}
+        for index, trade_date in enumerate(dates):
+            close_price = to_float(closes[index])
+            previous20 = to_float(closes[index - 20]) if index >= 20 else None
+            trailing60 = [to_float(value) for value in closes[max(0, index - 59):index + 1]]
+            trailing60 = [value for value in trailing60 if value is not None]
+            returns20 = []
+            for return_index in range(max(1, index - 19), index + 1):
+                current_close = to_float(closes[return_index])
+                previous_close = to_float(closes[return_index - 1])
+                if current_close is not None and previous_close not in (None, 0):
+                    returns20.append(math.log(current_close / previous_close))
+            realized_vol = None
+            if len(returns20) >= 15:
+                mean_return = sum(returns20) / len(returns20)
+                variance = sum((value - mean_return) ** 2 for value in returns20) / len(returns20)
+                realized_vol = math.sqrt(variance) * math.sqrt(252)
+
+            price_payload, flow_payload = _self_sentiment_option_payloads(
+                index_name,
+                option_pc_map.get((trade_date, index_name)),
+                option_flow_pc_map.get((trade_date, index_name)),
+                exchange_option_pc_map.get((trade_date, index_name)),
+            )
+            main_symbol = INDEX_FUTURES_SYMBOLS[index_name]["month_symbol"]
+            month_close = to_float(futures_close_map.get((trade_date, main_symbol)))
+            historical_raw = raw_history.get((trade_date, index_name), {})
+            raw_values = {
+                "rsi14": to_float(rsi_values[index]),
+                "momentum20": ((close_price / previous20) - 1.0) if close_price is not None and previous20 not in (None, 0) else None,
+                "price_strength60": (
+                    (close_price - min(trailing60)) / (max(trailing60) - min(trailing60)) * 100.0
+                    if close_price is not None and len(trailing60) >= 40 and max(trailing60) > min(trailing60)
+                    else None
+                ),
+                "realized_vol20": realized_vol,
+                "vix": _first_option_vix_value(
+                    option_vix_map.get((trade_date, index_name)),
+                    index_name,
+                    "vix_close",
+                    positive_only=True,
+                ),
+                "vix_term_structure": _first_option_vix_value(
+                    option_vix_map.get((trade_date, index_name)),
+                    index_name,
+                    "vix_term_structure",
+                ),
+                "downside_skew_25d": _first_option_vix_value(
+                    option_vix_map.get((trade_date, index_name)),
+                    index_name,
+                    "downside_skew_25d",
+                ),
+                "put_call_price": to_float(price_payload.get("option_pc_current_month")),
+                "put_call_volume": to_float(flow_payload.get("option_volume_pc_ratio")),
+                "put_call_turnover": to_float(flow_payload.get("option_turnover_pc_ratio")),
+                "month_basis": ((month_close - close_price) / close_price) if month_close is not None and close_price not in (None, 0) else None,
+                "margin_financing_net_buy_30d": to_float(
+                    (margin_financing_net_buy_sum_map.get(trade_date) or {}).get(
+                        "margin_financing_net_buy_sum_30d"
+                    )
+                ),
+            }
+            for key in component_keys:
+                if (
+                    raw_values[key] is None
+                    and (
+                        not normalized_output_start_date
+                        or trade_date < normalized_output_start_date
+                    )
+                ):
+                    raw_values[key] = to_float(historical_raw.get(key))
+                raw_by_component[key].append(raw_values[key])
+
+        for index, trade_date in enumerate(dates):
+            scores = {
+                "rsi14": clamp_score(raw_by_component["rsi14"][index]),
+                "momentum20": rolling_percentile(raw_by_component["momentum20"], index),
+                "price_strength60": clamp_score(raw_by_component["price_strength60"][index]),
+                "realized_vol20": rolling_percentile(raw_by_component["realized_vol20"], index, inverse=True),
+                "vix": rolling_percentile(raw_by_component["vix"], index, inverse=True),
+                "vix_term_structure": rolling_percentile(
+                    raw_by_component["vix_term_structure"], index
+                ),
+                "downside_skew_25d": rolling_percentile(
+                    raw_by_component["downside_skew_25d"], index, inverse=True
+                ),
+                "put_call_price": rolling_percentile(raw_by_component["put_call_price"], index, inverse=True),
+                "put_call_volume": rolling_percentile(raw_by_component["put_call_volume"], index, inverse=True),
+                "put_call_turnover": rolling_percentile(raw_by_component["put_call_turnover"], index, inverse=True),
+                "month_basis": rolling_percentile(raw_by_component["month_basis"], index),
+                "margin_financing_net_buy_30d": rolling_percentile(
+                    raw_by_component["margin_financing_net_buy_30d"], index
+                ),
+            }
+            core_values = [
+                scores[key]
+                for key in (
+                    "rsi14",
+                    "momentum20",
+                    "price_strength60",
+                    "realized_vol20",
+                    "margin_financing_net_buy_30d",
+                )
+                if scores[key] is not None
+            ]
+            derivative_values = [
+                scores[key]
+                for key in (
+                    "vix",
+                    "vix_term_structure",
+                    "downside_skew_25d",
+                    "put_call_turnover",
+                    "month_basis",
+                )
+                if scores[key] is not None
+            ]
+            core_score = average_or_none(core_values) if len(core_values) >= 3 else None
+            derivative_score = average_or_none(derivative_values) if len(derivative_values) >= 2 else None
+            all_scores = [*core_values, *derivative_values]
+            score = (
+                average_or_none([core_score, derivative_score])
+                if core_score is not None and derivative_score is not None
+                else core_score
+            )
+            core_results[(trade_date, index_name)] = {
+                "self_sentiment_score": score,
+                "self_sentiment_core_score": core_score,
+                "self_sentiment_derivative_score": derivative_score,
+                "self_sentiment_components_json": {
+                    "version": SELF_SENTIMENT_VERSION,
+                    "component_count": len(all_scores),
+                    "scores": scores,
+                    "raw_values": {key: raw_by_component[key][index] for key in component_keys},
+                },
+            }
+
+    result = dict(core_results)
+    for trade_date in all_dates:
+        core_payloads = [core_results.get((trade_date, index_name)) for index_name in CORE_INDEX_NAMES]
+        core_payloads = [payload for payload in core_payloads if payload and payload.get("self_sentiment_score") is not None]
+        if core_payloads:
+            aggregate_scores = {}
+            for key in component_keys:
+                aggregate_scores[key] = average_or_none([
+                    (payload.get("self_sentiment_components_json") or {}).get("scores", {}).get(key)
+                    for payload in core_payloads
+                ])
+            result[(trade_date, "上证指数")] = {
+                "self_sentiment_score": average_or_none([payload.get("self_sentiment_score") for payload in core_payloads]),
+                "self_sentiment_core_score": average_or_none([payload.get("self_sentiment_core_score") for payload in core_payloads]),
+                "self_sentiment_derivative_score": average_or_none([payload.get("self_sentiment_derivative_score") for payload in core_payloads]),
+                "self_sentiment_components_json": {
+                    "version": SELF_SENTIMENT_VERSION,
+                    "component_count": len([value for value in aggregate_scores.values() if value is not None]),
+                    "scores": aggregate_scores,
+                    "raw_values": {},
+                    "aggregate": "core_index_equal_weight",
+                },
+            }
+    if output_start_date or output_end_date:
+        return {
+            key: value for key, value in result.items()
+            if (not output_start_date or key[0] >= output_start_date)
+            and (not output_end_date or key[0] <= output_end_date)
+        }
+    return result
+
+
 def empty_option_pc_payload():
     payload = {}
     for bucket in OPTION_PC_BUCKETS:
@@ -296,6 +587,10 @@ def empty_cffex_net_short_delta_payload():
 
 def empty_basis_delta_payload():
     return {field_name: None for field_name, _basis_kind, _window in BASIS_DELTA_FIELDS}
+
+
+def empty_margin_financing_net_buy_payload():
+    return {field_name: None for field_name, _window in MARGIN_FINANCING_NET_BUY_FIELDS}
 
 
 def normalize_contract_month(value):
@@ -797,6 +1092,163 @@ def resolve_option_vix_expiry(row, exchange):
     return third_friday_of_contract_month(row.get("contract_month"))
 
 
+def standard_normal_cdf(value):
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def black_76_option_price(forward, strike, time_to_expiry, risk_free_rate, volatility, option_type):
+    if (
+        forward <= 0
+        or strike <= 0
+        or time_to_expiry <= 0
+        or volatility <= 0
+    ):
+        return None
+    sqrt_time = math.sqrt(time_to_expiry)
+    d1 = (
+        math.log(forward / strike) + 0.5 * volatility * volatility * time_to_expiry
+    ) / (volatility * sqrt_time)
+    d2 = d1 - volatility * sqrt_time
+    discount = math.exp(-risk_free_rate * time_to_expiry)
+    if option_type == "CALL":
+        return discount * (
+            forward * standard_normal_cdf(d1) - strike * standard_normal_cdf(d2)
+        )
+    return discount * (
+        strike * standard_normal_cdf(-d2) - forward * standard_normal_cdf(-d1)
+    )
+
+
+def solve_black_76_implied_volatility(
+    option_price,
+    forward,
+    strike,
+    time_to_expiry,
+    risk_free_rate,
+    option_type,
+):
+    price = to_float(option_price)
+    if price is None or price <= 0 or forward <= 0 or strike <= 0 or time_to_expiry <= 0:
+        return None
+    discount = math.exp(-risk_free_rate * time_to_expiry)
+    intrinsic = discount * max(
+        forward - strike if option_type == "CALL" else strike - forward,
+        0.0,
+    )
+    if price <= intrinsic + 1e-10:
+        return None
+    low = 1e-6
+    high = 5.0
+    high_price = black_76_option_price(
+        forward,
+        strike,
+        time_to_expiry,
+        risk_free_rate,
+        high,
+        option_type,
+    )
+    if high_price is None or high_price < price:
+        return None
+    for _ in range(80):
+        middle = (low + high) / 2.0
+        model_price = black_76_option_price(
+            forward,
+            strike,
+            time_to_expiry,
+            risk_free_rate,
+            middle,
+            option_type,
+        )
+        if model_price is None:
+            return None
+        if model_price < price:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2.0
+
+
+def black_76_absolute_delta(forward, strike, time_to_expiry, volatility, option_type):
+    if forward <= 0 or strike <= 0 or time_to_expiry <= 0 or volatility <= 0:
+        return None
+    d1 = (
+        math.log(forward / strike) + 0.5 * volatility * volatility * time_to_expiry
+    ) / (volatility * math.sqrt(time_to_expiry))
+    if option_type == "CALL":
+        return standard_normal_cdf(d1)
+    return standard_normal_cdf(-d1)
+
+
+def calculate_25d_downside_skew(
+    strike_prices,
+    forward,
+    time_to_expiry,
+    risk_free_rate,
+):
+    candidates = {"CALL": [], "PUT": []}
+    for strike, prices in strike_prices.items():
+        for option_type in ("CALL", "PUT"):
+            if option_type not in prices:
+                continue
+            if option_type == "CALL" and strike <= forward:
+                continue
+            if option_type == "PUT" and strike >= forward:
+                continue
+            implied_volatility = solve_black_76_implied_volatility(
+                prices[option_type],
+                forward,
+                strike,
+                time_to_expiry,
+                risk_free_rate,
+                option_type,
+            )
+            if implied_volatility is None:
+                continue
+            absolute_delta = black_76_absolute_delta(
+                forward,
+                strike,
+                time_to_expiry,
+                implied_volatility,
+                option_type,
+            )
+            if (
+                absolute_delta is None
+                or absolute_delta < OPTION_SKEW_MIN_DELTA
+                or absolute_delta > OPTION_SKEW_MAX_DELTA
+            ):
+                continue
+            candidates[option_type].append(
+                {
+                    "strike": strike,
+                    "absolute_delta": absolute_delta,
+                    "implied_volatility": implied_volatility,
+                }
+            )
+    selected = {}
+    for option_type in ("CALL", "PUT"):
+        if not candidates[option_type]:
+            return None
+        selected[option_type] = min(
+            candidates[option_type],
+            key=lambda item: abs(item["absolute_delta"] - OPTION_SKEW_TARGET_DELTA),
+        )
+    downside_skew = (
+        selected["PUT"]["implied_volatility"]
+        - selected["CALL"]["implied_volatility"]
+    ) * 100.0
+    if abs(downside_skew) > OPTION_SKEW_MAX_ABS_VOL_POINTS:
+        return None
+    return {
+        "downside_skew_25d": downside_skew,
+        "put_25d_implied_volatility": selected["PUT"]["implied_volatility"] * 100.0,
+        "put_25d_delta": selected["PUT"]["absolute_delta"],
+        "put_25d_strike": selected["PUT"]["strike"],
+        "call_25d_implied_volatility": selected["CALL"]["implied_volatility"] * 100.0,
+        "call_25d_delta": selected["CALL"]["absolute_delta"],
+        "call_25d_strike": selected["CALL"]["strike"],
+    }
+
+
 def calculate_option_term_variance(
     product_rows,
     trade_date,
@@ -883,8 +1335,9 @@ def calculate_option_term_variance(
     )
     if not math.isfinite(variance) or variance <= 0:
         return None
-    return {
+    result = {
         "variance": variance,
+        "term_vix": 100.0 * math.sqrt(variance),
         "minutes_to_expiry": minutes_to_expiry,
         "days_to_expiry": minutes_to_expiry / (24 * 60),
         "forward": forward,
@@ -894,6 +1347,32 @@ def calculate_option_term_variance(
         "price_basis_counts": price_basis_counts,
         "pre_settle_sources": sorted(pre_settle_sources),
     }
+    skew_payload = calculate_25d_downside_skew(
+        strike_prices,
+        forward,
+        time_to_expiry,
+        risk_free_rate,
+    )
+    if skew_payload:
+        result.update(skew_payload)
+    return result
+
+
+def interpolate_constant_30d_metric(near, next_term, field_name):
+    near_value = to_float((near or {}).get(field_name))
+    if near_value is None:
+        return None
+    target_minutes = OPTION_VIX_TARGET_DAYS * 24 * 60
+    near_minutes = to_float((near or {}).get("minutes_to_expiry"))
+    if near_minutes is None or near_minutes >= target_minutes:
+        return near_value
+    next_value = to_float((next_term or {}).get(field_name))
+    next_minutes = to_float((next_term or {}).get("minutes_to_expiry"))
+    if next_value is None or next_minutes is None or next_minutes <= near_minutes:
+        return None
+    near_weight = (next_minutes - target_minutes) / (next_minutes - near_minutes)
+    next_weight = (target_minutes - near_minutes) / (next_minutes - near_minutes)
+    return near_value * near_weight + next_value * next_weight
 
 
 def calculate_constant_30d_vix(term_results):
@@ -909,6 +1388,7 @@ def calculate_constant_30d_vix(term_results):
     if not valid_terms:
         return None
     near = valid_terms[0]
+    curve_next = valid_terms[1] if len(valid_terms) > 1 else None
     target_minutes = OPTION_VIX_TARGET_DAYS * 24 * 60
     if near["minutes_to_expiry"] >= target_minutes:
         annual_variance = near["variance"]
@@ -947,6 +1427,13 @@ def calculate_constant_30d_vix(term_results):
         "vix_close": 100 * math.sqrt(annual_variance),
         "near": near,
         "next": next_term,
+        "curve_near": near,
+        "curve_next": curve_next,
+        "downside_skew_25d": interpolate_constant_30d_metric(
+            near,
+            next_term,
+            "downside_skew_25d",
+        ),
     }
 
 
@@ -1010,6 +1497,16 @@ def build_option_vix_payload(
         return None
     near = result["near"]
     next_term = result["next"]
+    curve_near = result.get("curve_near") or near
+    curve_next = result.get("curve_next")
+    near_term_vix = to_float(curve_near.get("term_vix"))
+    next_term_vix = to_float((curve_next or {}).get("term_vix"))
+    term_structure_is_usable = (
+        near_term_vix is not None
+        and next_term_vix is not None
+        and int(curve_near.get("strike_count") or 0) >= OPTION_TERM_STRUCTURE_MIN_STRIKES
+        and int((curve_next or {}).get("strike_count") or 0) >= OPTION_TERM_STRUCTURE_MIN_STRIKES
+    )
     basis_counts = dict(near.get("price_basis_counts") or {})
     pre_settle_sources = set(near.get("pre_settle_sources") or [])
     if next_term:
@@ -1046,12 +1543,34 @@ def build_option_vix_payload(
             )
             if value is not None
         ),
+        "near_term_vix": near_term_vix,
+        "next_term_vix": next_term_vix,
+        "vix_term_structure": (
+            next_term_vix - near_term_vix
+            if term_structure_is_usable
+            else None
+        ),
+        "downside_skew_25d": to_float(result.get("downside_skew_25d")),
+        "near_put_25d_implied_volatility": to_float(
+            curve_near.get("put_25d_implied_volatility")
+        ),
+        "near_call_25d_implied_volatility": to_float(
+            curve_near.get("call_25d_implied_volatility")
+        ),
+        "near_put_25d_strike": to_float(curve_near.get("put_25d_strike")),
+        "near_call_25d_strike": to_float(curve_near.get("call_25d_strike")),
         "near_contract_month": near.get("contract_month"),
         "near_expiry_date": near.get("expiry_date"),
         "near_strike_count": near.get("strike_count"),
         "next_contract_month": next_term.get("contract_month") if next_term else None,
         "next_expiry_date": next_term.get("expiry_date") if next_term else None,
         "next_strike_count": next_term.get("strike_count") if next_term else None,
+        "curve_next_contract_month": (
+            curve_next.get("contract_month") if curve_next else None
+        ),
+        "curve_next_expiry_date": (
+            curve_next.get("expiry_date") if curve_next else None
+        ),
         "risk_free_curve_date": normalize_date_text(rate_curve_date),
         "near_risk_free_rate": near.get("risk_free_rate"),
         "next_risk_free_rate": (
@@ -1314,6 +1833,31 @@ def build_index_basis_delta_map(raw_core_basis_by_date, trade_dates):
     return result
 
 
+def build_margin_financing_net_buy_sum_map(margin_trading_map, trade_dates):
+    sorted_trade_dates = sorted({
+        normalize_date_text(trade_date)
+        for trade_date in trade_dates
+        if normalize_date_text(trade_date)
+    })
+    values = [
+        to_float((margin_trading_map.get(trade_date) or {}).get("margin_financing_net_buy_amount"))
+        for trade_date in sorted_trade_dates
+    ]
+    result = {}
+    for index, trade_date in enumerate(sorted_trade_dates):
+        payload = empty_margin_financing_net_buy_payload()
+        for field_name, window in MARGIN_FINANCING_NET_BUY_FIELDS:
+            start_index = index - window + 1
+            window_values = values[start_index:index + 1] if start_index >= 0 else []
+            payload[field_name] = (
+                sum(window_values)
+                if len(window_values) == window and all(value is not None for value in window_values)
+                else None
+            )
+        result[trade_date] = payload
+    return result
+
+
 def build_index_close_map(rows):
     result = {}
     for row in rows:
@@ -1469,6 +2013,8 @@ def build_dashboard_rows(
     basis_delta_trade_dates=None,
     fund_purchase_limit_map=None,
     margin_trading_map=None,
+    margin_financing_net_buy_sum_map=None,
+    self_sentiment_map=None,
 ):
     rows = []
     option_pc_map = option_pc_map or {}
@@ -1478,6 +2024,8 @@ def build_dashboard_rows(
     cffex_net_short_delta_map = cffex_net_short_delta_map or {}
     fund_purchase_limit_map = fund_purchase_limit_map or {}
     margin_trading_map = margin_trading_map or {}
+    margin_financing_net_buy_sum_map = margin_financing_net_buy_sum_map or {}
+    self_sentiment_map = self_sentiment_map or {}
     basis_delta_dates = basis_delta_trade_dates or trade_dates
     raw_core_basis_by_date = build_raw_core_basis_by_date(basis_delta_dates, index_close_map, futures_close_map)
     basis_delta_map = build_index_basis_delta_map(raw_core_basis_by_date, basis_delta_dates)
@@ -1542,6 +2090,11 @@ def build_dashboard_rows(
                 else {}
             )
             margin_trading_payload = margin_trading_map.get(trade_date) or {}
+            margin_financing_net_buy_payload = (
+                margin_financing_net_buy_sum_map.get(trade_date)
+                or empty_margin_financing_net_buy_payload()
+            )
+            self_sentiment_payload = self_sentiment_map.get((trade_date, index_name)) or {}
             rows.append({
                 "trade_date": trade_date,
                 "index_code": index_code_map.get(index_name) or INDEX_CODE_FALLBACKS[index_name],
@@ -1556,6 +2109,10 @@ def build_dashboard_rows(
                 **option_flow_pc_payload,
                 "exchange_option_pc_json": exchange_option_pc_map.get((trade_date, index_name)) or {},
                 "option_vix_json": option_vix_map.get((trade_date, index_name)) or {},
+                "self_sentiment_score": self_sentiment_payload.get("self_sentiment_score"),
+                "self_sentiment_core_score": self_sentiment_payload.get("self_sentiment_core_score"),
+                "self_sentiment_derivative_score": self_sentiment_payload.get("self_sentiment_derivative_score"),
+                "self_sentiment_components_json": self_sentiment_payload.get("self_sentiment_components_json") or {},
                 **cffex_delta_payload,
                 **basis_delta_payload,
                 "fund_purchase_limit_count": fund_purchase_limit_payload.get(
@@ -1582,6 +2139,10 @@ def build_dashboard_rows(
                 "margin_leverage_ratio_pct": margin_trading_payload.get(
                     "margin_leverage_ratio_pct"
                 ),
+                "margin_total_market_cap_leverage_ratio_pct": margin_trading_payload.get(
+                    "margin_total_market_cap_leverage_ratio_pct"
+                ),
+                **margin_financing_net_buy_payload,
             })
 
     return rows
@@ -1635,7 +2196,10 @@ def build_us_dashboard_rows(trade_dates, index_code_map, index_close_map, future
 
 
 async def compute_and_upsert_range(db_tools, start_date, end_date):
-    basis_delta_start_date = shift_date_text(start_date, -CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS)
+    basis_delta_start_date = shift_date_text(
+        start_date,
+        -max(CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS, SELF_SENTIMENT_LOOKBACK_DAYS),
+    )
     cn_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(
         INDEX_NAME_ORDER,
         start_date=start_date,
@@ -1739,7 +2303,7 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         if normalize_date_text(item.get("trade_date"))
     }
     margin_trading_rows = await db_tools.get_margin_trading_daily_summary(
-        start_date,
+        basis_delta_start_date,
         end_date,
     )
     margin_trading_map = {
@@ -1757,20 +2321,48 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
             "margin_leverage_ratio_pct": to_float(
                 item.get("margin_leverage_ratio_pct")
             ),
+            "margin_total_market_cap_leverage_ratio_pct": to_float(
+                item.get("margin_total_market_cap_leverage_ratio_pct")
+            ),
         }
         for item in margin_trading_rows
         if normalize_date_text(item.get("trade_date"))
     }
+
+    option_pc_map = build_index_option_pc_map(option_rows, cn_index_close_map)
+    option_flow_pc_map = build_index_option_flow_pc_map(option_rows)
+    futures_close_map = build_futures_close_map(futures_rows)
+    self_sentiment_history_rows = await db_tools.get_quant_index_dashboard_self_sentiment_history(
+        basis_delta_start_date,
+        end_date,
+    )
+    margin_financing_net_buy_sum_map = build_margin_financing_net_buy_sum_map(
+        margin_trading_map,
+        cn_basis_delta_trade_dates,
+    )
+    self_sentiment_map = build_self_sentiment_map(
+        trade_dates=cn_basis_delta_trade_dates,
+        index_close_map=cn_index_close_map,
+        futures_close_map=futures_close_map,
+        option_pc_map=option_pc_map,
+        option_flow_pc_map=option_flow_pc_map,
+        exchange_option_pc_map=exchange_option_pc_map,
+        option_vix_map=option_vix_map,
+        margin_financing_net_buy_sum_map=margin_financing_net_buy_sum_map,
+        history_rows=self_sentiment_history_rows,
+        output_start_date=start_date,
+        output_end_date=end_date,
+    )
 
     rows = build_dashboard_rows(
         trade_dates=cn_trade_dates,
         index_code_map=index_code_map,
         emotion_map=build_emotion_map(emotion_rows),
         index_close_map=cn_index_close_map,
-        futures_close_map=build_futures_close_map(futures_rows),
+        futures_close_map=futures_close_map,
         breadth_map=build_breadth_map(breadth_rows),
-        option_pc_map=build_index_option_pc_map(option_rows, cn_index_close_map),
-        option_flow_pc_map=build_index_option_flow_pc_map(option_rows),
+        option_pc_map=option_pc_map,
+        option_flow_pc_map=option_flow_pc_map,
         exchange_option_pc_map=exchange_option_pc_map,
         option_vix_map=option_vix_map,
         cffex_net_short_delta_map=build_index_cffex_net_short_delta_map(
@@ -1781,6 +2373,8 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         basis_delta_trade_dates=cn_basis_delta_trade_dates,
         fund_purchase_limit_map=fund_purchase_limit_map,
         margin_trading_map=margin_trading_map,
+        margin_financing_net_buy_sum_map=margin_financing_net_buy_sum_map,
+        self_sentiment_map=self_sentiment_map,
     )
     if hk_trade_dates:
         hk_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(

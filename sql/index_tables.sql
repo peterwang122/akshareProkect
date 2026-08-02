@@ -180,6 +180,18 @@ CREATE TABLE IF NOT EXISTS index_us_fear_greed_daily (
   KEY idx_index_us_fear_greed_trade_date (trade_date)
 ) COMMENT='Daily US fear and greed index data';
 
+CREATE TABLE IF NOT EXISTS index_cn_market_fear_greed_daily (
+  trade_date DATE NOT NULL PRIMARY KEY,
+  fear_greed_value DECIMAL(10, 4) NOT NULL COMMENT 'A-share market fear and greed score',
+  sentiment_label VARCHAR(32) NULL COMMENT 'Source sentiment label',
+  locked TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Whether the source marked the record locked',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'miumiu_market_fear_greed' COMMENT 'Data source',
+  raw_json JSON NULL COMMENT 'Complete source record',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_cn_market_fear_greed_source (data_source)
+) COMMENT='Daily A-share overall market fear and greed index from MIUMIU';
+
 CREATE TABLE IF NOT EXISTS index_us_hedge_fund_ls_proxy (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   report_date DATE NOT NULL COMMENT 'CFTC report date',
