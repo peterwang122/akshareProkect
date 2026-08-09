@@ -375,6 +375,14 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             ),
             direct_network=True,
         ),
+        "/collect-index-cn-baifenwei-fear-greed-daily": DailyRoute(
+            path="/collect-index-cn-baifenwei-fear-greed-daily",
+            task_name="index_cn_baifenwei_fear_greed_daily",
+            handler=lambda target_date=None: index.sync_daily_cn_baifenwei_fear_greed(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
         "/import-emotion-excel": DailyRoute(
             path="/import-emotion-excel",
             task_name="excel_emotion_import",
@@ -493,6 +501,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "margin_trading_daily",
             "fund_purchase_limit_daily",
             "index_cn_market_fear_greed_daily",
+            "index_cn_baifenwei_fear_greed_daily",
             "hk_index_futures_daily",
         }
         if payload and route.task_name not in payload_task_names:

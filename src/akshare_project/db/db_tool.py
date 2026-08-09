@@ -418,6 +418,36 @@ class DbTools:
         )
         return sanitized
 
+    def _sanitize_index_cn_baifenwei_fear_greed_daily_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        for field_name in (
+            'fear_greed_value',
+            'volatility_score',
+            'relative_turnover_score',
+            'margin_trading_score',
+            'market_breadth_score',
+            'rsi_score',
+            'limit_up_down_ratio_score',
+        ):
+            sanitized[field_name] = self._normalize_numeric('emotion_value', row.get(field_name))
+        sanitized['market_index_value'] = self._normalize_numeric('close_value', row.get('market_index_value'))
+        sanitized['sentiment_label'] = str(row.get('sentiment_label', '')).strip().upper() or None
+        sanitized['value_origin'] = str(row.get('value_origin', '')).strip().lower() or 'reconstructed'
+        sanitized['data_source'] = str(
+            row.get('data_source', 'baifenwei_fear_greed')
+        ).strip() or 'baifenwei_fear_greed'
+        source_generated_at = str(row.get('source_generated_at') or '').strip()
+        sanitized['source_generated_at'] = source_generated_at.replace('T', ' ') or None
+        raw_json = row.get('raw_json')
+        sanitized['raw_json'] = (
+            raw_json
+            if isinstance(raw_json, str)
+            else json.dumps(raw_json or {}, ensure_ascii=False, separators=(',', ':'))
+        )
+        return sanitized
+
     def _sanitize_index_us_hedge_fund_ls_proxy_row(self, row):
         sanitized = dict(row)
         report_date = row.get('report_date')
@@ -4865,6 +4895,97 @@ class DbTools:
                     [(
                         row['trade_date'], row['fear_greed_value'], row['sentiment_label'],
                         row['locked'], row['data_source'], row['raw_json'],
+                    ) for row in sanitized_rows],
+                )
+                await conn.commit()
+                return len(sanitized_rows)
+
+    async def ensure_index_cn_baifenwei_fear_greed_daily_table(self):
+        if self.pool is None:
+            await self.init_pool()
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS index_cn_baifenwei_fear_greed_daily (
+                        trade_date DATE NOT NULL PRIMARY KEY,
+                        fear_greed_value DECIMAL(10,4) NOT NULL,
+                        sentiment_label VARCHAR(32) NULL,
+                        volatility_score DECIMAL(10,4) NOT NULL,
+                        relative_turnover_score DECIMAL(10,4) NOT NULL,
+                        margin_trading_score DECIMAL(10,4) NOT NULL,
+                        market_breadth_score DECIMAL(10,4) NOT NULL,
+                        rsi_score DECIMAL(10,4) NOT NULL,
+                        limit_up_down_ratio_score DECIMAL(10,4) NOT NULL,
+                        market_index_value DECIMAL(14,4) NULL,
+                        value_origin VARCHAR(32) NOT NULL,
+                        data_source VARCHAR(64) NOT NULL DEFAULT 'baifenwei_fear_greed',
+                        source_generated_at DATETIME NULL,
+                        raw_json JSON NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_cn_baifenwei_fear_greed_origin (value_origin),
+                        KEY idx_cn_baifenwei_fear_greed_source (data_source)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                await conn.commit()
+
+    async def upsert_index_cn_baifenwei_fear_greed_daily(self, rows):
+        if not rows:
+            return 0
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_cn_baifenwei_fear_greed_daily_table()
+        sanitized_rows = [self._sanitize_index_cn_baifenwei_fear_greed_daily_row(row) for row in rows]
+        required_fields = (
+            'fear_greed_value',
+            'volatility_score',
+            'relative_turnover_score',
+            'margin_trading_score',
+            'market_breadth_score',
+            'rsi_score',
+            'limit_up_down_ratio_score',
+        )
+        sanitized_rows = [
+            row for row in sanitized_rows
+            if row['trade_date'] and all(row.get(field_name) is not None for field_name in required_fields)
+        ]
+        sanitized_rows = list({row['trade_date']: row for row in sanitized_rows}.values())
+        if not sanitized_rows:
+            return 0
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(
+                    """
+                    INSERT INTO index_cn_baifenwei_fear_greed_daily (
+                        trade_date, fear_greed_value, sentiment_label,
+                        volatility_score, relative_turnover_score, margin_trading_score,
+                        market_breadth_score, rsi_score, limit_up_down_ratio_score,
+                        market_index_value, value_origin, data_source, source_generated_at, raw_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        fear_greed_value = VALUES(fear_greed_value),
+                        sentiment_label = VALUES(sentiment_label),
+                        volatility_score = VALUES(volatility_score),
+                        relative_turnover_score = VALUES(relative_turnover_score),
+                        margin_trading_score = VALUES(margin_trading_score),
+                        market_breadth_score = VALUES(market_breadth_score),
+                        rsi_score = VALUES(rsi_score),
+                        limit_up_down_ratio_score = VALUES(limit_up_down_ratio_score),
+                        market_index_value = VALUES(market_index_value),
+                        value_origin = VALUES(value_origin),
+                        data_source = VALUES(data_source),
+                        source_generated_at = VALUES(source_generated_at),
+                        raw_json = VALUES(raw_json),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    [(
+                        row['trade_date'], row['fear_greed_value'], row['sentiment_label'],
+                        row['volatility_score'], row['relative_turnover_score'], row['margin_trading_score'],
+                        row['market_breadth_score'], row['rsi_score'], row['limit_up_down_ratio_score'],
+                        row['market_index_value'], row['value_origin'], row['data_source'],
+                        row['source_generated_at'], row['raw_json'],
                     ) for row in sanitized_rows],
                 )
                 await conn.commit()

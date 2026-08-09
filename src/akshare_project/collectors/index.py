@@ -28,6 +28,16 @@ SPECIAL_INDEX_MARKET = 'bj'
 SPECIAL_INDEX_NAME = '北证50'
 SPECIAL_INDEX_SOURCE = 'stock_zh_index_daily'
 
+CSI_DIVIDEND_INDEX_CODE = 'sh000922'
+CSI_DIVIDEND_SIMPLE_CODE = '000922'
+CSI_DIVIDEND_INDEX_NAME = '中证红利'
+CSI_DIVIDEND_INDEX_SOURCE = 'csindex_official_index_perf'
+CSI_DIVIDEND_INDEX_START_DATE = '20050101'
+CSI_INDEX_PERF_URL = 'https://www.csindex.com.cn/csindex-home/perf/index-perf'
+CSI_INDEX_PERF_VALUE_FIELDS = (
+    'open', 'high', 'low', 'close', 'change', 'changePct', 'tradingVol', 'tradingValue'
+)
+
 US_INDEX_SOURCE = 'index_us_stock_sina'
 HK_INDEX_SPOT_SOURCE = 'stock_hk_index_spot_sina'
 HK_INDEX_DAILY_SOURCE = 'stock_hk_index_daily_sina'
@@ -42,6 +52,7 @@ US_PUT_CALL_SOURCE = 'cboe_market_statistics'
 US_TREASURY_YIELD_SOURCE = 'fred_public_csv'
 US_CREDIT_SPREAD_SOURCE = 'fred_public_csv'
 CN_MARKET_FEAR_GREED_SOURCE = 'miumiu_market_fear_greed'
+CN_BAIFENWEI_FEAR_GREED_SOURCE = 'baifenwei_fear_greed'
 
 US_VIX_HISTORY_URL = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'
 US_PUT_CALL_HISTORY_URLS = {
@@ -57,6 +68,8 @@ US_PUT_CALL_DAILY_JSON_URL_TEMPLATE = (
 US_PUT_CALL_DAILY_JSON_START_DATE = '2019-10-05'
 US_FEAR_GREED_CNN_URL = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata'
 CN_MARKET_FEAR_GREED_HISTORY_URL = 'https://www.miumiudashuju.com/api/index/history'
+CN_BAIFENWEI_FEAR_GREED_SERIES_URL = 'https://baifenwei.com/data/fear-greed/series-1.json'
+CN_BAIFENWEI_FEAR_GREED_SUBSCORES_URL = 'https://baifenwei.com/data/fear-greed/subscores.json'
 US_FEAR_GREED_HISTORY_START_DATE = '2020-09-19'
 US_FEAR_GREED_MIRROR_URLS = [
     (
@@ -99,6 +112,20 @@ MIUMIU_HTTP_HEADERS = {
     'Accept': 'application/json,text/plain,*/*',
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Referer': 'https://www.miumiudashuju.com/history',
+}
+BAIFENWEI_HTTP_HEADERS = {
+    **DEFAULT_HTTP_HEADERS,
+    'Accept': 'application/json,text/plain,*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://baifenwei.com/indicator/fear-greed/',
+}
+BAIFENWEI_FEAR_GREED_WEIGHTS = {
+    'volatility': 0.25,
+    'relative_turnover_rate': 0.20,
+    'margin_trading': 0.20,
+    'market_breadth': 0.15,
+    'rsi': 0.10,
+    'limit_up_down_ratio': 0.10,
 }
 US_HEDGE_PROXY_DEFINITIONS = {
     'ES': {
@@ -602,6 +629,108 @@ def build_special_index_basic_row():
         'index_name': SPECIAL_INDEX_NAME,
         'data_source': SPECIAL_INDEX_SOURCE,
     }
+
+
+def build_csi_dividend_index_basic_row():
+    return {
+        'index_code': CSI_DIVIDEND_INDEX_CODE,
+        'simple_code': CSI_DIVIDEND_SIMPLE_CODE,
+        'market': 'sh',
+        'index_name': CSI_DIVIDEND_INDEX_NAME,
+        'data_source': CSI_DIVIDEND_INDEX_SOURCE,
+    }
+
+
+def append_csi_dividend_index_basic_row(index_rows):
+    deduped = {}
+    for row in index_rows or []:
+        index_code = str((row or {}).get('index_code', '')).strip().lower()
+        if not index_code:
+            continue
+        deduped[index_code] = row
+    deduped[CSI_DIVIDEND_INDEX_CODE] = build_csi_dividend_index_basic_row()
+    return list(deduped.values())
+
+
+def drop_csi_index_perf_boundary_duplicate(source_rows, start_date):
+    rows = list(source_rows or [])
+    if len(rows) < 2:
+        return rows
+
+    normalized_start_date = normalize_trade_date(start_date).replace('-', '')
+    first_row = rows[0]
+    second_row = rows[1]
+    first_date = str((first_row or {}).get('tradeDate', '')).strip()
+    second_date = str((second_row or {}).get('tradeDate', '')).strip()
+    same_snapshot = all(
+        (first_row or {}).get(field) == (second_row or {}).get(field)
+        for field in CSI_INDEX_PERF_VALUE_FIELDS
+    )
+    if first_date == normalized_start_date and first_date != second_date and same_snapshot:
+        return rows[1:]
+    return rows
+
+
+def fetch_csi_dividend_index_perf(start_date, end_date):
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(
+        CSI_INDEX_PERF_URL,
+        params={
+            'indexCode': CSI_DIVIDEND_SIMPLE_CODE,
+            'startDate': normalize_trade_date(start_date).replace('-', ''),
+            'endDate': normalize_trade_date(end_date).replace('-', ''),
+        },
+        headers={
+            **DEFAULT_HTTP_HEADERS,
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://www.csindex.com.cn/',
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get('data') if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError('CSI index performance response has no data rows')
+    return drop_csi_index_perf_boundary_duplicate(rows, start_date)
+
+
+def build_csi_dividend_index_daily_rows(source_rows):
+    daily_rows = []
+    for source_row in source_rows or []:
+        if not isinstance(source_row, dict):
+            continue
+        raw_trade_date = normalize_trade_date(source_row.get('tradeDate'))
+        try:
+            trade_date = datetime.strptime(raw_trade_date, '%Y%m%d').strftime('%Y-%m-%d')
+        except ValueError:
+            trade_date = raw_trade_date
+        close_price = to_float(source_row.get('close'))
+        if not trade_date or close_price is None or close_price <= 0:
+            continue
+        open_price = to_float(source_row.get('open'))
+        high_price = to_float(source_row.get('high'))
+        low_price = to_float(source_row.get('low'))
+        change_amount = to_float(source_row.get('change'))
+        previous_close = close_price - change_amount if change_amount is not None else None
+        trading_value = to_float(source_row.get('tradingValue'))
+        daily_rows.append({
+            'index_code': CSI_DIVIDEND_INDEX_CODE,
+            'open_price': open_price,
+            'close_price': close_price,
+            'high_price': high_price,
+            'low_price': low_price,
+            'volume': to_float(source_row.get('tradingVol')),
+            'turnover': round(trading_value * 100_000_000, 2) if trading_value is not None else None,
+            'amplitude': calculate_amplitude(high_price, low_price, previous_close),
+            'price_change_rate': to_float(source_row.get('changePct')),
+            'price_change_amount': change_amount,
+            'turnover_rate': None,
+            'trade_date': trade_date,
+            'data_source': CSI_DIVIDEND_INDEX_SOURCE,
+        })
+    return sorted(daily_rows, key=lambda row: row['trade_date'])
 
 
 def append_special_index_row(index_rows):
@@ -1488,6 +1617,46 @@ async def backfill_special_index_history():
         await db_tools.close()
 
 
+async def backfill_csi_dividend_index_history():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        end_date = datetime.now().strftime('%Y%m%d')
+        source_rows = await asyncio.to_thread(
+            fetch_csi_dividend_index_perf,
+            CSI_DIVIDEND_INDEX_START_DATE,
+            end_date,
+        )
+        daily_rows = build_csi_dividend_index_daily_rows(source_rows)
+        if not daily_rows:
+            raise ValueError('CSI Dividend official history returned no valid rows')
+
+        basic_upserted = await db_tools.upsert_index_basic_info([
+            build_csi_dividend_index_basic_row()
+        ])
+        daily_upserted = await db_tools.batch_index_daily_data(daily_rows)
+        result = {
+            'status': 'SUCCESS',
+            'index_code': CSI_DIVIDEND_INDEX_CODE,
+            'index_name': CSI_DIVIDEND_INDEX_NAME,
+            'basic_upserted': basic_upserted,
+            'daily_upserted': daily_upserted,
+            'row_count': len(daily_rows),
+            'start_date': daily_rows[0]['trade_date'],
+            'end_date': daily_rows[-1]['trade_date'],
+            'data_source': CSI_DIVIDEND_INDEX_SOURCE,
+        }
+        print(
+            'CSI Dividend history backfill finished, '
+            f'rows: {len(daily_rows)}, '
+            f'range: {result["start_date"]} -> {result["end_date"]}'
+        )
+        return result
+    finally:
+        await db_tools.close()
+
+
 async def sync_daily_special_index():
     db_tools = DbTools()
     await db_tools.init_pool()
@@ -1701,6 +1870,187 @@ async def sync_daily_cn_market_fear_greed(target_date=None):
     if expected_date and result['end_date'] < expected_date:
         raise ValueError(
             'MIUMIU market fear/greed source is not ready, '
+            f'expected {expected_date}, latest {result["end_date"]}'
+        )
+    return result
+
+
+def _fetch_baifenwei_json(url, attempt=0):
+    response = requests.get(
+        url,
+        params={'_': int(time.time() * 1000) + int(attempt)},
+        headers={
+            **BAIFENWEI_HTTP_HEADERS,
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f'Baifenwei response must be a JSON object: {url}')
+    return payload
+
+
+def _baifenwei_payload_latest_date(subscores_payload):
+    dates = subscores_payload.get('dates') if isinstance(subscores_payload, dict) else None
+    if not isinstance(dates, list):
+        return ''
+    return max((normalize_trade_date(value) for value in dates), default='')
+
+
+def fetch_cn_baifenwei_fear_greed_payloads(expected_date=None, max_attempts=5):
+    expected_date = normalize_trade_date(expected_date) if expected_date else ''
+    best_payloads = None
+    best_latest_date = ''
+
+    for attempt in range(max(1, int(max_attempts))):
+        series_payload = _fetch_baifenwei_json(CN_BAIFENWEI_FEAR_GREED_SERIES_URL, attempt)
+        subscores_payload = _fetch_baifenwei_json(CN_BAIFENWEI_FEAR_GREED_SUBSCORES_URL, attempt)
+        latest_date = _baifenwei_payload_latest_date(subscores_payload)
+        if best_payloads is None or latest_date > best_latest_date:
+            best_payloads = (series_payload, subscores_payload)
+            best_latest_date = latest_date
+        if not expected_date or latest_date >= expected_date:
+            return series_payload, subscores_payload
+        if attempt + 1 < max_attempts:
+            LOGGER.warning(
+                'Baifenwei fear/greed response is stale: expected %s, latest %s; retry %s/%s',
+                expected_date,
+                latest_date or '-',
+                attempt + 2,
+                max_attempts,
+            )
+            time.sleep(API_RETRY_SLEEP_SECONDS)
+
+    return best_payloads
+
+
+def build_cn_baifenwei_fear_greed_rows(series_payload, subscores_payload):
+    dates = subscores_payload.get('dates') if isinstance(subscores_payload, dict) else None
+    raw_series = subscores_payload.get('series') if isinstance(subscores_payload, dict) else None
+    if not isinstance(dates, list) or not isinstance(raw_series, list):
+        return []
+
+    component_data = {}
+    for item in raw_series:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get('key') or '').strip()
+        data = item.get('data')
+        if key in BAIFENWEI_FEAR_GREED_WEIGHTS and isinstance(data, list):
+            component_data[key] = data
+    if set(component_data) != set(BAIFENWEI_FEAR_GREED_WEIGHTS):
+        return []
+
+    published_by_date = {}
+    points = series_payload.get('points') if isinstance(series_payload, dict) else None
+    if isinstance(points, list):
+        for point in points:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            trade_date = normalize_trade_date(point[0])
+            value = to_float(point[1])
+            market_index_value = to_float(point[2]) if len(point) > 2 else None
+            if trade_date and value is not None and 0 <= value <= 100:
+                published_by_date[trade_date] = (value, market_index_value)
+
+    series_generated_at = str(series_payload.get('generated_at') or '').strip()
+    subscores_generated_at = str(subscores_payload.get('generated_at') or '').strip()
+    source_generated_at = max(series_generated_at, subscores_generated_at) or None
+    rows = []
+    for index, raw_date in enumerate(dates):
+        trade_date = normalize_trade_date(raw_date)
+        if not trade_date:
+            continue
+        components = {}
+        valid = True
+        for key in BAIFENWEI_FEAR_GREED_WEIGHTS:
+            values = component_data[key]
+            value = to_float(values[index]) if index < len(values) else None
+            if value is None or not 0 <= value <= 100:
+                valid = False
+                break
+            components[key] = value
+        if not valid:
+            continue
+
+        reconstructed_value = round(
+            sum(components[key] * weight for key, weight in BAIFENWEI_FEAR_GREED_WEIGHTS.items()),
+            2,
+        )
+        published = published_by_date.get(trade_date)
+        fear_greed_value = published[0] if published else reconstructed_value
+        market_index_value = published[1] if published else None
+        value_origin = 'published' if published else 'reconstructed'
+        rows.append(
+            {
+                'trade_date': trade_date,
+                'fear_greed_value': fear_greed_value,
+                'sentiment_label': infer_fear_greed_label(fear_greed_value),
+                'volatility_score': components['volatility'],
+                'relative_turnover_score': components['relative_turnover_rate'],
+                'margin_trading_score': components['margin_trading'],
+                'market_breadth_score': components['market_breadth'],
+                'rsi_score': components['rsi'],
+                'limit_up_down_ratio_score': components['limit_up_down_ratio'],
+                'market_index_value': market_index_value,
+                'value_origin': value_origin,
+                'data_source': CN_BAIFENWEI_FEAR_GREED_SOURCE,
+                'source_generated_at': source_generated_at,
+                'raw_json': {
+                    'components': components,
+                    'published_score': published[0] if published else None,
+                    'reconstructed_score': reconstructed_value,
+                    'market_index_value': market_index_value,
+                    'series_generated_at': series_generated_at,
+                    'subscores_generated_at': subscores_generated_at,
+                },
+            }
+        )
+    return sorted(rows, key=lambda row: row['trade_date'])
+
+
+async def backfill_cn_baifenwei_fear_greed_history(expected_date=None):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        payloads = await asyncio.to_thread(
+            fetch_cn_baifenwei_fear_greed_payloads,
+            expected_date,
+        )
+        if not payloads:
+            raise ValueError('No Baifenwei fear/greed payload returned.')
+        rows = build_cn_baifenwei_fear_greed_rows(*payloads)
+        if not rows:
+            raise ValueError('No valid Baifenwei fear/greed rows returned.')
+        upserted = await db_tools.upsert_index_cn_baifenwei_fear_greed_daily(rows)
+        result = {
+            'status': 'SUCCESS',
+            'upserted': upserted,
+            'row_count': len(rows),
+            'start_date': rows[0]['trade_date'],
+            'end_date': rows[-1]['trade_date'],
+            'published_count': sum(row['value_origin'] == 'published' for row in rows),
+            'reconstructed_count': sum(row['value_origin'] == 'reconstructed' for row in rows),
+            'data_source': CN_BAIFENWEI_FEAR_GREED_SOURCE,
+        }
+        print(
+            'index cn Baifenwei fear/greed backfill finished, '
+            f'rows: {len(rows)}, range: {rows[0]["trade_date"]} -> {rows[-1]["trade_date"]}'
+        )
+        return result
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_cn_baifenwei_fear_greed(target_date=None):
+    expected_date = normalize_trade_date(target_date) if target_date else ''
+    result = await backfill_cn_baifenwei_fear_greed_history(expected_date=expected_date)
+    if expected_date and result['end_date'] < expected_date:
+        raise ValueError(
+            'Baifenwei fear/greed source is not ready, '
             f'expected {expected_date}, latest {result["end_date"]}'
         )
     return result
@@ -2340,8 +2690,19 @@ async def sync_daily_from_spot():
             return 0
 
         trade_date = datetime.now().strftime('%Y-%m-%d')
-        basic_rows = build_index_basic_rows(spot_df)
+        basic_rows = append_csi_dividend_index_basic_row(build_index_basic_rows(spot_df))
         daily_rows = build_index_spot_daily_rows(spot_df, trade_date)
+
+        csi_start_date = (datetime.now() - timedelta(days=14)).strftime('%Y%m%d')
+        csi_source_rows = await asyncio.to_thread(
+            fetch_csi_dividend_index_perf,
+            csi_start_date,
+            datetime.now().strftime('%Y%m%d'),
+        )
+        csi_daily_rows = build_csi_dividend_index_daily_rows(csi_source_rows)
+        if not csi_daily_rows:
+            raise ValueError('CSI Dividend official daily source returned no valid rows')
+        daily_rows.extend(csi_daily_rows)
 
         basic_upserted = await db_tools.upsert_index_basic_info(basic_rows)
         daily_upserted = await db_tools.upsert_index_daily_snapshots(daily_rows)
@@ -2349,7 +2710,8 @@ async def sync_daily_from_spot():
         print(
             'index daily finished, '
             f'index_basic_info upserted: {basic_upserted}, '
-            f'index_daily_data upserted: {daily_upserted}'
+            f'index_daily_data upserted: {daily_upserted}, '
+            f'CSI Dividend latest: {csi_daily_rows[-1]["trade_date"]}'
         )
         return daily_upserted
     finally:
@@ -2446,6 +2808,9 @@ async def main():
     if command == 'backfill-bj899050':
         await backfill_special_index_history()
         return
+    if command == 'backfill-csi-dividend':
+        await backfill_csi_dividend_index_history()
+        return
     if command == 'daily-bj899050':
         await sync_daily_special_index()
         return
@@ -2473,6 +2838,13 @@ async def main():
     if command == 'daily-cn-market-fear-greed':
         target_date = sys.argv[2] if len(sys.argv) > 2 else None
         await sync_daily_cn_market_fear_greed(target_date=target_date)
+        return
+    if command == 'backfill-cn-baifenwei-fear-greed':
+        await backfill_cn_baifenwei_fear_greed_history()
+        return
+    if command == 'daily-cn-baifenwei-fear-greed':
+        target_date = sys.argv[2] if len(sys.argv) > 2 else None
+        await sync_daily_cn_baifenwei_fear_greed(target_date=target_date)
         return
     if command == 'backfill-us-vix':
         await backfill_us_vix()
@@ -2521,9 +2893,12 @@ async def main():
         return
 
     raise ValueError(
-        'supported commands: backfill, backfill-bj899050, backfill-us, backfill-hk, '
+        'supported commands: backfill, backfill-bj899050, backfill-csi-dividend, '
+        'backfill-us, backfill-hk, '
         'daily-bj899050, '
         'backfill-qvix, daily-qvix, backfill-news-sentiment, daily-news-sentiment, '
+        'backfill-cn-market-fear-greed, daily-cn-market-fear-greed, '
+        'backfill-cn-baifenwei-fear-greed, daily-cn-baifenwei-fear-greed, '
         'backfill-us-vix, daily-us-vix, backfill-us-fear-greed, daily-us-fear-greed, '
         'backfill-us-hedge-proxy, daily-us-hedge-proxy, '
         'backfill-us-put-call-ratio, daily-us-put-call-ratio, '

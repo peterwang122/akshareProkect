@@ -107,3 +107,53 @@ def test_stock_temp_service_registers_cn_market_fear_greed_route():
 
     assert route.task_name == "index_cn_market_fear_greed_daily"
     assert route.direct_network is True
+
+
+def test_build_cn_baifenwei_fear_greed_rows_prefers_published_and_reconstructs_history():
+    series_payload = {
+        "generated_at": "2026-08-05T23:02:32",
+        "points": [["2026-08-05", 40.26, 14144.2]],
+    }
+    subscores_payload = {
+        "generated_at": "2026-08-05T23:02:31",
+        "dates": ["2023-08-07", "2026-08-05"],
+        "series": [
+            {"key": "volatility", "data": [20, 5.23]},
+            {"key": "relative_turnover_rate", "data": [30, 70.9]},
+            {"key": "margin_trading", "data": [40, 0.79]},
+            {"key": "market_breadth", "data": [50, 60.19]},
+            {"key": "rsi", "data": [60, 64.29]},
+            {"key": "limit_up_down_ratio", "data": [70, 91.53]},
+        ],
+    }
+
+    rows = index.build_cn_baifenwei_fear_greed_rows(series_payload, subscores_payload)
+
+    assert [row["trade_date"] for row in rows] == ["2023-08-07", "2026-08-05"]
+    assert rows[0]["fear_greed_value"] == 39.5
+    assert rows[0]["value_origin"] == "reconstructed"
+    assert rows[1]["fear_greed_value"] == 40.26
+    assert rows[1]["value_origin"] == "published"
+    assert rows[1]["market_index_value"] == 14144.2
+    assert rows[1]["volatility_score"] == 5.23
+    assert rows[1]["source_generated_at"] == "2026-08-05T23:02:32"
+    assert rows[1]["data_source"] == "baifenwei_fear_greed"
+
+
+def test_build_cn_baifenwei_fear_greed_rows_requires_all_six_components():
+    rows = index.build_cn_baifenwei_fear_greed_rows(
+        {"points": []},
+        {
+            "dates": ["2026-08-05"],
+            "series": [{"key": "volatility", "data": [20]}],
+        },
+    )
+
+    assert rows == []
+
+
+def test_stock_temp_service_registers_cn_baifenwei_fear_greed_route():
+    route = stock_temp_service.build_daily_routes()["/collect-index-cn-baifenwei-fear-greed-daily"]
+
+    assert route.task_name == "index_cn_baifenwei_fear_greed_daily"
+    assert route.direct_network is True
