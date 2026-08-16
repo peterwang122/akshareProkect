@@ -1,10 +1,11 @@
 import asyncio
-import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
 
-import akshare as ak
+import pandas as pd
+import requests
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.progress import ProgressStore
@@ -16,6 +17,40 @@ API_RETRY_SLEEP_SECONDS = 3
 MAX_CONCURRENCY = 6
 USD_INDEX_SYMBOL_NAME = '\u7f8e\u5143\u6307\u6570'
 USD_INDEX_POLL_SECONDS = 1800
+SINA_FOREX_DAY_KLINE_URL = (
+    'https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/'
+    'var%20_FX=/NewForexService.getDayKLine'
+)
+SINA_FOREX_REALTIME_URL = 'https://hq.sinajs.cn/'
+SINA_FOREX_DATA_SOURCE = 'sina_forex_day_kline'
+SINA_USD_INDEX_DATA_SOURCE = 'sina_dxy_day_kline'
+SINA_FOREX_INTRADAY_DATA_SOURCE = 'sina_forex_realtime_intraday'
+SINA_USD_INDEX_INTRADAY_DATA_SOURCE = 'sina_dxy_realtime_intraday'
+SINA_FOREX_SYMBOLS = {
+    'USDCNH': 'fx_susdcnh',
+    'CNHJPY': 'fx_scnhjpy',
+    'CNHEUR': 'fx_seurcnh',
+    'CNHHKD': 'fx_scnhhkd',
+    'USDHKD': 'fx_susdhkd',
+    'USDJPY': 'fx_susdjpy',
+    'USDEUR': 'fx_susdeur',
+    'UDI': 'DINIW',
+}
+SINA_INVERTED_SYMBOLS = {'CNHEUR'}
+SINA_SYMBOL_TO_CODE = {
+    sina_symbol.lower(): symbol_code
+    for symbol_code, sina_symbol in SINA_FOREX_SYMBOLS.items()
+}
+FOREX_SYMBOL_NAMES = {
+    'USDCNH': '美元兑离岸人民币',
+    'CNHJPY': '离岸人民币兑日元',
+    'CNHEUR': '离岸人民币兑欧元',
+    'CNHHKD': '离岸人民币兑港币',
+    'USDHKD': '美元兑港币',
+    'USDJPY': '美元兑日元',
+    'USDEUR': '美元兑欧元',
+    'UDI': USD_INDEX_SYMBOL_NAME,
+}
 DAILY_SYNC_SYMBOLS = [
     'USDCNH',
     'CNHJPY',
@@ -68,15 +103,24 @@ def fetch_with_retry(func, *args, retries=API_RETRY_COUNT, sleep_seconds=API_RET
 
 
 def get_forex_spot():
-    return fetch_with_retry(ak.forex_spot_em)
+    return pd.DataFrame([
+        {
+            COL_CODE: symbol_code,
+            COL_NAME: FOREX_SYMBOL_NAMES[symbol_code],
+        }
+        for symbol_code in DAILY_SYNC_SYMBOLS
+    ])
 
 
 def get_forex_history(symbol_code):
-    return fetch_with_retry(ak.forex_hist_em, symbol=symbol_code)
+    normalized_code = normalize_symbol_code(symbol_code)
+    if normalized_code == 'UDI':
+        return get_usd_index_history()
+    return fetch_with_retry(fetch_sina_history_once, normalized_code)
 
 
 def get_usd_index_history():
-    return fetch_with_retry(ak.index_global_hist_em, symbol=USD_INDEX_SYMBOL_NAME)
+    return fetch_with_retry(fetch_sina_history_once, 'UDI')
 
 
 def normalize_symbol_code(value):
@@ -95,11 +139,238 @@ def normalize_trade_date(value):
     return str(value).split(' ')[0]
 
 
+def parse_sina_history_response(response_text, symbol_code, invert=False):
+    normalized_code = normalize_symbol_code(symbol_code)
+    symbol_name = FOREX_SYMBOL_NAMES.get(normalized_code, normalized_code)
+    match = re.search(
+        r'\bvar\s+[A-Za-z0-9_$]+\s*=\s*\(\s*"(?P<data>.*)"\s*\)\s*;?\s*$',
+        str(response_text or ''),
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise ValueError(f'Sina forex response format is invalid for {normalized_code}')
+
+    rows_by_date = {}
+    for raw_row in match.group('data').split('|'):
+        fields = [field.strip() for field in raw_row.split(',')]
+        if len(fields) < 5:
+            continue
+        trade_date = fields[0]
+        try:
+            datetime.strptime(trade_date, '%Y-%m-%d')
+            open_price = float(fields[1])
+            low_price = float(fields[2])
+            high_price = float(fields[3])
+            close_price = float(fields[4])
+        except (TypeError, ValueError):
+            continue
+        if min(open_price, low_price, high_price, close_price) <= 0:
+            continue
+        if low_price > min(open_price, close_price) or high_price < max(open_price, close_price):
+            continue
+        if low_price > high_price:
+            continue
+        if invert:
+            open_price, low_price, high_price, close_price = (
+                1 / open_price,
+                1 / high_price,
+                1 / low_price,
+                1 / close_price,
+            )
+        open_price, low_price, high_price, close_price = (
+            round(open_price, 6),
+            round(low_price, 6),
+            round(high_price, 6),
+            round(close_price, 6),
+        )
+        rows_by_date[trade_date] = {
+            COL_CODE: normalized_code,
+            COL_NAME: symbol_name,
+            COL_DATE: trade_date,
+            COL_OPEN: open_price,
+            COL_LOW: low_price,
+            COL_HIGH: high_price,
+            COL_LATEST: close_price,
+        }
+
+    if not rows_by_date:
+        raise ValueError(f'Sina forex response has no valid OHLC rows for {normalized_code}')
+
+    parsed_rows = []
+    previous_close = None
+    for trade_date in sorted(rows_by_date):
+        row = rows_by_date[trade_date]
+        row[COL_AMPLITUDE] = calculate_amplitude(
+            row[COL_HIGH],
+            row[COL_LOW],
+            previous_close,
+        )
+        previous_close = row[COL_LATEST]
+        parsed_rows.append(row)
+    return pd.DataFrame(parsed_rows)
+
+
+def fetch_sina_history_once(symbol_code):
+    normalized_code = normalize_symbol_code(symbol_code)
+    sina_symbol = SINA_FOREX_SYMBOLS.get(normalized_code)
+    if not sina_symbol:
+        supported = ', '.join(sorted(SINA_FOREX_SYMBOLS))
+        raise ValueError(
+            f'Sina forex source does not support {normalized_code}; supported symbols: {supported}'
+        )
+
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(
+        SINA_FOREX_DAY_KLINE_URL,
+        params={
+            'symbol': sina_symbol,
+            '_': int(time.time() * 1000),
+        },
+        headers={
+            'Accept': '*/*',
+            'Referer': 'https://finance.sina.com.cn/',
+            'User-Agent': (
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/136.0.0.0 Safari/537.36'
+            ),
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    response.encoding = 'gbk'
+    return parse_sina_history_response(
+        response.text,
+        normalized_code,
+        invert=normalized_code in SINA_INVERTED_SYMBOLS,
+    )
+
+
+def parse_sina_realtime_response(response_text, expected_symbol_codes=None):
+    expected_codes = set(normalize_selected_symbols(
+        expected_symbol_codes,
+        [*DAILY_SYNC_SYMBOLS, 'UDI'],
+    ))
+    rows = []
+    for sina_symbol, payload in re.findall(
+        r'var\s+hq_str_([A-Za-z0-9_]+)="([^"]*)"\s*;?',
+        str(response_text or ''),
+    ):
+        symbol_code = SINA_SYMBOL_TO_CODE.get(sina_symbol.lower())
+        if not symbol_code or symbol_code not in expected_codes:
+            continue
+        fields = [field.strip() for field in payload.split(',')]
+        if len(fields) < 9:
+            continue
+        trade_date = next(
+            (
+                field
+                for field in reversed(fields)
+                if re.fullmatch(r'\d{4}-\d{2}-\d{2}', field)
+            ),
+            '',
+        )
+        try:
+            datetime.strptime(trade_date, '%Y-%m-%d')
+            latest_price = float(fields[1])
+            previous_close = float(fields[3])
+            open_price = float(fields[5])
+            high_price = float(fields[6])
+            low_price = float(fields[7])
+        except (TypeError, ValueError):
+            continue
+        if min(open_price, low_price, high_price, latest_price, previous_close) <= 0:
+            continue
+        if low_price > min(open_price, latest_price) or high_price < max(open_price, latest_price):
+            continue
+        if symbol_code in SINA_INVERTED_SYMBOLS:
+            open_price, low_price, high_price, latest_price, previous_close = (
+                1 / open_price,
+                1 / high_price,
+                1 / low_price,
+                1 / latest_price,
+                1 / previous_close,
+            )
+        open_price, low_price, high_price, latest_price, previous_close = (
+            round(open_price, 6),
+            round(low_price, 6),
+            round(high_price, 6),
+            round(latest_price, 6),
+            round(previous_close, 6),
+        )
+        rows.append({
+            COL_CODE: symbol_code,
+            COL_NAME: FOREX_SYMBOL_NAMES[symbol_code],
+            COL_DATE: trade_date,
+            COL_OPEN: open_price,
+            COL_LOW: low_price,
+            COL_HIGH: high_price,
+            COL_LATEST: latest_price,
+            COL_AMPLITUDE: calculate_amplitude(
+                high_price,
+                low_price,
+                previous_close,
+            ),
+        })
+
+    rows_by_code = {row[COL_CODE]: row for row in rows}
+    missing_codes = sorted(expected_codes - set(rows_by_code))
+    if missing_codes:
+        raise ValueError(
+            'Sina realtime forex response is missing symbols: '
+            + ','.join(missing_codes)
+        )
+    return pd.DataFrame([rows_by_code[code] for code in sorted(expected_codes)])
+
+
+def fetch_sina_realtime_once(symbol_codes=None):
+    effective_symbols = normalize_selected_symbols(
+        symbol_codes,
+        [*DAILY_SYNC_SYMBOLS, 'UDI'],
+    )
+    unsupported = sorted(set(effective_symbols) - set(SINA_FOREX_SYMBOLS))
+    if unsupported:
+        raise ValueError(
+            'Sina realtime forex source does not support: '
+            + ','.join(unsupported)
+        )
+    sina_symbols = [SINA_FOREX_SYMBOLS[code] for code in effective_symbols]
+    session = requests.Session()
+    session.trust_env = False
+    request_url = f'{SINA_FOREX_REALTIME_URL}list={",".join(sina_symbols)}'
+    response = session.get(
+        request_url,
+        headers={
+            'Accept': '*/*',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Referer': 'https://finance.sina.com.cn/',
+            'User-Agent': (
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/136.0.0.0 Safari/537.36'
+            ),
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    response.encoding = 'gbk'
+    return parse_sina_realtime_response(response.text, effective_symbols)
+
+
+def get_forex_realtime(symbol_codes=None):
+    return fetch_with_retry(fetch_sina_realtime_once, symbol_codes)
+
+
 def calculate_amplitude(high_price, low_price, pre_close):
     try:
         if high_price is None or low_price is None or pre_close in (None, 0):
             return None
-        return (float(high_price) - float(low_price)) / float(pre_close) * 100
+        return round(
+            (float(high_price) - float(low_price)) / float(pre_close) * 100,
+            6,
+        )
     except (TypeError, ValueError, ZeroDivisionError):
         return None
 
@@ -116,13 +387,18 @@ def build_forex_basic_rows(spot_df):
         basic_rows.append({
             'symbol_code': symbol_code,
             'symbol_name': str(row.get(COL_NAME, '')).strip() or None,
-            'data_source': 'forex_spot_em',
+            'data_source': SINA_FOREX_DATA_SOURCE,
         })
 
     return basic_rows
 
 
-def build_forex_daily_rows(history_df, fallback_symbol_code='', fallback_symbol_name=''):
+def build_forex_daily_rows(
+    history_df,
+    fallback_symbol_code='',
+    fallback_symbol_name='',
+    data_source=SINA_FOREX_DATA_SOURCE,
+):
     rows = []
     for _, row in history_df.iterrows():
         symbol_code = normalize_symbol_code(row.get(COL_CODE) or fallback_symbol_code)
@@ -139,7 +415,7 @@ def build_forex_daily_rows(history_df, fallback_symbol_code='', fallback_symbol_
             'high_price': row.get(COL_HIGH),
             'low_price': row.get(COL_LOW),
             'amplitude': row.get(COL_AMPLITUDE),
-            'data_source': 'forex_hist_em',
+            'data_source': data_source,
         })
 
     return rows
@@ -164,7 +440,7 @@ def build_forex_spot_daily_rows(spot_df, trade_date):
             'high_price': high_price,
             'low_price': low_price,
             'amplitude': calculate_amplitude(high_price, low_price, pre_close),
-            'data_source': 'forex_spot_em',
+            'data_source': SINA_FOREX_DATA_SOURCE,
         })
 
     return rows
@@ -188,7 +464,7 @@ def build_usd_index_basic_rows():
     return [{
         'symbol_code': 'UDI',
         'symbol_name': USD_INDEX_SYMBOL_NAME,
-        'data_source': 'index_global_hist_em',
+        'data_source': SINA_USD_INDEX_DATA_SOURCE,
     }]
 
 
@@ -257,6 +533,11 @@ async def fetch_symbol_history_rows_for_daily_sync(symbol_code, semaphore):
             }
 
         history_rows = build_forex_daily_rows(history_df, symbol_code, symbol_code)
+        today_text = datetime.now().date().isoformat()
+        history_rows = [
+            row for row in history_rows
+            if row.get('trade_date') and row['trade_date'] < today_text
+        ]
         latest_rows = select_latest_history_rows(history_rows, max_rows=2)
         if not latest_rows:
             return {
@@ -274,7 +555,7 @@ async def fetch_symbol_history_rows_for_daily_sync(symbol_code, semaphore):
             'basic_row': {
                 'symbol_code': symbol_code,
                 'symbol_name': latest_name,
-                'data_source': 'forex_hist_em',
+                'data_source': SINA_FOREX_DATA_SOURCE,
             },
             'daily_rows': latest_rows,
             'error': None,
@@ -378,6 +659,8 @@ async def process_symbol(symbol_row, processed, db_tools, semaphore, progress_lo
         new_progress_lines = []
 
         for update in build_forex_daily_rows(history_df, symbol_code, symbol_name):
+            if update['trade_date'] >= datetime.now().date().isoformat():
+                continue
             progress_key = f"{symbol_code},{update['trade_date']}"
             if progress_key in processed:
                 continue
@@ -403,13 +686,37 @@ async def process_symbol(symbol_row, processed, db_tools, semaphore, progress_lo
         log_error(symbol_code, 'N/A', error_message)
 
 
+async def backfill_symbol_history(symbol_row, db_tools, semaphore):
+    symbol_code = symbol_row['symbol_code']
+    symbol_name = symbol_row.get('symbol_name') or symbol_code
+    try:
+        async with semaphore:
+            history_df = await asyncio.to_thread(get_forex_history, symbol_code)
+        if history_df is None or history_df.empty:
+            return 0
+
+        yesterday = datetime.now().date() - timedelta(days=1)
+        history_rows = build_forex_daily_rows(history_df, symbol_code, symbol_name)
+        history_rows = filter_rows_by_end_date(history_rows, yesterday)
+        upserted = await db_tools.upsert_forex_daily_snapshots(history_rows)
+        print(
+            f'{symbol_code} Sina history upserted: {upserted}, '
+            f'range: {history_rows[0]["trade_date"] if history_rows else "NONE"} -> '
+            f'{history_rows[-1]["trade_date"] if history_rows else "NONE"}'
+        )
+        return upserted
+    except Exception as exc:
+        error_message = f'Error backfilling Sina history for {symbol_code}: {exc}'
+        print(error_message)
+        log_error(symbol_code, 'N/A', error_message)
+        raise
+
+
 async def backfill_history(selected_symbols=None):
     db_tools = DbTools()
     await db_tools.init_pool()
 
-    processed = load_progress()
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-    progress_lock = asyncio.Lock()
 
     try:
         spot_df = await asyncio.to_thread(get_forex_spot)
@@ -429,12 +736,12 @@ async def backfill_history(selected_symbols=None):
         upserted = await db_tools.upsert_forex_basic_info(basic_rows)
         print(f'forex_basic_info upserted: {upserted}')
 
-        tasks = [
-            process_symbol(symbol_row, processed, db_tools, semaphore, progress_lock)
+        results = await asyncio.gather(*[
+            backfill_symbol_history(symbol_row, db_tools, semaphore)
             for symbol_row in basic_rows
-        ]
-        await asyncio.gather(*tasks)
-        print('forex history backfill finished.')
+        ])
+        print(f'forex Sina history backfill finished, rows upserted: {sum(results)}.')
+        return sum(results)
     finally:
         await db_tools.close()
 
@@ -450,11 +757,16 @@ async def backfill_usd_index_history():
             return 0
 
         yesterday = datetime.now().date() - timedelta(days=1)
-        history_rows = build_forex_daily_rows(history_df, 'UDI', USD_INDEX_SYMBOL_NAME)
+        history_rows = build_forex_daily_rows(
+            history_df,
+            'UDI',
+            USD_INDEX_SYMBOL_NAME,
+            data_source=SINA_USD_INDEX_DATA_SOURCE,
+        )
         history_rows = filter_rows_by_end_date(history_rows, yesterday)
 
         basic_upserted = await db_tools.upsert_forex_basic_info(build_usd_index_basic_rows())
-        inserted = await db_tools.batch_forex_daily_data(history_rows)
+        inserted = await db_tools.upsert_forex_daily_snapshots(history_rows)
         print(
             'usd index history backfill finished, '
             f'forex_basic_info upserted: {basic_upserted}, '
@@ -475,7 +787,18 @@ async def sync_usd_index_once():
             print('No USD index history data fetched.')
             return 0
 
-        recent_rows = select_latest_usd_rows(build_forex_daily_rows(history_df, 'UDI', USD_INDEX_SYMBOL_NAME))
+        history_rows = build_forex_daily_rows(
+            history_df,
+            'UDI',
+            USD_INDEX_SYMBOL_NAME,
+            data_source=SINA_USD_INDEX_DATA_SOURCE,
+        )
+        today_text = datetime.now().date().isoformat()
+        history_rows = [
+            row for row in history_rows
+            if row.get('trade_date') and row['trade_date'] < today_text
+        ]
+        recent_rows = select_latest_usd_rows(history_rows)
         if not recent_rows:
             print('No USD index rows parsed.')
             return 0
@@ -488,6 +811,46 @@ async def sync_usd_index_once():
             f'forex_basic_info upserted: {basic_upserted}, '
             f'forex_daily_data upserted: {upserted}, '
             f'latest_trade_date: {latest_trade_date}'
+        )
+        return upserted
+    finally:
+        await db_tools.close()
+
+
+async def sync_usd_index_intraday():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        realtime_df = await asyncio.to_thread(get_forex_realtime, ['UDI'])
+        today_text = datetime.now().date().isoformat()
+        history_rows = build_forex_daily_rows(
+            realtime_df,
+            'UDI',
+            USD_INDEX_SYMBOL_NAME,
+            data_source=SINA_USD_INDEX_INTRADAY_DATA_SOURCE,
+        )
+        current_rows = [
+            row for row in history_rows
+            if row.get('trade_date') == today_text
+        ]
+        if len(current_rows) != 1:
+            latest_date = max(
+                (row.get('trade_date') for row in history_rows if row.get('trade_date')),
+                default='NONE',
+            )
+            raise RuntimeError(
+                f'Sina DXY realtime quote is not ready for {today_text}; '
+                f'latest quote date: {latest_date}'
+            )
+
+        basic_upserted = await db_tools.upsert_forex_basic_info(build_usd_index_basic_rows())
+        upserted = await db_tools.upsert_forex_daily_snapshots(current_rows)
+        print(
+            'usd index intraday sync finished, '
+            f'forex_basic_info upserted: {basic_upserted}, '
+            f'forex_daily_data upserted: {upserted}, '
+            f'trade_date: {today_text}'
         )
         return upserted
     finally:
@@ -507,16 +870,27 @@ async def collect_symbol_history_for_request(symbol_code):
             history_df = await asyncio.to_thread(get_usd_index_history)
             fallback_name = USD_INDEX_SYMBOL_NAME
             basic_rows = build_usd_index_basic_rows()
+            data_source = SINA_USD_INDEX_DATA_SOURCE
         else:
             history_df = await asyncio.to_thread(get_forex_history, normalized_code)
-            fallback_name = normalized_code
+            fallback_name = FOREX_SYMBOL_NAMES.get(normalized_code, normalized_code)
             basic_rows = []
+            data_source = SINA_FOREX_DATA_SOURCE
 
         if history_df is None or history_df.empty:
             raise RuntimeError(f'No forex history data fetched for {normalized_code}')
 
-        history_rows = build_forex_daily_rows(history_df, normalized_code, fallback_name)
-        history_rows = [row for row in history_rows if row.get('trade_date')]
+        history_rows = build_forex_daily_rows(
+            history_df,
+            normalized_code,
+            fallback_name,
+            data_source=data_source,
+        )
+        today_text = datetime.now().date().isoformat()
+        history_rows = [
+            row for row in history_rows
+            if row.get('trade_date') and row['trade_date'] < today_text
+        ]
         if not history_rows:
             raise RuntimeError(f'No forex history rows parsed for {normalized_code}')
 
@@ -526,7 +900,7 @@ async def collect_symbol_history_for_request(symbol_code):
             basic_rows = [{
                 'symbol_code': normalized_code,
                 'symbol_name': latest_name,
-                'data_source': 'forex_hist_em',
+                'data_source': data_source,
             }]
 
         # Forex bars may be captured before the 24-hour day has fully settled, so refresh every returned row.
@@ -612,6 +986,57 @@ async def sync_daily_from_history(selected_symbols=None):
         await db_tools.close()
 
 
+async def sync_intraday_from_history(selected_symbols=None):
+    effective_symbols = normalize_selected_symbols(selected_symbols, DAILY_SYNC_SYMBOLS)
+    if not effective_symbols:
+        print('No forex symbols matched the current intraday selection.')
+        return 0
+
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        realtime_df = await asyncio.to_thread(get_forex_realtime, effective_symbols)
+        today_text = datetime.now().date().isoformat()
+        history_rows = build_forex_daily_rows(
+            realtime_df,
+            data_source=SINA_FOREX_INTRADAY_DATA_SOURCE,
+        )
+        current_rows = [
+            row for row in history_rows
+            if row.get('trade_date') == today_text
+        ]
+        current_codes = {row['symbol_code'] for row in current_rows}
+        missing_codes = sorted(set(effective_symbols) - current_codes)
+        if missing_codes:
+            latest_date = max(
+                (row.get('trade_date') for row in history_rows if row.get('trade_date')),
+                default='NONE',
+            )
+            raise RuntimeError(
+                f'Sina forex realtime quotes are not ready for {today_text}; '
+                f'missing symbols: {",".join(missing_codes)}; '
+                f'latest quote date: {latest_date}'
+            )
+
+        basic_rows = [{
+            'symbol_code': symbol_code,
+            'symbol_name': FOREX_SYMBOL_NAMES[symbol_code],
+            'data_source': SINA_FOREX_DATA_SOURCE,
+        } for symbol_code in effective_symbols]
+        basic_upserted = await db_tools.upsert_forex_basic_info(basic_rows)
+        daily_upserted = await db_tools.upsert_forex_daily_snapshots(current_rows)
+        print(
+            'forex intraday finished, '
+            f'forex_basic_info upserted: {basic_upserted}, '
+            f'forex_daily_data upserted: {daily_upserted}, '
+            f'trade_date: {today_text}, '
+            f'symbols: {",".join(sorted(current_codes))}'
+        )
+        return daily_upserted
+    finally:
+        await db_tools.close()
+
+
 async def repair_unrefreshed_history_rows(selected_symbols=None):
     db_tools = DbTools()
     await db_tools.init_pool()
@@ -673,6 +1098,9 @@ async def main():
     if command == 'daily':
         await sync_daily_from_spot(selected_symbols)
         return
+    if command == 'intraday':
+        await sync_intraday_from_history(selected_symbols)
+        return
     if command == 'usd-backfill':
         await backfill_usd_index_history()
         return
@@ -682,13 +1110,16 @@ async def main():
     if command == 'usd-once':
         await sync_usd_index_once()
         return
+    if command == 'usd-intraday':
+        await sync_usd_index_intraday()
+        return
     if command == 'repair-history':
         await repair_unrefreshed_history_rows(selected_symbols)
         return
 
     raise ValueError(
-        'usage: python forex_main.py [backfill|daily|repair-history] [SYMBOL ...] '
-        '| [usd-backfill|usd-daily|usd-once]'
+        'usage: python forex_main.py [backfill|daily|intraday|repair-history] [SYMBOL ...] '
+        '| [usd-backfill|usd-daily|usd-once|usd-intraday]'
     )
 
 

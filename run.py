@@ -18,6 +18,7 @@ from akshare_project.collectors import (  # noqa: E402
     forex,
     fund_purchase_limit,
     futures,
+    global_risk,
     index,
     macro,
     margin_trading,
@@ -43,7 +44,7 @@ async def dispatch():
             "usage: python run.py <domain> <command> [args]\n"
             "domains: stock, index, quant-index, cffex, douyin, forex, futures, etf, "
             "option, option-minute, exchange-option, risk-free-rate, macro, margin-trading, fund-purchase-limit, "
-            "runner, emotion-excel"
+            "global-risk, runner, emotion-excel"
         )
 
     domain = sys.argv[1].strip().lower()
@@ -109,6 +110,10 @@ async def dispatch():
     if domain == "fund-purchase-limit":
         set_argv("fund-purchase-limit", [command, *args])
         await fund_purchase_limit.main()
+        return
+    if domain == "global-risk":
+        set_argv("global-risk", [command, *args])
+        await global_risk.main()
         return
     if domain == "runner":
         if command == "daily":

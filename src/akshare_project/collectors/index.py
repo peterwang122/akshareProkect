@@ -2690,19 +2690,8 @@ async def sync_daily_from_spot():
             return 0
 
         trade_date = datetime.now().strftime('%Y-%m-%d')
-        basic_rows = append_csi_dividend_index_basic_row(build_index_basic_rows(spot_df))
+        basic_rows = build_index_basic_rows(spot_df)
         daily_rows = build_index_spot_daily_rows(spot_df, trade_date)
-
-        csi_start_date = (datetime.now() - timedelta(days=14)).strftime('%Y%m%d')
-        csi_source_rows = await asyncio.to_thread(
-            fetch_csi_dividend_index_perf,
-            csi_start_date,
-            datetime.now().strftime('%Y%m%d'),
-        )
-        csi_daily_rows = build_csi_dividend_index_daily_rows(csi_source_rows)
-        if not csi_daily_rows:
-            raise ValueError('CSI Dividend official daily source returned no valid rows')
-        daily_rows.extend(csi_daily_rows)
 
         basic_upserted = await db_tools.upsert_index_basic_info(basic_rows)
         daily_upserted = await db_tools.upsert_index_daily_snapshots(daily_rows)
@@ -2710,10 +2699,61 @@ async def sync_daily_from_spot():
         print(
             'index daily finished, '
             f'index_basic_info upserted: {basic_upserted}, '
-            f'index_daily_data upserted: {daily_upserted}, '
-            f'CSI Dividend latest: {csi_daily_rows[-1]["trade_date"]}'
+            f'index_daily_data upserted: {daily_upserted}'
         )
         return daily_upserted
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_csi_dividend_index(target_date=None):
+    target_date_text = str(target_date or datetime.now().date())[:10]
+    target_day = datetime.strptime(target_date_text, '%Y-%m-%d')
+    source_rows = await asyncio.to_thread(
+        fetch_csi_dividend_index_perf,
+        (target_day - timedelta(days=14)).strftime('%Y%m%d'),
+        target_day.strftime('%Y%m%d'),
+    )
+    daily_rows = build_csi_dividend_index_daily_rows(source_rows)
+    latest_trade_date = daily_rows[-1]['trade_date'] if daily_rows else None
+    target_row_count = sum(
+        1 for row in daily_rows if row.get('trade_date') == target_date_text
+    )
+    if target_row_count < 1:
+        return {
+            'status': 'SOURCE_NOT_READY',
+            'target_date': target_date_text,
+            'latest_trade_date': latest_trade_date,
+            'index_code': CSI_DIVIDEND_INDEX_CODE,
+            'index_name': CSI_DIVIDEND_INDEX_NAME,
+            'data_source': CSI_DIVIDEND_INDEX_SOURCE,
+        }
+
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        basic_upserted = await db_tools.upsert_index_basic_info([
+            build_csi_dividend_index_basic_row()
+        ])
+        daily_upserted = await db_tools.upsert_index_daily_snapshots(daily_rows)
+        result = {
+            'status': 'SUCCESS',
+            'target_date': target_date_text,
+            'latest_trade_date': latest_trade_date,
+            'index_code': CSI_DIVIDEND_INDEX_CODE,
+            'index_name': CSI_DIVIDEND_INDEX_NAME,
+            'basic_upserted': basic_upserted,
+            'daily_upserted': daily_upserted,
+            'row_count': len(daily_rows),
+            'data_source': CSI_DIVIDEND_INDEX_SOURCE,
+        }
+        print(
+            'CSI Dividend daily finished, '
+            f'target date: {target_date_text}, '
+            f'rows: {len(daily_rows)}, '
+            f'latest: {latest_trade_date}'
+        )
+        return result
     finally:
         await db_tools.close()
 

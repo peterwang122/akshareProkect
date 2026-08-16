@@ -21,14 +21,20 @@ async def dispatch_failed_task(failure):
         return await stock.sync_daily()
     if task_name == 'index_daily':
         return await index.sync_daily_from_spot()
+    if task_name == 'index_csi_dividend_daily':
+        return await index.sync_daily_csi_dividend_index()
     if task_name == 'index_bj50_daily':
         return await index.sync_daily_special_index()
     if task_name == 'cffex_daily':
         return await cffex.sync_latest_daily_data(headless=True)
     if task_name == 'forex_daily':
         return await forex.sync_daily_from_spot()
-    if task_name == 'usd_index_once':
+    if task_name == 'forex_intraday':
+        return await forex.sync_intraday_from_history()
+    if task_name in {'usd_index_once', 'usd_index_daily'}:
         return await forex.sync_usd_index_once()
+    if task_name == 'usd_index_intraday':
+        return await forex.sync_usd_index_intraday()
     if task_name == 'futures_daily':
         return await futures.sync_today()
     if task_name == 'etf_daily':

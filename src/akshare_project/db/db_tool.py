@@ -40,6 +40,22 @@ QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS = (
     "self_sentiment_core_score",
     "self_sentiment_derivative_score",
 )
+QUANT_INDEX_RISK_FIELDS = (
+    "risk_yellow_vulnerability",
+    "risk_yellow_vulnerability_score",
+    "risk_red_escalation",
+    "risk_red_escalation_score",
+    "risk_global_shock",
+    "risk_global_shock_score",
+    "risk_global_shock_mode",
+    "risk_strategy_components_json",
+)
+QUANT_INDEX_TURNOVER_CONCENTRATION_FIELDS = (
+    "turnover_concentration_top5_pct",
+    "turnover_concentration_top1_pct",
+    "turnover_concentration_top1_raw_pct",
+    "turnover_concentration_meta_json",
+)
 
 
 def get_timestamp():
@@ -109,6 +125,9 @@ class DbTools:
         'option_volume_pc_ratio': 9999999999.9999,
         'option_turnover_pc_ratio': 9999999999.9999,
         **{field: 100.0 for field in QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS},
+        'risk_yellow_vulnerability_score': 100.0,
+        'risk_red_escalation_score': 100.0,
+        'risk_global_shock_score': 100.0,
         'fund_purchase_limit_pct': 100.0,
         **{field: 9999999999999999999999.99 for field in QUANT_INDEX_MARGIN_TRADING_FIELDS},
         **{field: 99999999999999.99 for field in QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS},
@@ -156,6 +175,8 @@ class DbTools:
     )
     QUANT_INDEX_MARGIN_TRADING_FIELDS = QUANT_INDEX_MARGIN_TRADING_FIELDS
     QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS = QUANT_INDEX_SELF_SENTIMENT_SCORE_FIELDS
+    QUANT_INDEX_RISK_FIELDS = QUANT_INDEX_RISK_FIELDS
+    QUANT_INDEX_TURNOVER_CONCENTRATION_FIELDS = QUANT_INDEX_TURNOVER_CONCENTRATION_FIELDS
     INDEX_BASIC_TABLES = {'index_basic_info', 'index_us_basic_info', 'index_hk_basic_info', 'index_qvix_basic_info'}
     INDEX_DAILY_TABLES = {'index_daily_data', 'index_us_daily_data', 'index_hk_daily_data', 'index_qvix_daily_data'}
     INDEX_FUTURES_CONTRACT_TABLES = {
@@ -178,6 +199,8 @@ class DbTools:
         self._cn_macro_tables_ready = False
         self._fund_purchase_limit_daily_table_ready = False
         self._margin_trading_daily_table_ready = False
+        self._global_risk_asset_daily_table_ready = False
+        self._a_share_turnover_concentration_daily_table_ready = False
         self._quant_index_dashboard_option_pc_columns_ready = False
 
     def load_db_info(self):
@@ -725,6 +748,30 @@ class DbTools:
                 if value is not None
                 else None
             )
+        for field in (
+            'risk_yellow_vulnerability',
+            'risk_red_escalation',
+            'risk_global_shock',
+        ):
+            raw_value = row.get(field)
+            sanitized[field] = None if raw_value is None else (1 if raw_value else 0)
+        for field in (
+            'risk_yellow_vulnerability_score',
+            'risk_red_escalation_score',
+            'risk_global_shock_score',
+        ):
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = (
+                round(max(0.0, min(100.0, float(value))), 6)
+                if value is not None
+                else None
+            )
+        raw_mode = row.get('risk_global_shock_mode')
+        sanitized['risk_global_shock_mode'] = (
+            str(raw_mode).strip()[:64]
+            if raw_mode is not None and str(raw_mode).strip()
+            else None
+        )
         for field in self.QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS:
             raw_value = row.get(field)
             sanitized[field] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
@@ -741,6 +788,23 @@ class DbTools:
         )
         sanitized['self_sentiment_components_json'] = self._serialize_json_field(
             row.get('self_sentiment_components_json')
+        )
+        sanitized['risk_strategy_components_json'] = self._serialize_json_field(
+            row.get('risk_strategy_components_json')
+        )
+        for field in (
+            'turnover_concentration_top5_pct',
+            'turnover_concentration_top1_pct',
+            'turnover_concentration_top1_raw_pct',
+        ):
+            value = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = (
+                round(max(0.0, min(100.0, float(value))), 6)
+                if value is not None
+                else None
+            )
+        sanitized['turnover_concentration_meta_json'] = self._serialize_json_field(
+            row.get('turnover_concentration_meta_json')
         )
         return sanitized
 
@@ -2455,6 +2519,59 @@ class DbTools:
 
     async def batch_index_qvix_daily_data(self, updates):
         return await self._batch_index_daily_data_for_table('index_qvix_daily_data', updates)
+
+    async def upsert_index_daily_data(self, updates):
+        """Upsert official index rows, including revised turnover fields."""
+        if not updates:
+            return 0
+        if self.pool is None:
+            await self.init_pool()
+
+        sanitized_rows = [self._sanitize_index_daily_update(update) for update in updates]
+        sanitized_rows = [
+            row for row in sanitized_rows if row.get('index_code') and row.get('trade_date')
+        ]
+        deduped = {
+            (row['index_code'], row['trade_date']): row for row in sanitized_rows
+        }
+        rows = list(deduped.values())
+        if not rows:
+            return 0
+
+        query = """
+        INSERT INTO index_daily_data (
+            index_code, open_price, close_price, high_price, low_price,
+            volume, turnover, amplitude, price_change_rate,
+            price_change_amount, turnover_rate, trade_date, data_source
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            open_price = VALUES(open_price),
+            close_price = VALUES(close_price),
+            high_price = VALUES(high_price),
+            low_price = VALUES(low_price),
+            volume = VALUES(volume),
+            turnover = VALUES(turnover),
+            amplitude = VALUES(amplitude),
+            price_change_rate = VALUES(price_change_rate),
+            price_change_amount = VALUES(price_change_amount),
+            turnover_rate = VALUES(turnover_rate),
+            data_source = VALUES(data_source),
+            updated_at = CURRENT_TIMESTAMP
+        """
+        values = [
+            (
+                row['index_code'], row['open_price'], row['close_price'],
+                row['high_price'], row['low_price'], row['volume'], row['turnover'],
+                row['amplitude'], row['price_change_rate'], row['price_change_amount'],
+                row['turnover_rate'], row['trade_date'], row['data_source'],
+            )
+            for row in rows
+        ]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(rows)
 
     async def upsert_stock_daily_snapshots(self, updates):
         if not updates:
@@ -5841,6 +5958,44 @@ class DbTools:
                 )
             )
             previous_column = field
+        risk_columns = (
+            ("risk_yellow_vulnerability", "TINYINT(1) NULL COMMENT '中证1000黄色脆弱期状态'"),
+            ("risk_yellow_vulnerability_score", "DECIMAL(18, 6) NULL COMMENT '黄色脆弱期条件完成度'"),
+            ("risk_red_escalation", "TINYINT(1) NULL COMMENT '中证1000红色风险升级状态'"),
+            ("risk_red_escalation_score", "DECIMAL(18, 6) NULL COMMENT '红色风险升级条件完成度'"),
+            ("risk_global_shock", "TINYINT(1) NULL COMMENT '中证1000全球冲击状态'"),
+            ("risk_global_shock_score", "DECIMAL(18, 6) NULL COMMENT '全球冲击模块完成度'"),
+            ("risk_global_shock_mode", "VARCHAR(64) NULL COMMENT '全球冲击命中模式'"),
+            ("risk_strategy_components_json", "JSON NULL COMMENT '三套风险策略完整组件审计信息'"),
+        )
+        for column_name, definition in risk_columns:
+            column_definitions.append(
+                (column_name, f"ADD COLUMN {column_name} {definition} AFTER {previous_column}")
+            )
+            previous_column = column_name
+        turnover_concentration_columns = (
+            (
+                "turnover_concentration_top5_pct",
+                "DECIMAL(18, 6) NULL COMMENT 'A股成交额前5%个股集中度MA5，百分比'",
+            ),
+            (
+                "turnover_concentration_top1_pct",
+                "DECIMAL(18, 6) NULL COMMENT 'A股成交额前1%个股集中度MA5，百分比'",
+            ),
+            (
+                "turnover_concentration_top1_raw_pct",
+                "DECIMAL(18, 6) NULL COMMENT 'A股成交额前1%个股集中度原始值，百分比'",
+            ),
+            (
+                "turnover_concentration_meta_json",
+                "JSON NULL COMMENT 'A股成交集中度覆盖范围、来源和原始口径'",
+            ),
+        )
+        for column_name, definition in turnover_concentration_columns:
+            column_definitions.append(
+                (column_name, f"ADD COLUMN {column_name} {definition} AFTER {previous_column}")
+            )
+            previous_column = column_name
         basis_label_by_kind = {
             'main': '主连',
             'month': '月连',
@@ -5972,6 +6127,400 @@ class DbTools:
         WHERE trade_date BETWEEN %s AND %s
           AND index_name IN ('上证50', '沪深300', '中证500', '中证1000')
         ORDER BY trade_date ASC, index_name ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_dashboard_option_pc_history(self, index_name, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_quant_index_dashboard_option_pc_columns()
+        query = """
+        SELECT trade_date,
+               option_pc_current_month,
+               option_pc_next_month,
+               option_pc_quarter_1,
+               option_pc_quarter_2
+        FROM quant_index_dashboard_daily
+        WHERE index_name = %s
+          AND trade_date BETWEEN %s AND %s
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(index_name), str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def ensure_global_risk_asset_daily_table(self):
+        if self._global_risk_asset_daily_table_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        CREATE TABLE IF NOT EXISTS global_risk_asset_daily (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            asset_code VARCHAR(32) NOT NULL,
+            asset_name VARCHAR(96) NOT NULL,
+            trade_date DATE NOT NULL,
+            open_value DECIMAL(24, 8) NULL,
+            high_value DECIMAL(24, 8) NULL,
+            low_value DECIMAL(24, 8) NULL,
+            close_value DECIMAL(24, 8) NOT NULL,
+            volume DECIMAL(30, 4) NULL,
+            source_date DATE NOT NULL,
+            available_at DATETIME NOT NULL,
+            data_source VARCHAR(96) NOT NULL,
+            source_url VARCHAR(1024) NOT NULL,
+            raw_json JSON NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_global_risk_asset_date (asset_code, trade_date),
+            KEY idx_global_risk_available (available_at, asset_code),
+            KEY idx_global_risk_source_date (source_date, asset_code)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                await conn.commit()
+        self._global_risk_asset_daily_table_ready = True
+
+    async def upsert_global_risk_asset_daily_rows(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_global_risk_asset_daily_table()
+        deduped = {}
+        for raw in rows:
+            asset_code = str(raw.get('asset_code') or '').strip().upper()
+            trade_date = str(raw.get('trade_date') or '').split(' ')[0].strip()
+            close_value = self._normalize_numeric('close_value', raw.get('close_value'))
+            if not asset_code or not trade_date or close_value is None:
+                continue
+            row = dict(raw)
+            row['asset_code'] = asset_code
+            row['trade_date'] = trade_date
+            row['source_date'] = str(raw.get('source_date') or trade_date).split(' ')[0]
+            row['close_value'] = close_value
+            deduped[(asset_code, trade_date)] = row
+        normalized_rows = list(deduped.values())
+        if not normalized_rows:
+            return 0
+
+        query = """
+        INSERT INTO global_risk_asset_daily (
+            asset_code, asset_name, trade_date,
+            open_value, high_value, low_value, close_value, volume,
+            source_date, available_at, data_source, source_url, raw_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            asset_name = VALUES(asset_name),
+            open_value = VALUES(open_value),
+            high_value = VALUES(high_value),
+            low_value = VALUES(low_value),
+            close_value = VALUES(close_value),
+            volume = VALUES(volume),
+            source_date = VALUES(source_date),
+            available_at = VALUES(available_at),
+            data_source = VALUES(data_source),
+            source_url = VALUES(source_url),
+            raw_json = VALUES(raw_json),
+            updated_at = CURRENT_TIMESTAMP
+        """
+        values = []
+        for row in normalized_rows:
+            values.append((
+                row['asset_code'],
+                str(row.get('asset_name') or row['asset_code']).strip(),
+                row['trade_date'],
+                self._normalize_numeric('open_value', row.get('open_value')),
+                self._normalize_numeric('high_value', row.get('high_value')),
+                self._normalize_numeric('low_value', row.get('low_value')),
+                row['close_value'],
+                self._normalize_numeric('volume', row.get('volume')),
+                row['source_date'],
+                row.get('available_at'),
+                str(row.get('data_source') or '').strip(),
+                str(row.get('source_url') or '').strip(),
+                self._serialize_json_field(row.get('raw_json')),
+            ))
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def get_global_risk_asset_daily_rows(self, start_date, end_date, asset_codes=None):
+        await self.ensure_global_risk_asset_daily_table()
+        params = [str(start_date), str(end_date)]
+        code_clause = ''
+        normalized_codes = sorted({
+            str(code).strip().upper() for code in (asset_codes or []) if str(code).strip()
+        })
+        if normalized_codes:
+            placeholders = ','.join(['%s'] * len(normalized_codes))
+            code_clause = f' AND asset_code IN ({placeholders})'
+            params.extend(normalized_codes)
+        query = f"""
+        SELECT asset_code, asset_name, trade_date,
+               open_value, high_value, low_value, close_value, volume,
+               source_date, available_at, data_source, source_url, raw_json
+        FROM global_risk_asset_daily
+        WHERE trade_date BETWEEN %s AND %s{code_clause}
+        ORDER BY trade_date ASC, asset_code ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def ensure_a_share_turnover_concentration_daily_table(self):
+        if self._a_share_turnover_concentration_daily_table_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        CREATE TABLE IF NOT EXISTS a_share_turnover_concentration_daily (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            trade_date DATE NOT NULL,
+            top5_pct DECIMAL(18, 6) NULL,
+            top1_pct DECIMAL(18, 6) NULL,
+            top1_raw_pct DECIMAL(18, 6) NULL,
+            stock_count INT NULL,
+            top1_stock_count INT NULL,
+            total_turnover_amount DECIMAL(30, 2) NULL,
+            top1_turnover_amount DECIMAL(30, 2) NULL,
+            top5_data_source VARCHAR(96) NULL,
+            top1_data_source VARCHAR(96) NULL,
+            top5_source_url VARCHAR(1024) NULL,
+            source_date DATE NULL,
+            available_at DATETIME NULL,
+            raw_json JSON NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_a_share_turnover_concentration_date (trade_date),
+            KEY idx_a_share_turnover_concentration_source_date (source_date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                await conn.commit()
+        self._a_share_turnover_concentration_daily_table_ready = True
+
+    async def upsert_a_share_turnover_concentration_daily_rows(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_a_share_turnover_concentration_daily_table()
+        deduped = {}
+        for raw in rows:
+            trade_date = str(raw.get("trade_date") or "").split(" ")[0].strip()
+            if not trade_date:
+                continue
+            current = deduped.setdefault(trade_date, {"trade_date": trade_date})
+            for key, value in raw.items():
+                if key != "trade_date" and value is not None:
+                    current[key] = value
+        normalized_rows = list(deduped.values())
+        if not normalized_rows:
+            return 0
+        query = """
+        INSERT INTO a_share_turnover_concentration_daily (
+            trade_date, top5_pct, top1_pct, top1_raw_pct,
+            stock_count, top1_stock_count, total_turnover_amount, top1_turnover_amount,
+            top5_data_source, top1_data_source, top5_source_url,
+            source_date, available_at, raw_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            top5_pct = COALESCE(VALUES(top5_pct), top5_pct),
+            top1_pct = COALESCE(VALUES(top1_pct), top1_pct),
+            top1_raw_pct = COALESCE(VALUES(top1_raw_pct), top1_raw_pct),
+            stock_count = COALESCE(VALUES(stock_count), stock_count),
+            top1_stock_count = COALESCE(VALUES(top1_stock_count), top1_stock_count),
+            total_turnover_amount = COALESCE(VALUES(total_turnover_amount), total_turnover_amount),
+            top1_turnover_amount = COALESCE(VALUES(top1_turnover_amount), top1_turnover_amount),
+            top5_data_source = COALESCE(VALUES(top5_data_source), top5_data_source),
+            top1_data_source = COALESCE(VALUES(top1_data_source), top1_data_source),
+            top5_source_url = COALESCE(VALUES(top5_source_url), top5_source_url),
+            source_date = COALESCE(VALUES(source_date), source_date),
+            available_at = COALESCE(VALUES(available_at), available_at),
+            raw_json = JSON_MERGE_PATCH(
+                COALESCE(raw_json, JSON_OBJECT()),
+                COALESCE(VALUES(raw_json), JSON_OBJECT())
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        """
+        values = []
+        for row in normalized_rows:
+            values.append((
+                row["trade_date"],
+                self._normalize_numeric("top5_pct", row.get("top5_pct")),
+                self._normalize_numeric("top1_pct", row.get("top1_pct")),
+                self._normalize_numeric("top1_raw_pct", row.get("top1_raw_pct")),
+                int(row["stock_count"]) if row.get("stock_count") is not None else None,
+                int(row["top1_stock_count"]) if row.get("top1_stock_count") is not None else None,
+                self._normalize_numeric("turnover_amount", row.get("total_turnover_amount")),
+                self._normalize_numeric("turnover_amount", row.get("top1_turnover_amount")),
+                str(row.get("top5_data_source") or "").strip() or None,
+                str(row.get("top1_data_source") or "").strip() or None,
+                str(row.get("top5_source_url") or "").strip() or None,
+                str(row.get("source_date") or "").split(" ")[0].strip() or None,
+                row.get("available_at"),
+                self._serialize_json_field(row.get("raw_json")),
+            ))
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def get_a_share_turnover_concentration_daily_rows(self, start_date, end_date):
+        await self.ensure_a_share_turnover_concentration_daily_table()
+        query = """
+        SELECT trade_date, top5_pct, top1_pct, top1_raw_pct,
+               stock_count, top1_stock_count,
+               total_turnover_amount, top1_turnover_amount,
+               top5_data_source, top1_data_source, top5_source_url,
+               source_date, available_at, raw_json
+        FROM a_share_turnover_concentration_daily
+        WHERE trade_date BETWEEN %s AND %s
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def calculate_a_share_top1_turnover_concentration_rows(self, start_date, end_date):
+        """Calculate top-1% concentration only where official per-stock coverage exists."""
+        await self.ensure_stock_exchange_official_daily_table()
+        query = """
+        WITH official_dates AS (
+            SELECT trade_date
+            FROM stock_exchange_official_daily_data
+            WHERE trade_date BETWEEN %s AND %s
+              AND exchange IN ('SH', 'SZ', 'SSE', 'SZSE')
+              AND turnover_amount IS NOT NULL
+              AND turnover_amount > 0
+            GROUP BY trade_date
+            HAVING COUNT(*) >= 1
+        ), eligible AS (
+            SELECT o.trade_date, LOWER(o.prefixed_code) AS prefixed_code, o.turnover_amount
+            FROM stock_exchange_official_daily_data o
+            INNER JOIN official_dates d ON d.trade_date = o.trade_date
+            WHERE o.exchange IN ('SH', 'SZ', 'SSE', 'SZSE')
+              AND o.turnover_amount IS NOT NULL
+              AND o.turnover_amount > 0
+              AND (
+                LOWER(o.prefixed_code) REGEXP '^sh(60|68)[0-9]{4}$'
+                OR LOWER(o.prefixed_code) REGEXP '^sz(00|30)[0-9]{4}$'
+              )
+            UNION ALL
+            SELECT s.trade_date, LOWER(s.prefixed_code) AS prefixed_code, s.turnover_amount
+            FROM stock_daily_data s
+            INNER JOIN official_dates d ON d.trade_date = s.trade_date
+            WHERE s.turnover_amount IS NOT NULL
+              AND s.turnover_amount > 0
+              AND (
+                LOWER(s.prefixed_code) REGEXP '^sh(60|68)[0-9]{4}$'
+                OR LOWER(s.prefixed_code) REGEXP '^sz(00|30)[0-9]{4}$'
+                OR LOWER(s.prefixed_code) REGEXP '^bj[489][0-9]{5}$'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM stock_exchange_official_daily_data o2
+                  WHERE o2.trade_date = s.trade_date
+                    AND LOWER(o2.prefixed_code) = LOWER(s.prefixed_code)
+                    AND o2.exchange IN ('SH', 'SZ', 'SSE', 'SZSE')
+                    AND o2.turnover_amount IS NOT NULL
+                    AND o2.turnover_amount > 0
+              )
+        ), ranked AS (
+            SELECT trade_date, prefixed_code, turnover_amount,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY trade_date ORDER BY turnover_amount DESC, prefixed_code ASC
+                   ) AS turnover_rank,
+                   COUNT(*) OVER (PARTITION BY trade_date) AS stock_count,
+                   SUM(turnover_amount) OVER (PARTITION BY trade_date) AS total_turnover_amount
+            FROM eligible
+        )
+        SELECT trade_date,
+               MAX(stock_count) AS stock_count,
+               CEIL(MAX(stock_count) * 0.01) AS top1_stock_count,
+               MAX(total_turnover_amount) AS total_turnover_amount,
+               SUM(CASE
+                   WHEN turnover_rank <= CEIL(stock_count * 0.01) THEN turnover_amount
+                   ELSE 0
+               END) AS top1_turnover_amount
+        FROM ranked
+        GROUP BY trade_date
+        HAVING MAX(stock_count) >= 5000
+           AND MAX(total_turnover_amount) >= 100000000000
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_im_contract_rows(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        SELECT trade_date, symbol, close_price, open_interest, volume, data_source
+        FROM futures_daily_data
+        WHERE trade_date BETWEEN %s AND %s
+          AND symbol REGEXP '^IM[0-9]{4}$'
+          AND close_price IS NOT NULL
+          AND open_interest IS NOT NULL
+        ORDER BY trade_date ASC, open_interest DESC, symbol ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_us_vix_rows(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        SELECT trade_date, close_value, data_source
+        FROM index_us_vix_daily
+        WHERE trade_date BETWEEN %s AND %s
+          AND close_value IS NOT NULL
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_us_credit_rows(self, start_date, end_date):
+        await self.ensure_index_us_macro_auxiliary_tables()
+        query = """
+        SELECT trade_date, high_yield_oas, data_source
+        FROM index_us_credit_spread_daily
+        WHERE trade_date BETWEEN %s AND %s
+          AND high_yield_oas IS NOT NULL
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_csi_tech_turnover_rows(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        SELECT index_code, trade_date, turnover, data_source
+        FROM index_daily_data
+        WHERE index_code IN ('sh000985', 'sh000993')
+          AND trade_date BETWEEN %s AND %s
+          AND turnover IS NOT NULL
+          AND turnover > 0
+        ORDER BY trade_date ASC, index_code ASC
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -6732,6 +7281,8 @@ class DbTools:
             *fund_purchase_limit_columns,
             *margin_trading_columns,
             *margin_financing_net_buy_sum_columns,
+            *self.QUANT_INDEX_RISK_FIELDS,
+            *self.QUANT_INDEX_TURNOVER_CONCENTRATION_FIELDS,
         ]
         values = [
             (

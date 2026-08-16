@@ -19,6 +19,7 @@ from akshare_project.collectors import (
     forex,
     fund_purchase_limit,
     futures,
+    global_risk,
     index,
     macro,
     margin_trading,
@@ -238,6 +239,36 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             handler=index.sync_daily_from_spot,
             direct_network=True,
         ),
+        "/collect-index-csi-dividend-daily": DailyRoute(
+            path="/collect-index-csi-dividend-daily",
+            task_name="index_csi_dividend_daily",
+            handler=index.sync_daily_csi_dividend_index,
+            direct_network=True,
+        ),
+        "/collect-global-risk-daily": DailyRoute(
+            path="/collect-global-risk-daily",
+            task_name="global_risk_daily",
+            handler=lambda target_date=None: global_risk.sync_global_risk_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
+        "/collect-csi-tech-concentration-daily": DailyRoute(
+            path="/collect-csi-tech-concentration-daily",
+            task_name="csi_tech_concentration_daily",
+            handler=lambda target_date=None: global_risk.sync_csi_tech_concentration_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
+        "/collect-a-share-turnover-concentration-daily": DailyRoute(
+            path="/collect-a-share-turnover-concentration-daily",
+            task_name="a_share_turnover_concentration_daily",
+            handler=lambda target_date=None: global_risk.sync_a_share_turnover_concentration_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
         "/collect-index-bj50-daily": DailyRoute(
             path="/collect-index-bj50-daily",
             task_name="index_bj50_daily",
@@ -256,10 +287,22 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             handler=forex.sync_daily_from_history,
             direct_network=True,
         ),
+        "/collect-forex-intraday": DailyRoute(
+            path="/collect-forex-intraday",
+            task_name="forex_intraday",
+            handler=forex.sync_intraday_from_history,
+            direct_network=True,
+        ),
         "/collect-usd-index-daily": DailyRoute(
             path="/collect-usd-index-daily",
             task_name="usd_index_daily",
             handler=forex.sync_usd_index_once,
+        ),
+        "/collect-usd-index-intraday": DailyRoute(
+            path="/collect-usd-index-intraday",
+            task_name="usd_index_intraday",
+            handler=forex.sync_usd_index_intraday,
+            direct_network=True,
         ),
         "/collect-futures-daily": DailyRoute(
             path="/collect-futures-daily",
@@ -500,6 +543,10 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "cn_macro_daily",
             "margin_trading_daily",
             "fund_purchase_limit_daily",
+            "index_csi_dividend_daily",
+            "global_risk_daily",
+            "csi_tech_concentration_daily",
+            "a_share_turnover_concentration_daily",
             "index_cn_market_fear_greed_daily",
             "index_cn_baifenwei_fear_greed_daily",
             "hk_index_futures_daily",

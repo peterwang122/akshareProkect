@@ -1,7 +1,9 @@
 import asyncio
+import bisect
 import json
 import math
 import re
+import statistics
 import sys
 from datetime import datetime, timedelta
 
@@ -186,6 +188,20 @@ FUTURES_SOURCE_PRIORITY = {
     "get_futures_daily_derived": 0,
     "futures_hist_em": 1,
 }
+RISK_TARGET_INDEX_NAME = "中证1000"
+RISK_PERCENTILE_MAX_SAMPLES = 1260
+RISK_PERCENTILE_MIN_SAMPLES = 252
+RISK_LOOKBACK_CALENDAR_DAYS = 2200
+RISK_VERSION = "v2"
+RISK_GLOBAL_ASSET_CODES = (
+    "KOSPI",
+    "SOX",
+    "IXN_NAV",
+    "ACWI_NAV",
+    "WTI",
+    "BRENT",
+    "COPPER_HG",
+)
 
 
 def print(*args, **kwargs):
@@ -293,6 +309,190 @@ def rolling_percentile(values, index, window=SELF_SENTIMENT_PERCENTILE_WINDOW, i
     equal_count = sum(1 for value in sample if value == current)
     percentile = (lower_count + equal_count * 0.5) / len(sample) * 100.0
     return 100.0 - percentile if inverse else percentile
+
+
+def strict_prior_percentile(
+    values,
+    index,
+    max_samples=RISK_PERCENTILE_MAX_SAMPLES,
+    min_samples=RISK_PERCENTILE_MIN_SAMPLES,
+):
+    """Return the current rank using only valid observations before index."""
+    current = to_float(values[index]) if 0 <= index < len(values) else None
+    if current is None or not math.isfinite(current):
+        return None
+    prior = [
+        numeric
+        for numeric in (
+            to_float(value) for value in values[max(0, index - max_samples):index]
+        )
+        if numeric is not None and math.isfinite(numeric)
+    ]
+    if len(prior) < min_samples:
+        return None
+    prior.sort()
+    return bisect.bisect_right(prior, current) / len(prior) * 100.0
+
+
+def build_change_values(values, periods, percent=False):
+    result = [None] * len(values)
+    for index in range(periods, len(values)):
+        current = to_float(values[index])
+        previous = to_float(values[index - periods])
+        if current is None or previous is None:
+            continue
+        if percent:
+            if previous == 0:
+                continue
+            result[index] = (current / previous - 1.0) * 100.0
+        else:
+            result[index] = current - previous
+    return result
+
+
+def build_metric_points(dates, values, sources=None):
+    points = []
+    for index, trade_date in enumerate(dates):
+        value = to_float(values[index]) if index < len(values) else None
+        points.append({
+            "source_date": normalize_date_text(trade_date),
+            "value": value,
+            "percentile": strict_prior_percentile(values, index),
+            "data_source": sources[index] if sources and index < len(sources) else None,
+        })
+    return points
+
+
+def align_metric_points_to_cn_dates(points, cn_trade_dates, max_stale_days=10):
+    sorted_points = sorted(
+        [point for point in points if point.get("source_date")],
+        key=lambda point: point["source_date"],
+    )
+    result = {}
+    point_index = 0
+    latest = None
+    for trade_date in sorted(cn_trade_dates):
+        while (
+            point_index < len(sorted_points)
+            and sorted_points[point_index]["source_date"] < trade_date
+        ):
+            latest = sorted_points[point_index]
+            point_index += 1
+        if latest is None:
+            continue
+        age = (
+            datetime.strptime(trade_date, "%Y-%m-%d").date()
+            - datetime.strptime(latest["source_date"], "%Y-%m-%d").date()
+        ).days
+        if age <= max_stale_days:
+            result[trade_date] = latest
+    return result
+
+
+def build_source_series(rows, value_key, predicate=None, default_source=None):
+    deduped = {}
+    for row in rows or []:
+        if predicate and not predicate(row):
+            continue
+        trade_date = normalize_date_text(row.get("trade_date"))
+        value = to_float(row.get(value_key))
+        if not trade_date or value is None or not math.isfinite(value):
+            continue
+        deduped[trade_date] = {
+            "source_date": trade_date,
+            "value": value,
+            "data_source": str(row.get("data_source") or default_source or "").strip(),
+        }
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def transform_source_series(points, periods, percent=False):
+    dates = [point["source_date"] for point in points]
+    values = [point["value"] for point in points]
+    sources = [point.get("data_source") for point in points]
+    return build_metric_points(dates, build_change_values(values, periods, percent=percent), sources)
+
+
+def combine_ratio_series(numerator_points, denominator_points, periods=10):
+    numerator = {point["source_date"]: point for point in numerator_points}
+    denominator = {point["source_date"]: point for point in denominator_points}
+    dates = sorted(set(numerator) & set(denominator))
+    values = []
+    for trade_date in dates:
+        denominator_value = denominator[trade_date]["value"]
+        values.append(
+            numerator[trade_date]["value"] / denominator_value
+            if denominator_value and denominator_value > 0
+            else None
+        )
+    changes = build_change_values(values, periods, percent=True)
+    sources = ["blackrock_ishares_historical_nav" for _ in dates]
+    return build_metric_points(dates, changes, sources)
+
+
+def risk_condition(
+    value,
+    percentile,
+    *,
+    direction,
+    absolute_threshold,
+    percentile_threshold=None,
+    data_date=None,
+    data_source=None,
+    label=None,
+    unit=None,
+    absolute_inclusive=True,
+):
+    numeric = to_float(value)
+    rank = to_float(percentile)
+    requires_rank = percentile_threshold is not None
+    if numeric is None or (requires_rank and rank is None):
+        return {
+            "label": label,
+            "value": numeric,
+            "unit": unit,
+            "direction": direction,
+            "percentile": rank,
+            "absolute_threshold": absolute_threshold,
+            "percentile_threshold": percentile_threshold,
+            "matched": None,
+            "data_date": data_date,
+            "data_source": data_source,
+            "missing_reason": (
+                "有效历史样本不足252个" if numeric is not None else "当日原始值缺失"
+            ),
+        }
+    if direction == "high":
+        absolute_matched = (
+            numeric >= absolute_threshold
+            if absolute_inclusive
+            else numeric > absolute_threshold
+        )
+        matched = absolute_matched and (
+            not requires_rank or rank >= percentile_threshold
+        )
+    else:
+        absolute_matched = (
+            numeric <= absolute_threshold
+            if absolute_inclusive
+            else numeric < absolute_threshold
+        )
+        matched = absolute_matched and (
+            not requires_rank or rank <= percentile_threshold
+        )
+    return {
+        "label": label,
+        "value": numeric,
+        "unit": unit,
+        "direction": direction,
+        "percentile": rank,
+        "absolute_threshold": absolute_threshold,
+        "percentile_threshold": percentile_threshold,
+        "matched": matched,
+        "data_date": data_date,
+        "data_source": data_source,
+        "missing_reason": None,
+    }
 
 
 def calculate_rsi_series(values, period=14):
@@ -1858,6 +2058,537 @@ def build_margin_financing_net_buy_sum_map(margin_trading_map, trade_dates):
     return result
 
 
+def build_dominant_im_basis_metrics(trade_dates, index_close_map, futures_rows):
+    dominant_by_date = {}
+    for row in futures_rows or []:
+        trade_date = normalize_date_text(row.get("trade_date"))
+        symbol = str(row.get("symbol") or "").strip().upper()
+        open_interest = to_float(row.get("open_interest"))
+        close_price = to_float(row.get("close_price"))
+        if not trade_date or not re.fullmatch(r"IM\d{4}", symbol):
+            continue
+        if open_interest is None or close_price is None:
+            continue
+        existing = dominant_by_date.get(trade_date)
+        if existing is None or open_interest > existing["open_interest"]:
+            dominant_by_date[trade_date] = {
+                "symbol": symbol,
+                "close_price": close_price,
+                "open_interest": open_interest,
+                "data_source": str(row.get("data_source") or "").strip(),
+            }
+
+    dates = sorted({normalize_date_text(value) for value in trade_dates if normalize_date_text(value)})
+    basis_values = []
+    sources = []
+    contracts = []
+    for trade_date in dates:
+        contract = dominant_by_date.get(trade_date)
+        index_close = index_close_map.get((trade_date, RISK_TARGET_INDEX_NAME))
+        basis_values.append(
+            (contract["close_price"] / index_close - 1.0) * 10000.0
+            if contract and index_close and index_close > 0
+            else None
+        )
+        sources.append(contract.get("data_source") if contract else None)
+        contracts.append(contract.get("symbol") if contract else None)
+
+    delta_14 = build_change_values(basis_values, 14)
+    delta_30 = build_change_values(basis_values, 30)
+    return {
+        "level": {point["source_date"]: {**point, "contract": contracts[index]}
+                  for index, point in enumerate(build_metric_points(dates, basis_values, sources))},
+        "delta_14d": {point["source_date"]: {**point, "contract": contracts[index]}
+                      for index, point in enumerate(build_metric_points(dates, delta_14, sources))},
+        "delta_30d": {point["source_date"]: {**point, "contract": contracts[index]}
+                      for index, point in enumerate(build_metric_points(dates, delta_30, sources))},
+    }
+
+
+def build_tech_concentration_points(rows):
+    turnover_by_code = {"sh000985": {}, "sh000993": {}}
+    source_by_date = {}
+    for row in rows or []:
+        index_code = str(row.get("index_code") or "").strip().lower()
+        trade_date = normalize_date_text(row.get("trade_date"))
+        turnover = to_float(row.get("turnover"))
+        if index_code not in turnover_by_code or not trade_date or not turnover or turnover <= 0:
+            continue
+        turnover_by_code[index_code][trade_date] = turnover
+        source_by_date[trade_date] = str(row.get("data_source") or "").strip()
+    dates = sorted(set(turnover_by_code["sh000985"]) & set(turnover_by_code["sh000993"]))
+    shares = [
+        turnover_by_code["sh000993"][trade_date]
+        / turnover_by_code["sh000985"][trade_date]
+        * 100.0
+        for trade_date in dates
+    ]
+    changes_5d = build_change_values(shares, 5)
+    points = []
+    for index, trade_date in enumerate(dates):
+        recent_start = max(0, index - 19)
+        crowded_high = max(shares[recent_start:index + 1])
+        prior = [
+            value
+            for value in shares[max(0, index - RISK_PERCENTILE_MAX_SAMPLES):index]
+            if value is not None and math.isfinite(value)
+        ]
+        crowded_percentile = None
+        if len(prior) >= RISK_PERCENTILE_MIN_SAMPLES:
+            prior.sort()
+            crowded_percentile = bisect.bisect_right(prior, crowded_high) / len(prior) * 100.0
+        points.append({
+            "source_date": trade_date,
+            "value": shares[index],
+            "percentile": strict_prior_percentile(shares, index),
+            "crowded_high": crowded_high,
+            "crowded_percentile": crowded_percentile,
+            "change_5d": changes_5d[index],
+            "change_5d_percentile": strict_prior_percentile(changes_5d, index),
+            "data_source": source_by_date.get(trade_date),
+        })
+    return points
+
+
+def _metric_lookup(points):
+    return {point["source_date"]: point for point in points if point.get("source_date")}
+
+
+def _combined_metric_points(first_points, second_points, combine):
+    first = _metric_lookup(first_points)
+    second = _metric_lookup(second_points)
+    dates = sorted(set(first) & set(second))
+    values = []
+    for trade_date in dates:
+        first_value = to_float(first[trade_date].get("value"))
+        second_value = to_float(second[trade_date].get("value"))
+        values.append(
+            combine(first_value, second_value)
+            if first_value is not None and second_value is not None
+            else None
+        )
+    sources = [
+        "+".join(filter(None, (first[trade_date].get("data_source"), second[trade_date].get("data_source"))))
+        for trade_date in dates
+    ]
+    return build_metric_points(dates, values, sources)
+
+
+def _status_from_conditions(conditions):
+    statuses = [condition.get("matched") for condition in conditions]
+    if any(status is None for status in statuses):
+        return None, None
+    matched_count = sum(1 for status in statuses if status)
+    return matched_count == len(statuses), matched_count / len(statuses) * 100.0
+
+
+def build_risk_strategy_map(
+    trade_dates,
+    index_close_map,
+    option_pc_map,
+    cffex_net_short_delta_map,
+    margin_financing_net_buy_sum_map,
+    im_futures_rows,
+    global_asset_rows,
+    us_index_rows,
+    hk_index_rows,
+    us_vix_rows,
+    us_credit_rows,
+    turnover_concentration_rows,
+    output_start_date=None,
+    output_end_date=None,
+):
+    dates = sorted({normalize_date_text(value) for value in trade_dates if normalize_date_text(value)})
+    output_start = normalize_date_text(output_start_date)
+    output_end = normalize_date_text(output_end_date)
+
+    margin_120_values = [
+        to_float((margin_financing_net_buy_sum_map.get(day) or {}).get("margin_financing_net_buy_sum_120d"))
+        for day in dates
+    ]
+    margin_5_values = [
+        to_float((margin_financing_net_buy_sum_map.get(day) or {}).get("margin_financing_net_buy_sum_5d"))
+        for day in dates
+    ]
+    citic_14_values = [
+        to_float((cffex_net_short_delta_map.get((day, RISK_TARGET_INDEX_NAME)) or {}).get(
+            "cffex_citic_net_short_delta_14d"
+        ))
+        for day in dates
+    ]
+    pc_median_values = []
+    pc_valid_counts = []
+    for day in dates:
+        payload = option_pc_map.get((day, RISK_TARGET_INDEX_NAME)) or {}
+        values = [
+            to_float(payload.get(field))
+            for field in (
+                "option_pc_current_month",
+                "option_pc_next_month",
+                "option_pc_quarter_1",
+                "option_pc_quarter_2",
+            )
+        ]
+        valid = [value for value in values if value is not None and value > 0]
+        pc_valid_counts.append(len(valid))
+        pc_median_values.append(statistics.median(valid) if len(valid) >= 2 else None)
+
+    margin_120_points = _metric_lookup(build_metric_points(dates, margin_120_values))
+    margin_5_points = _metric_lookup(build_metric_points(dates, margin_5_values))
+    citic_14_points = _metric_lookup(build_metric_points(dates, citic_14_values))
+    pc_median_points = _metric_lookup(build_metric_points(dates, pc_median_values))
+    concentration_by_date = {
+        normalize_date_text(row.get("trade_date")): row
+        for row in turnover_concentration_rows or []
+        if normalize_date_text(row.get("trade_date"))
+    }
+    concentration_top5_points = _metric_lookup(build_metric_points(
+        dates,
+        [to_float((concentration_by_date.get(day) or {}).get("top5_pct")) for day in dates],
+        [str((concentration_by_date.get(day) or {}).get("top5_data_source") or "") for day in dates],
+    ))
+    concentration_top1_points = _metric_lookup(build_metric_points(
+        dates,
+        [to_float((concentration_by_date.get(day) or {}).get("top1_pct")) for day in dates],
+        [str((concentration_by_date.get(day) or {}).get("top1_data_source") or "") for day in dates],
+    ))
+    im_metrics = build_dominant_im_basis_metrics(dates, index_close_map, im_futures_rows)
+
+    assets = {}
+    for asset_code in RISK_GLOBAL_ASSET_CODES:
+        assets[asset_code] = build_source_series(
+            global_asset_rows,
+            "close_value",
+            predicate=lambda row, code=asset_code: str(row.get("asset_code") or "").strip().upper() == code,
+        )
+    us_series = {
+        name: build_source_series(
+            us_index_rows,
+            "close_price",
+            predicate=lambda row, target=name: str(row.get("index_name") or "").strip() == target,
+            default_source="index_us_daily_data",
+        )
+        for name in ("标普500指数", "纳斯达克100指数")
+    }
+    hk_series = {
+        name: build_source_series(
+            hk_index_rows,
+            "close_price",
+            predicate=lambda row, target=name: str(row.get("index_name") or "").strip() == target,
+            default_source="index_hk_daily_data",
+        )
+        for name in ("恒生指数", "恒生科技指数")
+    }
+
+    source_metrics = {
+        "spx_return_10d": transform_source_series(us_series["标普500指数"], 10, percent=True),
+        "ndx_return_10d": transform_source_series(us_series["纳斯达克100指数"], 10, percent=True),
+        "hsi_return_10d": transform_source_series(hk_series["恒生指数"], 10, percent=True),
+        "hstech_return_10d": transform_source_series(hk_series["恒生科技指数"], 10, percent=True),
+        "kospi_return_10d": transform_source_series(assets["KOSPI"], 10, percent=True),
+        "sox_return_10d": transform_source_series(assets["SOX"], 10, percent=True),
+        "copper_return_10d": transform_source_series(assets["COPPER_HG"], 10, percent=True),
+    }
+    wti_return = transform_source_series(assets["WTI"], 10, percent=True)
+    brent_return = transform_source_series(assets["BRENT"], 10, percent=True)
+    source_metrics["oil_return_10d"] = _combined_metric_points(
+        wti_return, brent_return, lambda first, second: (first + second) / 2.0
+    )
+    source_metrics["tech_relative_return_10d"] = combine_ratio_series(
+        assets["IXN_NAV"], assets["ACWI_NAV"], periods=10
+    )
+
+    vix_level = build_source_series(us_vix_rows, "close_value", default_source="cboe_vix_history")
+    credit_level = build_source_series(
+        us_credit_rows, "high_yield_oas", default_source="fred_public_csv"
+    )
+    source_metrics["vix_level"] = build_metric_points(
+        [point["source_date"] for point in vix_level],
+        [point["value"] for point in vix_level],
+        [point.get("data_source") for point in vix_level],
+    )
+    source_metrics["vix_change_5d"] = transform_source_series(vix_level, 5)
+    source_metrics["hy_oas_level"] = build_metric_points(
+        [point["source_date"] for point in credit_level],
+        [point["value"] for point in credit_level],
+        [point.get("data_source") for point in credit_level],
+    )
+    source_metrics["hy_oas_change_5d"] = transform_source_series(credit_level, 5)
+    aligned = {
+        key: align_metric_points_to_cn_dates(points, dates)
+        for key, points in source_metrics.items()
+    }
+
+    results = {}
+    global_stock_labels = (
+        ("spx_return_10d", "标普500 10D"),
+        ("ndx_return_10d", "纳斯达克100 10D"),
+        ("hsi_return_10d", "恒生指数 10D"),
+        ("hstech_return_10d", "恒生科技 10D"),
+        ("kospi_return_10d", "KOSPI 10D"),
+        ("sox_return_10d", "SOX 10D"),
+    )
+    for date_index, trade_date in enumerate(dates):
+        if output_start and trade_date < output_start:
+            continue
+        if output_end and trade_date > output_end:
+            continue
+
+        margin_120 = margin_120_points.get(trade_date) or {}
+        pc_median = pc_median_points.get(trade_date) or {}
+        im_30 = im_metrics["delta_30d"].get(trade_date) or {}
+        yellow_conditions = [
+            risk_condition(
+                margin_120.get("value"), margin_120.get("percentile"),
+                direction="high", absolute_threshold=0.0, percentile_threshold=80.0,
+                data_date=trade_date, data_source="margin_trading_daily_data",
+                label="融资净买入累计120D", unit="元", absolute_inclusive=False,
+            ),
+            risk_condition(
+                pc_median.get("value"), pc_median.get("percentile"),
+                direction="high", absolute_threshold=1.60, percentile_threshold=80.0,
+                data_date=trade_date, data_source="cffex_option_daily_data",
+                label="MO四期限价格P/C中位数", unit="倍",
+            ),
+            risk_condition(
+                im_30.get("value"), im_30.get("percentile"),
+                direction="low", absolute_threshold=-100.0, percentile_threshold=20.0,
+                data_date=trade_date, data_source=im_30.get("data_source"),
+                label="真实IM主力期现差率30D变化", unit="bp",
+            ),
+        ]
+        if pc_valid_counts[date_index] < 2:
+            yellow_conditions[1]["matched"] = None
+            yellow_conditions[1]["missing_reason"] = "MO四期限中少于两个期限有效"
+        yellow_active, yellow_score = _status_from_conditions(yellow_conditions)
+        concentration_source = concentration_by_date.get(trade_date) or {}
+        top5_point = concentration_top5_points.get(trade_date) or {}
+        top1_point = concentration_top1_points.get(trade_date) or {}
+        concentration_observations = [
+            risk_condition(
+                top5_point.get("value"), top5_point.get("percentile"),
+                direction="high", absolute_threshold=45.0, percentile_threshold=80.0,
+                data_date=trade_date,
+                data_source=concentration_source.get("top5_data_source"),
+                label="A股成交额前5%集中度MA5", unit="%",
+            ),
+            risk_condition(
+                top1_point.get("value"), top1_point.get("percentile"),
+                direction="high", absolute_threshold=20.0, percentile_threshold=80.0,
+                data_date=trade_date,
+                data_source=concentration_source.get("top1_data_source"),
+                label="A股成交额前1%集中度MA5", unit="%",
+            ),
+        ]
+
+        im_14 = im_metrics["delta_14d"].get(trade_date) or {}
+        citic_14 = citic_14_points.get(trade_date) or {}
+        margin_5 = margin_5_points.get(trade_date) or {}
+        red_conditions = [
+            risk_condition(
+                im_14.get("value"), im_14.get("percentile"),
+                direction="low", absolute_threshold=-75.0, percentile_threshold=20.0,
+                data_date=trade_date, data_source=im_14.get("data_source"),
+                label="真实IM主力期现差率14D变化", unit="bp",
+            ),
+            risk_condition(
+                citic_14.get("value"), citic_14.get("percentile"),
+                direction="high", absolute_threshold=3000.0, percentile_threshold=80.0,
+                data_date=trade_date, data_source="cffex_member_rankings",
+                label="中信净空单14D增量", unit="手",
+            ),
+            risk_condition(
+                margin_5.get("value"), margin_5.get("percentile"),
+                direction="low", absolute_threshold=-6_000_000_000.0, percentile_threshold=20.0,
+                data_date=trade_date, data_source="margin_trading_daily_data",
+                label="融资净买入累计5D", unit="元",
+            ),
+        ]
+        red_active, red_score = _status_from_conditions(red_conditions)
+
+        stock_conditions = []
+        for key, label in global_stock_labels:
+            point = aligned[key].get(trade_date) or {}
+            stock_conditions.append(risk_condition(
+                point.get("value"), point.get("percentile"), direction="low",
+                absolute_threshold=-5.0, percentile_threshold=20.0,
+                data_date=point.get("source_date"), data_source=point.get("data_source"),
+                label=label, unit="%",
+            ))
+        stock_complete = all(item["matched"] is not None for item in stock_conditions)
+        stock_count = sum(1 for item in stock_conditions if item["matched"])
+        stock_block = stock_count >= 4 if stock_complete else None
+
+        oil_point = aligned["oil_return_10d"].get(trade_date) or {}
+        copper_point = aligned["copper_return_10d"].get(trade_date) or {}
+        oil_conditions = [
+            risk_condition(
+                oil_point.get("value"), oil_point.get("percentile"), direction="low",
+                absolute_threshold=-7.0, percentile_threshold=20.0,
+                data_date=oil_point.get("source_date"), data_source=oil_point.get("data_source"),
+                label="WTI/Brent平均10D", unit="%",
+            ),
+            risk_condition(
+                copper_point.get("value"), copper_point.get("percentile"), direction="low",
+                absolute_threshold=-5.0, percentile_threshold=20.0,
+                data_date=copper_point.get("source_date"), data_source=copper_point.get("data_source"),
+                label="COMEX铜10D", unit="%",
+            ),
+        ]
+        oil_block, _oil_score = _status_from_conditions(oil_conditions)
+
+        vix_point = aligned["vix_level"].get(trade_date) or {}
+        vix_change = aligned["vix_change_5d"].get(trade_date) or {}
+        vix_conditions = [
+            risk_condition(
+                vix_point.get("value"), None, direction="high", absolute_threshold=25.0,
+                data_date=vix_point.get("source_date"), data_source=vix_point.get("data_source"),
+                label="VIX收盘", unit="点",
+            ),
+            risk_condition(
+                vix_change.get("value"), vix_change.get("percentile"), direction="high",
+                absolute_threshold=5.0, percentile_threshold=80.0,
+                data_date=vix_change.get("source_date"), data_source=vix_change.get("data_source"),
+                label="VIX 5D增加", unit="点",
+            ),
+        ]
+        vix_block, _vix_score = _status_from_conditions(vix_conditions)
+
+        hy_point = aligned["hy_oas_level"].get(trade_date) or {}
+        hy_change = aligned["hy_oas_change_5d"].get(trade_date) or {}
+        hy_conditions = [
+            risk_condition(
+                hy_point.get("value"), None, direction="high", absolute_threshold=3.5,
+                data_date=hy_point.get("source_date"), data_source=hy_point.get("data_source"),
+                label="美国高收益债OAS", unit="%",
+            ),
+            risk_condition(
+                hy_change.get("value"), hy_change.get("percentile"), direction="high",
+                absolute_threshold=0.4, percentile_threshold=80.0,
+                data_date=hy_change.get("source_date"), data_source=hy_change.get("data_source"),
+                label="HY OAS 5D扩大", unit="百分点",
+            ),
+        ]
+        hy_block, _hy_score = _status_from_conditions(hy_conditions)
+        broad_blocks = [stock_block, oil_block, vix_block, hy_block]
+        broad_complete = all(value is not None for value in broad_blocks)
+        broad_count = sum(1 for value in broad_blocks if value)
+        broad_active = broad_count >= 3 if broad_complete else None
+
+        kospi_point = aligned["kospi_return_10d"].get(trade_date) or {}
+        sox_point = aligned["sox_return_10d"].get(trade_date) or {}
+        relative_point = aligned["tech_relative_return_10d"].get(trade_date) or {}
+        tech_market_conditions = [
+            risk_condition(
+                kospi_point.get("value"), kospi_point.get("percentile"), direction="low",
+                absolute_threshold=-5.0, percentile_threshold=10.0,
+                data_date=kospi_point.get("source_date"), data_source=kospi_point.get("data_source"),
+                label="KOSPI 10D", unit="%",
+            ),
+            risk_condition(
+                sox_point.get("value"), sox_point.get("percentile"), direction="low",
+                absolute_threshold=-8.0, percentile_threshold=10.0,
+                data_date=sox_point.get("source_date"), data_source=sox_point.get("data_source"),
+                label="SOX 10D", unit="%",
+            ),
+            risk_condition(
+                relative_point.get("value"), relative_point.get("percentile"), direction="low",
+                absolute_threshold=-3.0, percentile_threshold=10.0,
+                data_date=relative_point.get("source_date"), data_source=relative_point.get("data_source"),
+                label="IXN/ACWI相对收益10D", unit="%",
+            ),
+        ]
+        tech_market_complete = all(item["matched"] is not None for item in tech_market_conditions)
+        tech_market_count = sum(1 for item in tech_market_conditions if item["matched"])
+        tech_complete = tech_market_complete
+        tech_active = tech_market_count >= 2 if tech_complete else None
+
+        if broad_active is True or tech_active is True:
+            global_active = True
+        elif broad_active is False and tech_active is False:
+            global_active = False
+        else:
+            global_active = None
+        if broad_active and tech_active:
+            global_mode = "broad_risk_off+tech_deleveraging"
+        elif broad_active:
+            global_mode = "broad_risk_off"
+        elif tech_active:
+            global_mode = "tech_deleveraging"
+        else:
+            global_mode = None
+        broad_score = broad_count / 4.0 * 100.0 if broad_complete else None
+        tech_score = tech_market_count / 3.0 * 100.0 if tech_complete else None
+        available_scores = [value for value in (broad_score, tech_score) if value is not None]
+        global_score = max(available_scores) if available_scores else None
+
+        payload = {
+            "version": RISK_VERSION,
+            "trade_date": trade_date,
+            "yellow": {
+                "complete": yellow_active is not None,
+                "active": yellow_active,
+                "score": yellow_score,
+                "action": "降低高弹性仓位、停止追涨。",
+                "components": yellow_conditions,
+                "observations": {
+                    "turnover_concentration": {
+                        "label": "A股成交拥挤观察",
+                        "components": concentration_observations,
+                        "affects_strategy_state": False,
+                    }
+                },
+                "dominant_im_contract": im_30.get("contract"),
+            },
+            "red": {
+                "complete": red_active is not None,
+                "active": red_active,
+                "score": red_score,
+                "action": "按大级别调整管理风险，不按普通回踩处理。",
+                "components": red_conditions,
+                "dominant_im_contract": im_14.get("contract"),
+            },
+            "global": {
+                "complete": global_active is not None,
+                "active": global_active,
+                "score": global_score,
+                "mode": global_mode,
+                "broad_risk_off": {
+                    "complete": broad_complete,
+                    "active": broad_active,
+                    "matched_module_count": broad_count,
+                    "modules": {
+                        "global_equities": {
+                            "active": stock_block,
+                            "matched_count": stock_count,
+                            "components": stock_conditions,
+                        },
+                        "oil_and_copper": {"active": oil_block, "components": oil_conditions},
+                        "vix": {"active": vix_block, "components": vix_conditions},
+                        "hy_oas": {"active": hy_block, "components": hy_conditions},
+                    },
+                },
+                "tech_deleveraging": {
+                    "complete": tech_complete,
+                    "active": tech_active,
+                    "matched_market_count": tech_market_count,
+                    "market_components": tech_market_conditions,
+                },
+            },
+        }
+        results[trade_date] = {
+            "risk_yellow_vulnerability": None if yellow_active is None else int(yellow_active),
+            "risk_yellow_vulnerability_score": yellow_score,
+            "risk_red_escalation": None if red_active is None else int(red_active),
+            "risk_red_escalation_score": red_score,
+            "risk_global_shock": None if global_active is None else int(global_active),
+            "risk_global_shock_score": global_score,
+            "risk_global_shock_mode": global_mode,
+            "risk_strategy_components_json": payload,
+        }
+    return results
+
+
 def build_index_close_map(rows):
     result = {}
     for row in rows:
@@ -2015,6 +2746,8 @@ def build_dashboard_rows(
     margin_trading_map=None,
     margin_financing_net_buy_sum_map=None,
     self_sentiment_map=None,
+    risk_strategy_map=None,
+    turnover_concentration_map=None,
 ):
     rows = []
     option_pc_map = option_pc_map or {}
@@ -2026,6 +2759,8 @@ def build_dashboard_rows(
     margin_trading_map = margin_trading_map or {}
     margin_financing_net_buy_sum_map = margin_financing_net_buy_sum_map or {}
     self_sentiment_map = self_sentiment_map or {}
+    risk_strategy_map = risk_strategy_map or {}
+    turnover_concentration_map = turnover_concentration_map or {}
     basis_delta_dates = basis_delta_trade_dates or trade_dates
     raw_core_basis_by_date = build_raw_core_basis_by_date(basis_delta_dates, index_close_map, futures_close_map)
     basis_delta_map = build_index_basis_delta_map(raw_core_basis_by_date, basis_delta_dates)
@@ -2095,6 +2830,16 @@ def build_dashboard_rows(
                 or empty_margin_financing_net_buy_payload()
             )
             self_sentiment_payload = self_sentiment_map.get((trade_date, index_name)) or {}
+            risk_payload = (
+                risk_strategy_map.get(trade_date) or {}
+                if index_name == RISK_TARGET_INDEX_NAME
+                else {}
+            )
+            turnover_concentration_payload = (
+                turnover_concentration_map.get(trade_date) or {}
+                if index_name == "上证指数"
+                else {}
+            )
             rows.append({
                 "trade_date": trade_date,
                 "index_code": index_code_map.get(index_name) or INDEX_CODE_FALLBACKS[index_name],
@@ -2113,6 +2858,28 @@ def build_dashboard_rows(
                 "self_sentiment_core_score": self_sentiment_payload.get("self_sentiment_core_score"),
                 "self_sentiment_derivative_score": self_sentiment_payload.get("self_sentiment_derivative_score"),
                 "self_sentiment_components_json": self_sentiment_payload.get("self_sentiment_components_json") or {},
+                "risk_yellow_vulnerability": risk_payload.get("risk_yellow_vulnerability"),
+                "risk_yellow_vulnerability_score": risk_payload.get("risk_yellow_vulnerability_score"),
+                "risk_red_escalation": risk_payload.get("risk_red_escalation"),
+                "risk_red_escalation_score": risk_payload.get("risk_red_escalation_score"),
+                "risk_global_shock": risk_payload.get("risk_global_shock"),
+                "risk_global_shock_score": risk_payload.get("risk_global_shock_score"),
+                "risk_global_shock_mode": risk_payload.get("risk_global_shock_mode"),
+                "risk_strategy_components_json": risk_payload.get("risk_strategy_components_json") or {},
+                "turnover_concentration_top5_pct": turnover_concentration_payload.get("top5_pct"),
+                "turnover_concentration_top1_pct": turnover_concentration_payload.get("top1_pct"),
+                "turnover_concentration_top1_raw_pct": turnover_concentration_payload.get("top1_raw_pct"),
+                "turnover_concentration_meta_json": {
+                    "stock_count": turnover_concentration_payload.get("stock_count"),
+                    "top1_stock_count": turnover_concentration_payload.get("top1_stock_count"),
+                    "total_turnover_amount": turnover_concentration_payload.get("total_turnover_amount"),
+                    "top1_turnover_amount": turnover_concentration_payload.get("top1_turnover_amount"),
+                    "top5_data_source": turnover_concentration_payload.get("top5_data_source"),
+                    "top1_data_source": turnover_concentration_payload.get("top1_data_source"),
+                    "top5_source_url": turnover_concentration_payload.get("top5_source_url"),
+                    "source_date": normalize_date_text(turnover_concentration_payload.get("source_date")),
+                    "available_at": str(turnover_concentration_payload.get("available_at") or "") or None,
+                } if turnover_concentration_payload else {},
                 **cffex_delta_payload,
                 **basis_delta_payload,
                 "fund_purchase_limit_count": fund_purchase_limit_payload.get(
@@ -2198,7 +2965,11 @@ def build_us_dashboard_rows(trade_dates, index_code_map, index_close_map, future
 async def compute_and_upsert_range(db_tools, start_date, end_date):
     basis_delta_start_date = shift_date_text(
         start_date,
-        -max(CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS, SELF_SENTIMENT_LOOKBACK_DAYS),
+        -max(
+            CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS,
+            SELF_SENTIMENT_LOOKBACK_DAYS,
+            RISK_LOOKBACK_CALENDAR_DAYS,
+        ),
     )
     cn_trade_dates = await db_tools.get_quant_index_dashboard_trade_dates(
         INDEX_NAME_ORDER,
@@ -2286,7 +3057,7 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         option_vix_minute_rows,
     )
     cffex_position_rows = await db_tools.get_quant_index_dashboard_cffex_net_short_positions(
-        shift_date_text(start_date, -CFFEX_NET_SHORT_DELTA_LOOKBACK_DAYS),
+        basis_delta_start_date,
         end_date,
     )
     fund_purchase_limit_rows = await db_tools.get_fund_purchase_limit_daily_summary(
@@ -2330,6 +3101,23 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
     }
 
     option_pc_map = build_index_option_pc_map(option_rows, cn_index_close_map)
+    risk_pc_history_rows = await db_tools.get_quant_index_dashboard_option_pc_history(
+        RISK_TARGET_INDEX_NAME,
+        basis_delta_start_date,
+        end_date,
+    )
+    for history_row in risk_pc_history_rows:
+        history_date = normalize_date_text(history_row.get("trade_date"))
+        if history_date:
+            option_pc_map.setdefault(
+                (history_date, RISK_TARGET_INDEX_NAME),
+                {
+                    "option_pc_current_month": to_float(history_row.get("option_pc_current_month")),
+                    "option_pc_next_month": to_float(history_row.get("option_pc_next_month")),
+                    "option_pc_quarter_1": to_float(history_row.get("option_pc_quarter_1")),
+                    "option_pc_quarter_2": to_float(history_row.get("option_pc_quarter_2")),
+                },
+            )
     option_flow_pc_map = build_index_option_flow_pc_map(option_rows)
     futures_close_map = build_futures_close_map(futures_rows)
     self_sentiment_history_rows = await db_tools.get_quant_index_dashboard_self_sentiment_history(
@@ -2339,6 +3127,60 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
     margin_financing_net_buy_sum_map = build_margin_financing_net_buy_sum_map(
         margin_trading_map,
         cn_basis_delta_trade_dates,
+    )
+    cffex_net_short_delta_map = build_index_cffex_net_short_delta_map(
+        cffex_position_rows,
+        start_date=basis_delta_start_date,
+        end_date=end_date,
+    )
+    im_futures_rows = await db_tools.get_quant_index_risk_im_contract_rows(
+        basis_delta_start_date,
+        end_date,
+    )
+    global_asset_rows = await db_tools.get_global_risk_asset_daily_rows(
+        basis_delta_start_date,
+        end_date,
+        RISK_GLOBAL_ASSET_CODES,
+    )
+    risk_us_index_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(
+        ["标普500指数", "纳斯达克100指数"],
+        "us",
+        basis_delta_start_date,
+        end_date,
+    )
+    risk_hk_index_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(
+        ["恒生指数", "恒生科技指数"],
+        "hk",
+        basis_delta_start_date,
+        end_date,
+    )
+    risk_vix_rows = await db_tools.get_quant_index_risk_us_vix_rows(
+        basis_delta_start_date,
+        end_date,
+    )
+    risk_credit_rows = await db_tools.get_quant_index_risk_us_credit_rows(
+        basis_delta_start_date,
+        end_date,
+    )
+    turnover_concentration_rows = await db_tools.get_a_share_turnover_concentration_daily_rows(
+        basis_delta_start_date,
+        end_date,
+    )
+    risk_strategy_map = build_risk_strategy_map(
+        trade_dates=cn_basis_delta_trade_dates,
+        index_close_map=cn_index_close_map,
+        option_pc_map=option_pc_map,
+        cffex_net_short_delta_map=cffex_net_short_delta_map,
+        margin_financing_net_buy_sum_map=margin_financing_net_buy_sum_map,
+        im_futures_rows=im_futures_rows,
+        global_asset_rows=global_asset_rows,
+        us_index_rows=risk_us_index_rows,
+        hk_index_rows=risk_hk_index_rows,
+        us_vix_rows=risk_vix_rows,
+        us_credit_rows=risk_credit_rows,
+        turnover_concentration_rows=turnover_concentration_rows,
+        output_start_date=start_date,
+        output_end_date=end_date,
     )
     self_sentiment_map = build_self_sentiment_map(
         trade_dates=cn_basis_delta_trade_dates,
@@ -2365,16 +3207,18 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         option_flow_pc_map=option_flow_pc_map,
         exchange_option_pc_map=exchange_option_pc_map,
         option_vix_map=option_vix_map,
-        cffex_net_short_delta_map=build_index_cffex_net_short_delta_map(
-            cffex_position_rows,
-            start_date=start_date,
-            end_date=end_date,
-        ),
+        cffex_net_short_delta_map=cffex_net_short_delta_map,
         basis_delta_trade_dates=cn_basis_delta_trade_dates,
         fund_purchase_limit_map=fund_purchase_limit_map,
         margin_trading_map=margin_trading_map,
         margin_financing_net_buy_sum_map=margin_financing_net_buy_sum_map,
         self_sentiment_map=self_sentiment_map,
+        risk_strategy_map=risk_strategy_map,
+        turnover_concentration_map={
+            normalize_date_text(row.get("trade_date")): row
+            for row in turnover_concentration_rows
+            if normalize_date_text(row.get("trade_date"))
+        },
     )
     if hk_trade_dates:
         hk_index_close_rows = await db_tools.get_quant_index_dashboard_index_closes_for_market(
