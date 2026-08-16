@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import requests
 import pandas as pd
 
+from akshare_project.core import runtime_config
 from akshare_project.core.logging_utils import get_logger
 from akshare_project.core.paths import ensure_runtime_layout
 from akshare_project.scheduler.config import load_scheduler_config
@@ -269,6 +270,10 @@ class SchedulerService:
             "running_jobs": running_jobs,
             "queue_stats": queue_stats,
             "sources": self.state.health_payload(),
+            "runtime_profile": runtime_config.get_runtime_profile(),
+            "database": runtime_config.resolve_db_name(),
+            "collection_execution_mode": runtime_config.get_collection_execution_mode(),
+            "allowed_collectors": sorted(runtime_config.get_allowed_collectors()),
         }
 
     def start_background_threads(self):
@@ -612,7 +617,10 @@ def create_scheduler_server(host, port):
 
 
 def run_scheduler_service():
+    runtime_config.enforce_lan_test_runtime_guard()
     config = SERVICE_INSTANCE.config
+    if runtime_config.is_lan_test():
+        config = {**config, "host": "127.0.0.1"}
     host = config.get("host", "127.0.0.1")
     port = int(config.get("port", 8765))
     server = create_scheduler_server(host, port)

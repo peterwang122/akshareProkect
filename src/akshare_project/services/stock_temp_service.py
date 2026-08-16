@@ -29,6 +29,7 @@ from akshare_project.collectors import (
     risk_free_rate,
     stock,
 )
+from akshare_project.core import runtime_config
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.network import without_proxy_env
 from akshare_project.core.paths import ensure_runtime_layout, get_config_dir
@@ -152,6 +153,19 @@ def build_health_payload():
         "host": config["host"],
         "port": config["port"],
         "thread": threading.current_thread().name,
+        "runtime_profile": runtime_config.get_runtime_profile(),
+        "database": runtime_config.resolve_db_name(),
+        "collection_execution_mode": runtime_config.get_collection_execution_mode(),
+        "allowed_collectors": sorted(runtime_config.get_allowed_collectors()),
+    }
+
+
+def build_denied_payload(task_name: str) -> dict:
+    return {
+        "status": "DENIED",
+        "task_name": task_name,
+        "error": "collection allowlist rejected this task",
+        "collection_execution_mode": runtime_config.get_collection_execution_mode(),
     }
 
 
@@ -533,6 +547,10 @@ class StockTempHandler(BaseHTTPRequestHandler):
         return payload
 
     def _run_daily_route(self, route: DailyRoute, payload: dict):
+        if not runtime_config.is_collector_allowed(route.task_name):
+            self._send_json(403, build_denied_payload(route.task_name))
+            return
+
         payload_task_names = {
             "stock_exchange_official_daily",
             "douyin_coze_emotion_daily",
@@ -631,6 +649,15 @@ class StockTempHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"status": "NOT_FOUND", "error": "unsupported path"})
             return
 
+        if normalized_path == "/collect":
+            if not runtime_config.is_collector_allowed("stock_hfq_temp"):
+                self._send_json(403, build_denied_payload("stock_hfq_temp"))
+                return
+        elif normalized_path == "/collect-forex":
+            if not runtime_config.is_collector_allowed("forex_collect"):
+                self._send_json(403, build_denied_payload("forex_collect"))
+                return
+
         payload = self._read_json_payload()
         if payload is None:
             return
@@ -673,7 +700,10 @@ class StockTempHandler(BaseHTTPRequestHandler):
 
 def run_stock_temp_service():
     ensure_runtime_layout()
+    runtime_config.enforce_lan_test_runtime_guard()
     config = load_service_config()
+    if runtime_config.is_lan_test():
+        config = {**config, "host": DEFAULT_HOST}
     server = ThreadingHTTPServer((config["host"], int(config["port"])), StockTempHandler)
     print(f"stock temp service started at http://{config['host']}:{config['port']}")
     try:

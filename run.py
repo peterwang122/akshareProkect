@@ -29,6 +29,7 @@ from akshare_project.collectors import (  # noqa: E402
     runner,
     stock,
 )
+from akshare_project.core import runtime_config  # noqa: E402
 from akshare_project.core.paths import ensure_runtime_layout  # noqa: E402
 
 
@@ -50,6 +51,16 @@ async def dispatch():
     domain = sys.argv[1].strip().lower()
     command = sys.argv[2].strip().lower()
     args = sys.argv[3:]
+
+    runtime_config.enforce_lan_test_runtime_guard()
+    collector_key = runtime_config.collector_key_for_cli(domain, command)
+    if not runtime_config.is_collector_allowed(collector_key):
+        print(
+            "collection allowlist rejected command: "
+            f"domain={domain} command={command} collector_key={collector_key}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     if domain == "stock":
         set_argv("stock", [command, *args])

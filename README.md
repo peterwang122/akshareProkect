@@ -276,6 +276,26 @@ python ak_scheduler_service.py doctor
 python ak_scheduler_service.py doctor 50
 ```
 
+## 局域网测试环境（lan-test）采集白名单
+
+在另一台 Windows 电脑开发 FIT 测试版本时，通过环境变量开启采集防护：
+
+```dotenv
+AK_RUNTIME_PROFILE=lan-test
+AK_COLLECTION_EXECUTION_MODE=allowlist
+AK_ALLOWED_COLLECTORS=
+AK_DB_NAME=stock_info_test
+```
+
+规则：
+
+- `run.py` 的每个 `domain/command` 都会映射为稳定采集键（如 `stock daily -> stock_daily`）；白名单模式下键不在 `AK_ALLOWED_COLLECTORS` 中的命令会在任何上游网络访问和数据库写入之前被拒绝并退出。
+- `stock_temp_service.py` 的每个路由在执行 handler 前校验对应 `task_name`；旧路由 `/collect` 对应 `stock_hfq_temp`，`/collect-forex` 对应 `forex_collect`。
+- `lan-test` 模式下数据库名必须是 `stock_info_test`，stock-temp 与 AK 调度服务只监听 `127.0.0.1`。
+- `/health` 返回运行配置、数据库名、采集策略和当前白名单，不返回任何密码或密钥。
+- AKShare 请求调度服务只负责请求排队与节流，不会自行启动采集任务。
+- 白名单只写在测试机本地环境变量中，不提交到仓库。
+
 ## 模块说明
 
 ### 股票
