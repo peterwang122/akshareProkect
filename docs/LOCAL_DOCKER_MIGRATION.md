@@ -1,5 +1,5 @@
 # 本机 Docker MySQL 迁移说明
-
+本迁移与启动说明针对正式机（Mac）执行；Windows 开发机只做代码编辑、分支、Mock/单元测试和静态检查，不启动任何服务、不连接生产资源。
 ## 目标结构
 
 - FIT 项目负责启动本机 Docker 基础设施：MySQL、Redis、Flower。
@@ -52,7 +52,7 @@ REMOTE_DB_PASSWORD=... python scripts/db_sync.py mac-to-windows --confirm
 
 这个命令不会被 launchd、cron 或 Celery beat 自动调用。
 
-## 本机启动
+## 正式机（Mac）启动
 
 在 akshareProkect：
 
