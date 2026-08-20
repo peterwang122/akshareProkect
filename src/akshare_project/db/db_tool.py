@@ -526,6 +526,7 @@ class DbTools:
         trade_date = row.get('trade_date')
         sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
         sanitized['high_yield_oas'] = self._normalize_numeric('high_yield_oas', row.get('high_yield_oas'))
+        sanitized['available_at'] = str(row.get('available_at') or '').strip() or None
         sanitized['data_source'] = str(row.get('data_source', 'fred_public_csv')).strip() or 'fred_public_csv'
         return sanitized
 
@@ -5230,6 +5231,7 @@ class DbTools:
               id BIGINT PRIMARY KEY AUTO_INCREMENT,
               trade_date DATE NOT NULL COMMENT 'Trading date',
               high_yield_oas DECIMAL(10, 4) NULL COMMENT 'US high yield option-adjusted spread',
+              available_at DATETIME NULL COMMENT 'Publicly available time (Asia/Shanghai)',
               data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -5382,10 +5384,12 @@ class DbTools:
                 INSERT INTO index_us_credit_spread_daily (
                     trade_date,
                     high_yield_oas,
+                    available_at,
                     data_source
-                ) VALUES (%s, %s, %s)
+                ) VALUES (%s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    high_yield_oas = VALUES(high_yield_oas),
+                    high_yield_oas = COALESCE(VALUES(high_yield_oas), high_yield_oas),
+                    available_at = COALESCE(VALUES(available_at), available_at),
                     data_source = VALUES(data_source),
                     updated_at = CURRENT_TIMESTAMP
                 """
@@ -5393,6 +5397,7 @@ class DbTools:
                     (
                         row['trade_date'],
                         row['high_yield_oas'],
+                        row['available_at'],
                         row['data_source'],
                     )
                     for row in sanitized_rows

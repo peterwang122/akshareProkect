@@ -243,6 +243,7 @@ CREATE TABLE IF NOT EXISTS index_us_credit_spread_daily (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   trade_date DATE NOT NULL COMMENT 'Trading date',
   high_yield_oas DECIMAL(10, 4) NULL COMMENT 'US high yield option-adjusted spread',
+  available_at DATETIME NULL COMMENT 'Publicly available time (Asia/Shanghai)',
   data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

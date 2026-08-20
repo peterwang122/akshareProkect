@@ -6,11 +6,13 @@ import re
 import statistics
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.db.db_tool import DbTools
 
 LOGGER = get_logger("quant_index")
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 INDEX_NAME_ORDER = [
     "上证指数",
@@ -389,6 +391,102 @@ def align_metric_points_to_cn_dates(points, cn_trade_dates, max_stale_days=10):
     return result
 
 
+def _parse_aware_datetime(value):
+    try:
+        parsed = datetime.fromisoformat(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+    return parsed
+
+
+def align_metric_points_to_cn_dates_by_available_at(
+    points,
+    cn_trade_dates,
+    cutoff_time="09:20",
+    max_stale_days=10,
+):
+    """按“下一A股交易日 cutoff_time 前已公开”为每个A股风险日选择最新外盘点。"""
+    sorted_cn = sorted(
+        normalize_date_text(value)
+        for value in cn_trade_dates
+        if normalize_date_text(value)
+    )
+    sorted_points = sorted(
+        [point for point in points if point.get("source_date")],
+        key=lambda point: point["source_date"],
+    )
+    result = {}
+    for index, trade_date in enumerate(sorted_cn):
+        next_cn = next(
+            (candidate for candidate in sorted_cn[index + 1:]),
+            None,
+        )
+        if next_cn is None:
+            try:
+                cursor = datetime.strptime(trade_date, "%Y-%m-%d").date() + timedelta(days=1)
+                while cursor.weekday() >= 5:
+                    cursor = cursor + timedelta(days=1)
+                next_cn = cursor.isoformat()
+            except (TypeError, ValueError):
+                continue
+        try:
+            hour_text, _, minute_text = str(cutoff_time).partition(":")
+            cutoff = datetime.combine(
+                datetime.strptime(next_cn, "%Y-%m-%d").date(),
+                datetime.min.time().replace(
+                    hour=int(hour_text),
+                    minute=int(minute_text or "0"),
+                ),
+                tzinfo=SHANGHAI_TZ,
+            )
+        except (TypeError, ValueError):
+            continue
+        eligible = []
+        for point in sorted_points:
+            source_date = point["source_date"]
+            if source_date >= next_cn:
+                continue
+            available_at = _parse_aware_datetime(point.get("available_at"))
+            if available_at is None:
+                if source_date >= trade_date:
+                    continue
+            elif available_at > cutoff:
+                continue
+            eligible.append(point)
+        if not eligible:
+            continue
+        latest = eligible[-1]
+        age = (
+            datetime.strptime(next_cn, "%Y-%m-%d").date()
+            - datetime.strptime(latest["source_date"], "%Y-%m-%d").date()
+        ).days
+        if age <= max_stale_days:
+            result[trade_date] = latest
+    return result
+
+
+def _synthetic_next_day_available_at(points, hour=6):
+    """美股收盘类数据无 available_at 时的保守可用时间：下一自然日 hour 点 Asia/Shanghai。"""
+    result = []
+    for point in points:
+        if not point.get("source_date"):
+            result.append(point)
+            continue
+        try:
+            next_day = datetime.strptime(point["source_date"], "%Y-%m-%d") + timedelta(days=1)
+            result.append(
+                {
+                    **point,
+                    "available_at": next_day.replace(hour=hour, minute=0).isoformat(),
+                }
+            )
+        except (TypeError, ValueError):
+            result.append(point)
+    return result
+
+
 def build_source_series(rows, value_key, predicate=None, default_source=None):
     deduped = {}
     for row in rows or []:
@@ -443,6 +541,7 @@ def risk_condition(
     unit=None,
     absolute_inclusive=True,
     available_at=None,
+    level_value=None,
 ):
     numeric = to_float(value)
     rank = to_float(percentile)
@@ -460,6 +559,7 @@ def risk_condition(
             "data_date": data_date,
             "data_source": data_source,
             "available_at": available_at,
+            "level_value": level_value,
             "missing_reason": (
                 "有效历史样本不足252个" if numeric is not None else "当日原始值缺失"
             ),
@@ -494,6 +594,7 @@ def risk_condition(
         "data_date": data_date,
         "data_source": data_source,
         "available_at": available_at,
+        "level_value": level_value,
         "missing_reason": None,
     }
 
@@ -2182,7 +2283,14 @@ def _attach_available_at(points, rows):
     ]
 
 
-def build_usd_rate_shock_state(nominal_point, real_point, sox_point, relative_point):
+def build_usd_rate_shock_state(
+    nominal_point,
+    real_point,
+    sox_point,
+    relative_point,
+    nominal_level_value=None,
+    real_level_value=None,
+):
     """美元利率冲击模式：名义/实际10年美债5D变化+百分位，加SOX或IXN/ACWI市场确认。"""
     nominal_condition = risk_condition(
         nominal_point.get("value"), nominal_point.get("percentile"), direction="high",
@@ -2190,6 +2298,7 @@ def build_usd_rate_shock_state(nominal_point, real_point, sox_point, relative_po
         data_date=nominal_point.get("source_date"), data_source=nominal_point.get("data_source"),
         label="名义10年美债收益率5D变化", unit="百分点",
         available_at=nominal_point.get("available_at"),
+        level_value=nominal_level_value,
     )
     real_condition = risk_condition(
         real_point.get("value"), real_point.get("percentile"), direction="high",
@@ -2197,6 +2306,7 @@ def build_usd_rate_shock_state(nominal_point, real_point, sox_point, relative_po
         data_date=real_point.get("source_date"), data_source=real_point.get("data_source"),
         label="实际10年美债收益率5D变化", unit="百分点",
         available_at=real_point.get("available_at"),
+        level_value=real_level_value,
     )
     sox_market_condition = risk_condition(
         sox_point.get("value"), sox_point.get("percentile"), direction="low",
@@ -2211,15 +2321,17 @@ def build_usd_rate_shock_state(nominal_point, real_point, sox_point, relative_po
         data_source=relative_point.get("data_source"),
         label="IXN/ACWI相对收益10D", unit="%",
     )
-    if sox_market_condition["matched"] is None and relative_market_condition["matched"] is None:
-        market_matched = None
-        market_missing = "SOX 与 IXN/ACWI 相对收益均缺失"
-    elif sox_market_condition["matched"] is True or relative_market_condition["matched"] is True:
+    sox_matched = sox_market_condition["matched"]
+    relative_matched = relative_market_condition["matched"]
+    if sox_matched is True or relative_matched is True:
         market_matched = True
         market_missing = None
-    else:
+    elif sox_matched is False and relative_matched is False:
         market_matched = False
         market_missing = None
+    else:
+        market_matched = None
+        market_missing = "SOX 或 IXN/ACWI 相对收益存在缺失，市场确认不完整"
     market_condition = {
         "label": "市场确认（SOX 或 IXN/ACWI 相对收益）",
         "value": None,
@@ -2391,8 +2503,13 @@ def build_risk_strategy_map(
     )
 
     vix_level = build_source_series(us_vix_rows, "close_value", default_source="cboe_vix_history")
-    credit_level = build_source_series(
-        us_credit_rows, "high_yield_oas", default_source="fred_public_csv"
+    credit_level = _attach_available_at(
+        build_source_series(
+            us_credit_rows,
+            "high_yield_oas",
+            default_source="fred_public_csv",
+        ),
+        us_credit_rows,
     )
     treasury_nominal = _treasury_series_with_available_at(us_treasury_rows, "yield_10y")
     treasury_real = _treasury_series_with_available_at(us_treasury_rows, "yield_real_10y")
@@ -2421,6 +2538,42 @@ def build_risk_strategy_map(
     aligned = {
         key: align_metric_points_to_cn_dates(points, dates)
         for key, points in source_metrics.items()
+    }
+    aligned_by_available = {
+        "nominal_10y_change_5d": align_metric_points_to_cn_dates_by_available_at(
+            source_metrics["nominal_10y_change_5d"],
+            dates,
+        ),
+        "real_10y_change_5d": align_metric_points_to_cn_dates_by_available_at(
+            source_metrics["real_10y_change_5d"],
+            dates,
+        ),
+        "nominal_10y_level": align_metric_points_to_cn_dates_by_available_at(
+            treasury_nominal,
+            dates,
+        ),
+        "real_10y_level": align_metric_points_to_cn_dates_by_available_at(
+            treasury_real,
+            dates,
+        ),
+        "sox_return_10d": align_metric_points_to_cn_dates_by_available_at(
+            _synthetic_next_day_available_at(source_metrics["sox_return_10d"]),
+            dates,
+        ),
+        "tech_relative_return_10d": align_metric_points_to_cn_dates_by_available_at(
+            _synthetic_next_day_available_at(
+                source_metrics["tech_relative_return_10d"]
+            ),
+            dates,
+        ),
+        "hy_oas_level": align_metric_points_to_cn_dates_by_available_at(
+            _attach_available_at(source_metrics["hy_oas_level"], us_credit_rows),
+            dates,
+        ),
+        "hy_oas_change_5d": align_metric_points_to_cn_dates_by_available_at(
+            _attach_available_at(source_metrics["hy_oas_change_5d"], us_credit_rows),
+            dates,
+        ),
     }
 
     results = {}
@@ -2550,19 +2703,21 @@ def build_risk_strategy_map(
         ]
         vix_block, _vix_score = _status_from_conditions(vix_conditions)
 
-        hy_point = aligned["hy_oas_level"].get(trade_date) or {}
-        hy_change = aligned["hy_oas_change_5d"].get(trade_date) or {}
+        hy_point = aligned_by_available["hy_oas_level"].get(trade_date) or {}
+        hy_change = aligned_by_available["hy_oas_change_5d"].get(trade_date) or {}
         hy_conditions = [
             risk_condition(
                 hy_point.get("value"), None, direction="high", absolute_threshold=3.5,
                 data_date=hy_point.get("source_date"), data_source=hy_point.get("data_source"),
                 label="美国高收益债OAS", unit="%",
+                available_at=hy_point.get("available_at"),
             ),
             risk_condition(
                 hy_change.get("value"), hy_change.get("percentile"), direction="high",
                 absolute_threshold=0.4, percentile_threshold=80.0,
                 data_date=hy_change.get("source_date"), data_source=hy_change.get("data_source"),
                 label="HY OAS 5D扩大", unit="百分点",
+                available_at=hy_change.get("available_at"),
             ),
         ]
         hy_block, _hy_score = _status_from_conditions(hy_conditions)
@@ -2599,15 +2754,21 @@ def build_risk_strategy_map(
         tech_complete = tech_market_complete
         tech_active = tech_market_count >= 2 if tech_complete else None
 
-        nominal_point = aligned["nominal_10y_change_5d"].get(trade_date) or {}
-        real_point = aligned["real_10y_change_5d"].get(trade_date) or {}
-        sox_rate_point = aligned["sox_return_10d"].get(trade_date) or {}
-        relative_rate_point = aligned["tech_relative_return_10d"].get(trade_date) or {}
+        nominal_point = aligned_by_available["nominal_10y_change_5d"].get(trade_date) or {}
+        real_point = aligned_by_available["real_10y_change_5d"].get(trade_date) or {}
+        nominal_level_point = aligned_by_available["nominal_10y_level"].get(trade_date) or {}
+        real_level_point = aligned_by_available["real_10y_level"].get(trade_date) or {}
+        sox_rate_point = aligned_by_available["sox_return_10d"].get(trade_date) or {}
+        relative_rate_point = (
+            aligned_by_available["tech_relative_return_10d"].get(trade_date) or {}
+        )
         usd_rate_shock = build_usd_rate_shock_state(
             nominal_point,
             real_point,
             sox_rate_point,
             relative_rate_point,
+            nominal_level_value=nominal_level_point.get("value"),
+            real_level_value=real_level_point.get("value"),
         )
         rate_active = usd_rate_shock["active"]
         rate_score = usd_rate_shock["score"]

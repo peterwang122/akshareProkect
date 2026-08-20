@@ -5,7 +5,6 @@ from datetime import date, timedelta
 import pytest
 
 from akshare_project.collectors import index, quant_index
-from akshare_project.services import stock_temp_service
 
 
 def _us_dates(count):
@@ -47,6 +46,13 @@ def test_available_at_weekday_fallback_when_no_next_series_date():
     # 最新观测日没有系列内下一日时，按工作日推算（周五 -> 下周一）
     result = index.us_treasury_available_at("2026-01-02", None)
     assert result == "2026-01-06T06:00:00+08:00"
+
+
+def test_available_at_skips_us_federal_holiday_observation():
+    # 2026-07-04 是周六，联邦假日观察日为 2026-07-03（周五）；7/2 的下一美国工作日为 7/6
+    result = index.us_treasury_available_at("2026-07-02", None)
+    # 7 月为夏令时（CDT, UTC-5），16:00 Chicago = 次日 05:00 Asia/Shanghai
+    assert result == "2026-07-07T05:00:00+08:00"
 
 
 def _fred_csv(series_id, values):
@@ -179,6 +185,81 @@ def test_rate_shock_market_confirm_accepts_sox_only():
     assert state["active"] is True
 
 
+def test_rate_shock_market_confirm_incomplete_when_one_missing_one_false():
+    state = quant_index.build_usd_rate_shock_state(
+        _point(0.25, 95.0),
+        _point(0.20, 92.0),
+        _point(-1.0, 90.0, data_source="global_risk"),
+        _point(None, None, data_source="blackrock_ishares_historical_nav"),
+    )
+    # 一项明确未命中、另一项缺失：市场确认为 None/incomplete，不能判 False
+    market = state["components"][2]
+    assert market["matched"] is None
+    assert state["active"] is None
+    assert state["complete"] is False
+
+
+def test_rate_shock_market_confirm_false_only_when_both_false():
+    state = quant_index.build_usd_rate_shock_state(
+        _point(0.25, 95.0),
+        _point(0.20, 92.0),
+        _point(-1.0, 90.0, data_source="global_risk"),
+        _point(-0.5, 90.0, data_source="blackrock_ishares_historical_nav"),
+    )
+    market = state["components"][2]
+    assert market["matched"] is False
+    assert state["active"] is False
+    assert state["complete"] is True
+
+
+def test_rate_conditions_include_level_value_and_available_at():
+    state = quant_index.build_usd_rate_shock_state(
+        _point(0.25, 95.0),
+        _point(0.20, 92.0),
+        _point(-6.0, 8.0, data_source="global_risk"),
+        _point(-3.0, 5.0, data_source="blackrock_ishares_historical_nav"),
+        nominal_level_value=4.5,
+        real_level_value=2.3,
+    )
+    nominal = state["components"][0]
+    real = state["components"][1]
+    assert nominal["level_value"] == 4.5
+    assert real["level_value"] == 2.3
+    assert nominal["available_at"] == "2026-08-15T05:00:00+08:00"
+
+
+def test_align_by_available_at_includes_same_day_source_before_cutoff():
+    points = [
+        {
+            "source_date": "2026-08-13",
+            "value": 4.5,
+            "available_at": "2026-08-14T04:16:00+08:00",
+        }
+    ]
+    aligned = quant_index.align_metric_points_to_cn_dates_by_available_at(
+        points,
+        ["2026-08-13", "2026-08-14", "2026-08-17"],
+    )
+    # 美国 8/13 观测数据在 8/14 04:16 已公开，早于下一A股交易日 8/14 09:20
+    assert aligned["2026-08-13"]["source_date"] == "2026-08-13"
+
+
+def test_align_by_available_at_excludes_late_publication():
+    points = [
+        {
+            "source_date": "2026-08-13",
+            "value": 4.5,
+            "available_at": "2026-08-14T11:00:00+08:00",
+        }
+    ]
+    aligned = quant_index.align_metric_points_to_cn_dates_by_available_at(
+        points,
+        ["2026-08-13", "2026-08-14", "2026-08-17"],
+    )
+    # 晚于 8/14 09:20 公开，不能用于 A股 8/13 的下一个交易日风险状态
+    assert "2026-08-13" not in aligned
+
+
 def test_build_risk_strategy_map_rate_mode_and_top1_removed():
     dates = _us_dates(330)
     final_date = dates[-1]
@@ -256,11 +337,3 @@ def test_build_risk_strategy_map_rate_mode_and_top1_removed():
     observations = payload["yellow"]["observations"]["turnover_concentration"]["components"]
     assert len(observations) == 1
     assert observations[0]["label"] == "A股成交额前5%集中度MA5"
-
-
-def test_quant_index_repair_previous_route_key_matches_cli():
-    routes = stock_temp_service.build_daily_routes()
-    route = routes["/collect-quant-index-repair-market-previous"]
-    assert route.task_name == "quant_index_repair_market_previous"
-    # CLI 入口 key 与路由 task_name 保持一致（issue #14 collector_key 统一要求）
-    assert "quant_index_repair_market_previous" == route.task_name

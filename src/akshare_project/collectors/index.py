@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -91,6 +91,8 @@ US_TREASURY_AVAILABLE_TIMEZONE = ZoneInfo('America/Chicago')
 SHANGHAI_TIMEZONE = ZoneInfo('Asia/Shanghai')
 US_TREASURY_DAILY_AVAILABLE_HOUR = 16
 US_TREASURY_DAILY_SYNC_RECENT_DAYS = 10
+US_CREDIT_SPREAD_AVAILABLE_HOUR = 0
+US_CREDIT_SPREAD_AVAILABLE_MINUTE = 45
 DEFAULT_HTTP_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -1173,9 +1175,43 @@ def _next_us_business_day(trade_date: str, sorted_dates: list[str]) -> str | Non
     except (TypeError, ValueError):
         return None
     cursor = cursor + timedelta(days=1)
-    while cursor.weekday() >= 5:
+    while cursor.weekday() >= 5 or cursor in _us_federal_holidays(cursor.year):
         cursor = cursor + timedelta(days=1)
     return cursor.isoformat()
+
+
+def _us_federal_holidays(year: int) -> set:
+    """美国联邦假日（含周末顺延观察日）。用于不会提前的 available_at 保守回退。"""
+
+    def nth_weekday(target_year, month, weekday, n):
+        first = date(target_year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        day = first + timedelta(days=offset + 7 * (n - 1))
+        if n < 0:
+            last = date(target_year, month + 1, 1) - timedelta(days=1)
+            day = last - timedelta(days=(last.weekday() - weekday) % 7)
+        return day
+
+    holidays = {
+        date(year, 1, 1),
+        nth_weekday(year, 1, 0, 3),   # MLK 第三个周一
+        nth_weekday(year, 2, 0, 3),   # Presidents 第三个周一
+        nth_weekday(year, 5, 0, -1),  # Memorial 五月最后周一
+        date(year, 6, 19),            # Juneteenth
+        date(year, 7, 4),
+        nth_weekday(year, 9, 0, 1),   # Labor 九月第一个周一
+        nth_weekday(year, 11, 3, 4),  # Thanksgiving 十一月第四个周四
+        date(year, 12, 25),
+    }
+    observed = set()
+    for holiday in holidays:
+        if holiday.weekday() == 5:
+            observed.add(holiday - timedelta(days=1))
+        elif holiday.weekday() == 6:
+            observed.add(holiday + timedelta(days=1))
+        else:
+            observed.add(holiday)
+    return observed
 
 
 def attach_us_treasury_available_at(rows):
@@ -1196,9 +1232,46 @@ def attach_us_treasury_available_at(rows):
     ]
 
 
+def us_credit_spread_available_at(trade_date: str, next_us_business_date: str) -> str | None:
+    """HY OAS 公开可用时间：观测日后的下一个美国工作日 00:45 Asia/Shanghai。"""
+    if not trade_date:
+        return None
+    if not next_us_business_date:
+        next_us_business_date = _next_us_business_day(trade_date, [])
+    try:
+        publish_at = datetime.combine(
+            datetime.strptime(next_us_business_date, '%Y-%m-%d').date(),
+            datetime.min.time().replace(
+                hour=US_CREDIT_SPREAD_AVAILABLE_HOUR,
+                minute=US_CREDIT_SPREAD_AVAILABLE_MINUTE,
+            ),
+            tzinfo=SHANGHAI_TIMEZONE,
+        )
+    except (TypeError, ValueError):
+        return None
+    return publish_at.isoformat(timespec='seconds')
+
+
+def attach_us_credit_spread_available_at(rows):
+    sorted_dates = sorted(
+        {row['trade_date'] for row in rows if row.get('trade_date')}
+    )
+    return [
+        {
+            **row,
+            'available_at': us_credit_spread_available_at(
+                row['trade_date'],
+                _next_us_business_day(row['trade_date'], sorted_dates),
+            ),
+        }
+        for row in rows
+        if row.get('trade_date')
+    ]
+
+
 def build_us_credit_spread_rows(csv_text):
     points = build_fred_series_points(csv_text, FRED_HIGH_YIELD_OAS_SERIES)
-    return [
+    rows = [
         {
             'trade_date': trade_date,
             'high_yield_oas': value,
@@ -1207,6 +1280,7 @@ def build_us_credit_spread_rows(csv_text):
         for trade_date, value in sorted(points.items())
         if value is not None
     ]
+    return attach_us_credit_spread_available_at(rows)
 
 
 def build_us_fear_greed_rows_from_mirror(csv_text):
