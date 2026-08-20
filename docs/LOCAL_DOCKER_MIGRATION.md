@@ -30,29 +30,6 @@ conda activate akshareProkect
 python -m playwright install chromium
 ```
 
-## Windows 到 Mac 一次性切换
-
-1. 停止 Windows 端所有写库程序：采集、AK scheduler、stock temp service、FIT、Celery、定时任务。
-2. 确认 Mac 可以访问 Windows MySQL：`192.168.1.16:3306`。
-3. 在 akshareProkect 执行：
-
-```bash
-REMOTE_DB_PASSWORD=... python scripts/db_sync.py windows-to-mac --confirm
-REMOTE_DB_PASSWORD=... python scripts/db_compare.py
-```
-
-脚本会先备份 Mac 目标库，再覆盖恢复 `stock_info`。
-
-## Mac 到 Windows 手动备份
-
-Mac 成为主端后，如果需要把本机库备份到 Windows 备用库，手动执行：
-
-```bash
-REMOTE_DB_PASSWORD=... python scripts/db_sync.py mac-to-windows --confirm
-```
-
-这个命令不会被 launchd、cron 或 Celery beat 自动调用。
-
 ## 正式机（Mac）启动
 
 在 akshareProkect：
