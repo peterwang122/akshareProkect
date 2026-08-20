@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import pytest
 
 from akshare_project.collectors import index, quant_index
+from akshare_project.services import stock_temp_service
 
 
 def _us_dates(count):
@@ -255,3 +256,11 @@ def test_build_risk_strategy_map_rate_mode_and_top1_removed():
     observations = payload["yellow"]["observations"]["turnover_concentration"]["components"]
     assert len(observations) == 1
     assert observations[0]["label"] == "A股成交额前5%集中度MA5"
+
+
+def test_quant_index_repair_previous_route_key_matches_cli():
+    routes = stock_temp_service.build_daily_routes()
+    route = routes["/collect-quant-index-repair-market-previous"]
+    assert route.task_name == "quant_index_repair_market_previous"
+    # CLI 入口 key 与路由 task_name 保持一致（issue #14 collector_key 统一要求）
+    assert "quant_index_repair_market_previous" == route.task_name
