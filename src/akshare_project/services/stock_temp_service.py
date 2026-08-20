@@ -486,6 +486,12 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
 
 DAILY_ROUTES = build_daily_routes()
 
+# 旧路由对应的稳定采集键，必须与 FIT 侧 collector_key 完全一致。
+LEGACY_ROUTE_COLLECTOR_KEYS = {
+    "/collect": "stock_hfq_single",
+    "/collect-forex": "forex_collect",
+}
+
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -650,12 +656,14 @@ class StockTempHandler(BaseHTTPRequestHandler):
             return
 
         if normalized_path == "/collect":
-            if not runtime_config.is_collector_allowed("stock_hfq_temp"):
-                self._send_json(403, build_denied_payload("stock_hfq_temp"))
+            collector_key = LEGACY_ROUTE_COLLECTOR_KEYS[normalized_path]
+            if not runtime_config.is_collector_allowed(collector_key):
+                self._send_json(403, build_denied_payload(collector_key))
                 return
         elif normalized_path == "/collect-forex":
-            if not runtime_config.is_collector_allowed("forex_collect"):
-                self._send_json(403, build_denied_payload("forex_collect"))
+            collector_key = LEGACY_ROUTE_COLLECTOR_KEYS[normalized_path]
+            if not runtime_config.is_collector_allowed(collector_key):
+                self._send_json(403, build_denied_payload(collector_key))
                 return
 
         payload = self._read_json_payload()

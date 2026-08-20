@@ -77,6 +77,17 @@ def test_cli_collector_key_mapping():
     assert runtime_config.collector_key_for_cli("stock", "daily") == "stock_daily"
     assert runtime_config.collector_key_for_cli("index", "backfill") == "index_cn_backfill"
     assert runtime_config.collector_key_for_cli("index", "daily") == "index_cn_daily"
+    assert runtime_config.collector_key_for_cli("douyin", "daily") == "douyin_coze_emotion_daily"
+    assert runtime_config.collector_key_for_cli("global-risk", "daily-tech") == (
+        "csi_tech_concentration_daily"
+    )
+    assert runtime_config.collector_key_for_cli("global-risk", "daily-concentration") == (
+        "a_share_turnover_concentration_daily"
+    )
+    assert runtime_config.collector_key_for_cli(
+        "index",
+        "daily-cn-market-fear-greed",
+    ) == "index_cn_market_fear_greed_daily"
     assert runtime_config.collector_key_for_cli("option-minute", "daily") == "option_minute_daily"
     assert runtime_config.collector_key_for_cli("exchange-option", "repair-backfill") == (
         "exchange_option_repair_backfill"
@@ -208,7 +219,7 @@ def test_http_legacy_collect_denied_before_network(monkeypatch):
     assert response.status_code == 403
     payload = response.json()
     assert payload["status"] == "DENIED"
-    assert payload["task_name"] == "stock_hfq_temp"
+    assert payload["task_name"] == "stock_hfq_single"
 
 
 def test_http_legacy_forex_denied_before_network(monkeypatch):
@@ -244,7 +255,7 @@ def test_http_daily_route_denied_before_network(monkeypatch):
 
 
 def test_http_legacy_collect_allowed_when_allowlisted(monkeypatch):
-    _set_lan_test_env(monkeypatch, allowed_collectors="stock_hfq_temp")
+    _set_lan_test_env(monkeypatch, allowed_collectors="stock_hfq_single")
 
     async def _fake_collect(**kwargs):
         return {"status": "SUCCESS", "stock_code": kwargs.get("stock_code")}
@@ -255,6 +266,88 @@ def test_http_legacy_collect_allowed_when_allowlisted(monkeypatch):
     payload = response.json()
     assert payload["status"] == "SUCCESS"
     assert payload["stock_code"] == "600000"
+
+
+def test_legacy_route_keys_match_fit_collector_keys():
+    assert stock_temp_service.LEGACY_ROUTE_COLLECTOR_KEYS == {
+        "/collect": "stock_hfq_single",
+        "/collect-forex": "forex_collect",
+    }
+
+
+def test_runner_composite_keys_forbidden_in_lan_test(monkeypatch):
+    _set_lan_test_env(
+        monkeypatch,
+        allowed_collectors="runner_daily,runner_retry_failures",
+    )
+    assert runtime_config.is_collector_allowed("runner_daily") is False
+    assert runtime_config.is_collector_allowed("runner_retry_failures") is False
+    # 白名单里即便写了 runner 项，也不能把整个复合入口当单采集器放行
+    assert runtime_config.get_allowed_collectors() == {
+        "runner_daily",
+        "runner_retry_failures",
+    }
+
+
+@pytest.mark.parametrize(
+    "domain,command,route_path",
+    [
+        ("stock", "daily", "/collect-stock-daily"),
+        ("index", "daily", "/collect-index-cn-daily"),
+        ("index", "daily-qvix", "/collect-index-qvix-daily"),
+        ("index", "daily-news-sentiment", "/collect-index-news-sentiment-daily"),
+        ("index", "daily-csi-dividend", "/collect-index-csi-dividend-daily"),
+        (
+            "index",
+            "daily-cn-market-fear-greed",
+            "/collect-index-cn-market-fear-greed-daily",
+        ),
+        (
+            "index",
+            "daily-cn-baifenwei-fear-greed",
+            "/collect-index-cn-baifenwei-fear-greed-daily",
+        ),
+        ("index", "daily-us-vix", "/collect-index-us-vix-daily"),
+        ("index", "daily-us-fear-greed", "/collect-index-us-fear-greed-daily"),
+        ("index", "daily-us-hedge-proxy", "/collect-index-us-hedge-proxy-daily"),
+        ("douyin", "daily", "/collect-douyin-coze-emotion-daily"),
+        ("quant-index", "daily", "/collect-quant-index-daily"),
+        ("cffex", "daily", "/collect-cffex-daily"),
+        ("forex", "daily", "/collect-forex-daily"),
+        ("forex", "usd-daily", "/collect-usd-index-daily"),
+        ("futures", "daily", "/collect-futures-daily"),
+        ("futures", "daily-us-index", "/collect-us-index-futures-daily"),
+        (
+            "futures",
+            "daily-us-index-official",
+            "/collect-us-index-futures-official-daily",
+        ),
+        ("futures", "daily-hk-index", "/collect-hk-index-futures-daily"),
+        ("etf", "daily", "/collect-etf-daily"),
+        ("option", "daily", "/collect-option-daily"),
+        ("exchange-option", "daily", "/collect-exchange-option-daily"),
+        ("exchange-option", "stats-daily", "/collect-exchange-option-stats-daily"),
+        ("option-minute", "daily", "/collect-option-minute-daily"),
+        ("risk-free-rate", "daily", "/collect-cn-risk-free-rate-daily"),
+        ("macro", "daily", "/collect-cn-macro-daily"),
+        ("margin-trading", "daily", "/collect-margin-trading-daily"),
+        ("fund-purchase-limit", "daily", "/collect-fund-purchase-limit-daily"),
+        ("global-risk", "daily", "/collect-global-risk-daily"),
+        ("global-risk", "daily-tech", "/collect-csi-tech-concentration-daily"),
+        (
+            "global-risk",
+            "daily-concentration",
+            "/collect-a-share-turnover-concentration-daily",
+        ),
+        ("emotion-excel", "import", "/import-emotion-excel"),
+    ],
+)
+def test_cli_key_matches_http_route_key(domain, command, route_path):
+    routes = stock_temp_service.build_daily_routes()
+    assert route_path in routes, f"missing route {route_path}"
+    assert runtime_config.collector_key_for_cli(domain, command) == (
+        routes[route_path].task_name
+    )
 
 
 def test_health_payload_includes_runtime_fields_without_secrets(monkeypatch):

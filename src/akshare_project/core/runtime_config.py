@@ -16,6 +16,7 @@ import os
 
 LAN_TEST_PROFILE = "lan-test"
 LAN_TEST_DB_NAME = "stock_info_test"
+LAN_TEST_FORBIDDEN_COLLECTOR_KEYS = {"runner_daily", "runner_retry_failures"}
 
 
 def _first_env(names: tuple[str, ...]) -> str | None:
@@ -47,9 +48,12 @@ def is_lan_test() -> bool:
 
 def is_collector_allowed(collector_key: str) -> bool:
     """allowlist 模式下只放行白名单内的采集键；其他模式一律放行。"""
+    key = str(collector_key or "").strip().lower()
+    if is_lan_test() and key in LAN_TEST_FORBIDDEN_COLLECTOR_KEYS:
+        # 复合入口会一次执行多个未单独获准的采集器，lan-test 下直接禁止。
+        return False
     if get_collection_execution_mode() != "allowlist":
         return True
-    key = str(collector_key or "").strip().lower()
     if not key:
         return False
     return key in get_allowed_collectors()
@@ -85,6 +89,7 @@ CLI_COLLECTOR_KEY_ALIASES = {
     ("stock", "repair-backfill"): "stock_repair_backfill",
     ("stock", "repair-daily-dates"): "stock_repair_daily_dates",
     ("stock", "repair-hist-metrics"): "stock_repair_hist_metrics",
+    ("douyin", "daily"): "douyin_coze_emotion_daily",
     ("index", "daily"): "index_cn_daily",
     ("index", "backfill"): "index_cn_backfill",
     ("index", "backfill-bj899050"): "index_bj50_backfill",
@@ -94,6 +99,9 @@ CLI_COLLECTOR_KEY_ALIASES = {
     ("index", "daily-qvix"): "index_qvix_daily",
     ("index", "backfill-news-sentiment"): "index_news_sentiment_backfill",
     ("index", "daily-news-sentiment"): "index_news_sentiment_daily",
+    ("index", "daily-csi-dividend"): "index_csi_dividend_daily",
+    ("index", "daily-cn-market-fear-greed"): "index_cn_market_fear_greed_daily",
+    ("index", "daily-cn-baifenwei-fear-greed"): "index_cn_baifenwei_fear_greed_daily",
     ("index", "backfill-us-vix"): "index_us_vix_backfill",
     ("index", "daily-us-vix"): "index_us_vix_daily",
     ("index", "backfill-us-fear-greed"): "index_us_fear_greed_backfill",
@@ -140,6 +148,7 @@ CLI_COLLECTOR_KEY_ALIASES = {
     ("option-minute", "daily"): "option_minute_daily",
     ("option-minute", "backfill"): "option_minute_backfill",
     ("exchange-option", "daily"): "exchange_option_daily",
+    ("exchange-option", "stats-daily"): "exchange_option_stats_daily",
     ("exchange-option", "backfill"): "exchange_option_backfill",
     ("exchange-option", "repair-backfill"): "exchange_option_repair_backfill",
     ("risk-free-rate", "daily"): "cn_risk_free_rate_daily",
@@ -151,6 +160,8 @@ CLI_COLLECTOR_KEY_ALIASES = {
     ("fund-purchase-limit", "daily"): "fund_purchase_limit_daily",
     ("fund-purchase-limit", "backfill"): "fund_purchase_limit_backfill",
     ("global-risk", "daily"): "global_risk_daily",
+    ("global-risk", "daily-tech"): "csi_tech_concentration_daily",
+    ("global-risk", "daily-concentration"): "a_share_turnover_concentration_daily",
     ("global-risk", "backfill"): "global_risk_backfill",
     ("runner", "daily"): "runner_daily",
     ("runner", "retry-failures"): "runner_retry_failures",
