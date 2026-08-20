@@ -21,6 +21,11 @@
   - `python ak_scheduler_service.py serve`
   - `python stock_temp_service.py serve`
 
+
+## 协作规范
+
+本仓库采用与 FIT 一致的“Sol 出方案和审核、DeepSeek 按 Issue 实现并提交 Draft PR”异机编码工作流。开发前阅读根目录 `AGENTS.md` 与 `docs/REMOTE_CODING_AND_PR_WORKFLOW.md`（完整流程见 FIT 仓库同名文档）。Windows 开发机只做代码编辑、分支、Mock/单元测试和静态检查，不启动采集服务、不连接生产资源、不执行真实采集。
+
 ## 运行前准备
 
 ### 1. 安装依赖

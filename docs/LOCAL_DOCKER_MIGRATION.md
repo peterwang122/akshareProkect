@@ -1,4 +1,5 @@
 # 本机 Docker MySQL 迁移说明
+本迁移与启动说明针对正式机（Mac）执行；Windows 开发机只做代码编辑、分支、Mock/单元测试和静态检查，不启动任何服务、不连接生产资源。
 
 ## 目标结构
 
@@ -29,30 +30,7 @@ conda activate akshareProkect
 python -m playwright install chromium
 ```
 
-## Windows 到 Mac 一次性切换
-
-1. 停止 Windows 端所有写库程序：采集、AK scheduler、stock temp service、FIT、Celery、定时任务。
-2. 确认 Mac 可以访问 Windows MySQL：`192.168.1.16:3306`。
-3. 在 akshareProkect 执行：
-
-```bash
-REMOTE_DB_PASSWORD=... python scripts/db_sync.py windows-to-mac --confirm
-REMOTE_DB_PASSWORD=... python scripts/db_compare.py
-```
-
-脚本会先备份 Mac 目标库，再覆盖恢复 `stock_info`。
-
-## Mac 到 Windows 手动备份
-
-Mac 成为主端后，如果需要把本机库备份到 Windows 备用库，手动执行：
-
-```bash
-REMOTE_DB_PASSWORD=... python scripts/db_sync.py mac-to-windows --confirm
-```
-
-这个命令不会被 launchd、cron 或 Celery beat 自动调用。
-
-## 本机启动
+## 正式机（Mac）启动
 
 在 akshareProkect：
 
