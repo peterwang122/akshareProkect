@@ -1,5 +1,4 @@
 import asyncio
-import fcntl
 import json
 import os
 import re
@@ -15,6 +14,16 @@ import cv2
 import numpy as np
 from playwright.async_api import async_playwright
 from rapidocr_onnxruntime import RapidOCR
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 from akshare_project.collectors import quant_index
 from akshare_project.core.logging_utils import echo_and_log, get_logger
@@ -724,14 +733,32 @@ def has_douyin_session_cookie(cookies):
 def single_instance_lock():
     lock_file = open(LOCK_PATH, "a+", encoding="utf-8")
     try:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("抖音情绪采集已有实例正在运行") from exc
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("抖音情绪采集已有实例正在运行") from exc
+        else:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write("\x00")
+                lock_file.flush()
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError("抖音情绪采集已有实例正在运行") from exc
         yield
     finally:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
         finally:
             lock_file.close()
 

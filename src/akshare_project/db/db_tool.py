@@ -514,8 +514,10 @@ class DbTools:
         sanitized['yield_3m'] = self._normalize_numeric('yield_3m', row.get('yield_3m'))
         sanitized['yield_2y'] = self._normalize_numeric('yield_2y', row.get('yield_2y'))
         sanitized['yield_10y'] = self._normalize_numeric('yield_10y', row.get('yield_10y'))
+        sanitized['yield_real_10y'] = self._normalize_numeric('yield_real_10y', row.get('yield_real_10y'))
         sanitized['spread_10y_2y'] = self._normalize_numeric('spread_10y_2y', row.get('spread_10y_2y'))
         sanitized['spread_10y_3m'] = self._normalize_numeric('spread_10y_3m', row.get('spread_10y_3m'))
+        sanitized['available_at'] = str(row.get('available_at') or '').strip() or None
         sanitized['data_source'] = str(row.get('data_source', 'fred_public_csv')).strip() or 'fred_public_csv'
         return sanitized
 
@@ -5212,8 +5214,10 @@ class DbTools:
               yield_3m DECIMAL(10, 4) NULL COMMENT 'US Treasury 3 month yield',
               yield_2y DECIMAL(10, 4) NULL COMMENT 'US Treasury 2 year yield',
               yield_10y DECIMAL(10, 4) NULL COMMENT 'US Treasury 10 year yield',
+              yield_real_10y DECIMAL(10, 4) NULL COMMENT 'US Treasury 10 year real yield (DFII10)',
               spread_10y_2y DECIMAL(10, 4) NULL COMMENT '10Y minus 2Y spread',
               spread_10y_3m DECIMAL(10, 4) NULL COMMENT '10Y minus 3M spread',
+              available_at DATETIME NULL COMMENT 'Publicly available time (Asia/Shanghai)',
               data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -5319,16 +5323,20 @@ class DbTools:
                     yield_3m,
                     yield_2y,
                     yield_10y,
+                    yield_real_10y,
                     spread_10y_2y,
                     spread_10y_3m,
+                    available_at,
                     data_source
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    yield_3m = VALUES(yield_3m),
-                    yield_2y = VALUES(yield_2y),
-                    yield_10y = VALUES(yield_10y),
-                    spread_10y_2y = VALUES(spread_10y_2y),
-                    spread_10y_3m = VALUES(spread_10y_3m),
+                    yield_3m = COALESCE(VALUES(yield_3m), yield_3m),
+                    yield_2y = COALESCE(VALUES(yield_2y), yield_2y),
+                    yield_10y = COALESCE(VALUES(yield_10y), yield_10y),
+                    yield_real_10y = COALESCE(VALUES(yield_real_10y), yield_real_10y),
+                    spread_10y_2y = COALESCE(VALUES(spread_10y_2y), spread_10y_2y),
+                    spread_10y_3m = COALESCE(VALUES(spread_10y_3m), spread_10y_3m),
+                    available_at = COALESCE(VALUES(available_at), available_at),
                     data_source = VALUES(data_source),
                     updated_at = CURRENT_TIMESTAMP
                 """
@@ -5338,8 +5346,10 @@ class DbTools:
                         row['yield_3m'],
                         row['yield_2y'],
                         row['yield_10y'],
+                        row['yield_real_10y'],
                         row['spread_10y_2y'],
                         row['spread_10y_3m'],
+                        row['available_at'],
                         row['data_source'],
                     )
                     for row in sanitized_rows
@@ -6503,6 +6513,28 @@ class DbTools:
         FROM index_us_credit_spread_daily
         WHERE trade_date BETWEEN %s AND %s
           AND high_yield_oas IS NOT NULL
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_us_treasury_rows(self, start_date, end_date):
+        await self.ensure_index_us_macro_auxiliary_tables()
+        query = """
+        SELECT
+          trade_date,
+          yield_3m,
+          yield_2y,
+          yield_10y,
+          yield_real_10y,
+          spread_10y_2y,
+          spread_10y_3m,
+          available_at,
+          data_source
+        FROM index_us_treasury_yield_daily
+        WHERE trade_date BETWEEN %s AND %s
         ORDER BY trade_date ASC
         """
         async with self.pool.acquire() as conn:

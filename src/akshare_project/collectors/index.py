@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
@@ -83,8 +84,13 @@ FRED_TREASURY_SERIES = {
     'yield_3m': 'DGS3MO',
     'yield_2y': 'DGS2',
     'yield_10y': 'DGS10',
+    'yield_real_10y': 'DFII10',
 }
 FRED_HIGH_YIELD_OAS_SERIES = 'BAMLH0A0HYM2'
+US_TREASURY_AVAILABLE_TIMEZONE = ZoneInfo('America/Chicago')
+SHANGHAI_TIMEZONE = ZoneInfo('Asia/Shanghai')
+US_TREASURY_DAILY_AVAILABLE_HOUR = 16
+US_TREASURY_DAILY_SYNC_RECENT_DAYS = 10
 DEFAULT_HTTP_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -1123,20 +1129,71 @@ def build_us_treasury_yield_rows(series_maps):
         yield_3m = series_maps.get('yield_3m', {}).get(trade_date)
         yield_2y = series_maps.get('yield_2y', {}).get(trade_date)
         yield_10y = series_maps.get('yield_10y', {}).get(trade_date)
+        yield_real_10y = series_maps.get('yield_real_10y', {}).get(trade_date)
         spread_10y_2y = round(yield_10y - yield_2y, 4) if yield_10y is not None and yield_2y is not None else None
         spread_10y_3m = round(yield_10y - yield_3m, 4) if yield_10y is not None and yield_3m is not None else None
-        if yield_3m is None and yield_2y is None and yield_10y is None:
+        if all(value is None for value in (yield_3m, yield_2y, yield_10y, yield_real_10y)):
             continue
         rows.append({
             'trade_date': trade_date,
             'yield_3m': yield_3m,
             'yield_2y': yield_2y,
             'yield_10y': yield_10y,
+            'yield_real_10y': yield_real_10y,
             'spread_10y_2y': spread_10y_2y,
             'spread_10y_3m': spread_10y_3m,
             'data_source': US_TREASURY_YIELD_SOURCE,
         })
-    return rows
+    return attach_us_treasury_available_at(rows)
+
+
+def us_treasury_available_at(trade_date: str, next_us_business_date: str) -> str | None:
+    """观测日后的下一个美国工作日 16:00 America/Chicago，转换为 Asia/Shanghai。"""
+    if not trade_date:
+        return None
+    if not next_us_business_date:
+        next_us_business_date = _next_us_business_day(trade_date, [])
+    try:
+        publish_at = datetime.combine(
+            datetime.strptime(next_us_business_date, '%Y-%m-%d').date(),
+            datetime.min.time().replace(hour=US_TREASURY_DAILY_AVAILABLE_HOUR),
+            tzinfo=US_TREASURY_AVAILABLE_TIMEZONE,
+        )
+    except (TypeError, ValueError):
+        return None
+    return publish_at.astimezone(SHANGHAI_TIMEZONE).isoformat(timespec='seconds')
+
+
+def _next_us_business_day(trade_date: str, sorted_dates: list[str]) -> str | None:
+    for candidate in sorted_dates:
+        if candidate > trade_date:
+            return candidate
+    try:
+        cursor = datetime.strptime(trade_date, '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    cursor = cursor + timedelta(days=1)
+    while cursor.weekday() >= 5:
+        cursor = cursor + timedelta(days=1)
+    return cursor.isoformat()
+
+
+def attach_us_treasury_available_at(rows):
+    """为每行计算公开可用时间；最新一行的下一个工作日按工作日推算。"""
+    sorted_dates = sorted(
+        {row['trade_date'] for row in rows if row.get('trade_date')}
+    )
+    return [
+        {
+            **row,
+            'available_at': us_treasury_available_at(
+                row['trade_date'],
+                _next_us_business_day(row['trade_date'], sorted_dates),
+            ),
+        }
+        for row in rows
+        if row.get('trade_date')
+    ]
 
 
 def build_us_credit_spread_rows(csv_text):
@@ -2444,8 +2501,26 @@ async def sync_daily_us_treasury_yield(db_tools):
     if not rows:
         raise ValueError('No valid FRED US Treasury yield rows built.')
 
-    latest_row = rows[-1]
-    upserted = await db_tools.upsert_index_us_treasury_yield_daily([latest_row])
+    complete_rows = [
+        row
+        for row in rows
+        if (
+            row.get('yield_3m') is not None
+            and row.get('yield_2y') is not None
+            and row.get('yield_10y') is not None
+            and row.get('yield_real_10y') is not None
+        )
+    ]
+    if not complete_rows:
+        raise ValueError(
+            'No complete US Treasury row: DGS10 and DFII10 must both be non-null '
+            'on the latest common available trade date.'
+        )
+    latest_row = complete_rows[-1]
+    recent_rows = [
+        row for row in rows if row['trade_date'] <= latest_row['trade_date']
+    ][-US_TREASURY_DAILY_SYNC_RECENT_DAYS:]
+    upserted = await db_tools.upsert_index_us_treasury_yield_daily(recent_rows)
     print(
         'index us treasury yield daily finished, '
         f'index_us_treasury_yield_daily upserted: {upserted}, '
