@@ -6,11 +6,16 @@ import re
 import statistics
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import akshare as ak
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.db.db_tool import DbTools
 
 LOGGER = get_logger("quant_index")
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+_CN_TRADE_CALENDAR_CACHE = ()
 
 INDEX_NAME_ORDER = [
     "上证指数",
@@ -192,7 +197,7 @@ RISK_TARGET_INDEX_NAME = "中证1000"
 RISK_PERCENTILE_MAX_SAMPLES = 1260
 RISK_PERCENTILE_MIN_SAMPLES = 252
 RISK_LOOKBACK_CALENDAR_DAYS = 2200
-RISK_VERSION = "v2"
+RISK_VERSION = "v3"
 RISK_GLOBAL_ASSET_CODES = (
     "KOSPI",
     "SOX",
@@ -350,7 +355,7 @@ def build_change_values(values, periods, percent=False):
     return result
 
 
-def build_metric_points(dates, values, sources=None):
+def build_metric_points(dates, values, sources=None, available_ats=None):
     points = []
     for index, trade_date in enumerate(dates):
         value = to_float(values[index]) if index < len(values) else None
@@ -359,8 +364,32 @@ def build_metric_points(dates, values, sources=None):
             "value": value,
             "percentile": strict_prior_percentile(values, index),
             "data_source": sources[index] if sources and index < len(sources) else None,
+            "available_at": (
+                available_ats[index]
+                if available_ats and index < len(available_ats)
+                else None
+            ),
         })
     return points
+
+
+def load_cn_trade_calendar_dates():
+    """读取包含未来交易日的实际A股交易日历；调用失败时由上层降级为数据不完整。"""
+    global _CN_TRADE_CALENDAR_CACHE
+    today = datetime.now(SHANGHAI_TZ).date()
+    required_end = (today + timedelta(days=30)).isoformat()
+    if _CN_TRADE_CALENDAR_CACHE and _CN_TRADE_CALENDAR_CACHE[-1] >= required_end:
+        return list(_CN_TRADE_CALENDAR_CACHE)
+    frame = ak.tool_trade_date_hist_sina()
+    values = sorted({
+        normalize_date_text(value)
+        for value in frame.get("trade_date", [])
+        if normalize_date_text(value)
+    })
+    if not values:
+        raise RuntimeError("A股交易日历为空")
+    _CN_TRADE_CALENDAR_CACHE = tuple(values)
+    return values
 
 
 def align_metric_points_to_cn_dates(points, cn_trade_dates, max_stale_days=10):
@@ -389,12 +418,92 @@ def align_metric_points_to_cn_dates(points, cn_trade_dates, max_stale_days=10):
     return result
 
 
+def _parse_aware_datetime(value):
+    try:
+        parsed = datetime.fromisoformat(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+    return parsed
+
+
+def align_metric_points_to_cn_dates_by_available_at(
+    points,
+    cn_trade_dates,
+    cn_calendar_dates=None,
+    cutoff_time="09:20",
+    max_stale_days=10,
+):
+    """按“下一A股交易日 cutoff_time 前已公开”为每个A股风险日选择最新外盘点。"""
+    sorted_cn = sorted(
+        normalize_date_text(value)
+        for value in cn_trade_dates
+        if normalize_date_text(value)
+    )
+    calendar_dates = sorted({
+        normalize_date_text(value)
+        for value in (cn_calendar_dates or sorted_cn)
+        if normalize_date_text(value)
+    })
+    sorted_points = sorted(
+        [point for point in points if point.get("source_date")],
+        key=lambda point: point["source_date"],
+    )
+    result = {}
+    for trade_date in sorted_cn:
+        calendar_index = bisect.bisect_right(calendar_dates, trade_date)
+        next_cn = (
+            calendar_dates[calendar_index]
+            if calendar_index < len(calendar_dates)
+            else None
+        )
+        if next_cn is None:
+            continue
+        try:
+            hour_text, _, minute_text = str(cutoff_time).partition(":")
+            cutoff = datetime.combine(
+                datetime.strptime(next_cn, "%Y-%m-%d").date(),
+                datetime.min.time().replace(
+                    hour=int(hour_text),
+                    minute=int(minute_text or "0"),
+                ),
+                tzinfo=SHANGHAI_TZ,
+            )
+        except (TypeError, ValueError):
+            continue
+        eligible = []
+        for point in sorted_points:
+            source_date = point["source_date"]
+            if source_date >= next_cn:
+                continue
+            available_at = _parse_aware_datetime(point.get("available_at"))
+            if available_at is None:
+                if source_date >= trade_date:
+                    continue
+            elif available_at > cutoff:
+                continue
+            eligible.append(point)
+        if not eligible:
+            continue
+        latest = eligible[-1]
+        age = (
+            datetime.strptime(next_cn, "%Y-%m-%d").date()
+            - datetime.strptime(latest["source_date"], "%Y-%m-%d").date()
+        ).days
+        if age <= max_stale_days:
+            result[trade_date] = latest
+    return result
+
+
 def build_source_series(rows, value_key, predicate=None, default_source=None):
     deduped = {}
     for row in rows or []:
         if predicate and not predicate(row):
             continue
-        trade_date = normalize_date_text(row.get("trade_date"))
+        trade_date = normalize_date_text(
+            row.get("source_date") or row.get("trade_date")
+        )
         value = to_float(row.get(value_key))
         if not trade_date or value is None or not math.isfinite(value):
             continue
@@ -402,6 +511,7 @@ def build_source_series(rows, value_key, predicate=None, default_source=None):
             "source_date": trade_date,
             "value": value,
             "data_source": str(row.get("data_source") or default_source or "").strip(),
+            "available_at": str(row.get("available_at") or "").strip() or None,
         }
     return [deduped[key] for key in sorted(deduped)]
 
@@ -410,7 +520,22 @@ def transform_source_series(points, periods, percent=False):
     dates = [point["source_date"] for point in points]
     values = [point["value"] for point in points]
     sources = [point.get("data_source") for point in points]
-    return build_metric_points(dates, build_change_values(values, periods, percent=percent), sources)
+    available_ats = [point.get("available_at") for point in points]
+    return build_metric_points(
+        dates,
+        build_change_values(values, periods, percent=percent),
+        sources,
+        available_ats,
+    )
+
+
+def _latest_available_at(*values):
+    candidates = [
+        (parsed, str(value))
+        for value in values
+        if (parsed := _parse_aware_datetime(value)) is not None
+    ]
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def combine_ratio_series(numerator_points, denominator_points, periods=10):
@@ -427,7 +552,14 @@ def combine_ratio_series(numerator_points, denominator_points, periods=10):
         )
     changes = build_change_values(values, periods, percent=True)
     sources = ["blackrock_ishares_historical_nav" for _ in dates]
-    return build_metric_points(dates, changes, sources)
+    available_ats = [
+        _latest_available_at(
+            numerator[trade_date].get("available_at"),
+            denominator[trade_date].get("available_at"),
+        )
+        for trade_date in dates
+    ]
+    return build_metric_points(dates, changes, sources, available_ats)
 
 
 def risk_condition(
@@ -442,6 +574,8 @@ def risk_condition(
     label=None,
     unit=None,
     absolute_inclusive=True,
+    available_at=None,
+    level_value=None,
 ):
     numeric = to_float(value)
     rank = to_float(percentile)
@@ -458,6 +592,8 @@ def risk_condition(
             "matched": None,
             "data_date": data_date,
             "data_source": data_source,
+            "available_at": available_at,
+            "level_value": level_value,
             "missing_reason": (
                 "有效历史样本不足252个" if numeric is not None else "当日原始值缺失"
             ),
@@ -491,6 +627,8 @@ def risk_condition(
         "matched": matched,
         "data_date": data_date,
         "data_source": data_source,
+        "available_at": available_at,
+        "level_value": level_value,
         "missing_reason": None,
     }
 
@@ -2154,6 +2292,119 @@ def _metric_lookup(points):
     return {point["source_date"]: point for point in points if point.get("source_date")}
 
 
+def _treasury_series_with_available_at(rows, value_key):
+    points = build_source_series(rows, value_key, default_source="fred_public_csv")
+    available_by_date = {
+        normalize_date_text(row.get("trade_date")): str(row.get("available_at") or "") or None
+        for row in rows or []
+        if normalize_date_text(row.get("trade_date"))
+    }
+    return [
+        {**point, "available_at": available_by_date.get(point["source_date"])}
+        for point in points
+    ]
+
+
+def _attach_available_at(points, rows):
+    available_by_date = {
+        normalize_date_text(row.get("trade_date")): str(row.get("available_at") or "") or None
+        for row in rows or []
+        if normalize_date_text(row.get("trade_date"))
+    }
+    return [
+        {**point, "available_at": available_by_date.get(point["source_date"])}
+        for point in points
+    ]
+
+
+def build_usd_rate_shock_state(
+    nominal_point,
+    real_point,
+    sox_point,
+    relative_point,
+    nominal_level_value=None,
+    real_level_value=None,
+):
+    """美元利率冲击模式：名义/实际10年美债5D变化+百分位，加SOX或IXN/ACWI市场确认。"""
+    nominal_condition = risk_condition(
+        nominal_point.get("value"), nominal_point.get("percentile"), direction="high",
+        absolute_threshold=0.20, percentile_threshold=80.0,
+        data_date=nominal_point.get("source_date"), data_source=nominal_point.get("data_source"),
+        label="名义10年美债收益率5D变化", unit="百分点",
+        available_at=nominal_point.get("available_at"),
+        level_value=nominal_level_value,
+    )
+    real_condition = risk_condition(
+        real_point.get("value"), real_point.get("percentile"), direction="high",
+        absolute_threshold=0.15, percentile_threshold=80.0,
+        data_date=real_point.get("source_date"), data_source=real_point.get("data_source"),
+        label="实际10年美债收益率5D变化", unit="百分点",
+        available_at=real_point.get("available_at"),
+        level_value=real_level_value,
+    )
+    sox_market_condition = risk_condition(
+        sox_point.get("value"), sox_point.get("percentile"), direction="low",
+        absolute_threshold=-5.0,
+        data_date=sox_point.get("source_date"), data_source=sox_point.get("data_source"),
+        label="SOX 10D", unit="%",
+        available_at=sox_point.get("available_at"),
+    )
+    relative_market_condition = risk_condition(
+        relative_point.get("value"), relative_point.get("percentile"), direction="low",
+        absolute_threshold=-2.0,
+        data_date=relative_point.get("source_date"),
+        data_source=relative_point.get("data_source"),
+        label="IXN/ACWI相对收益10D", unit="%",
+        available_at=relative_point.get("available_at"),
+    )
+    sox_matched = sox_market_condition["matched"]
+    relative_matched = relative_market_condition["matched"]
+    if sox_matched is True or relative_matched is True:
+        market_matched = True
+        market_missing = None
+    elif sox_matched is False and relative_matched is False:
+        market_matched = False
+        market_missing = None
+    else:
+        market_matched = None
+        market_missing = "SOX 或 IXN/ACWI 相对收益存在缺失，市场确认不完整"
+    market_condition = {
+        "label": "市场确认（SOX 或 IXN/ACWI 相对收益）",
+        "value": None,
+        "unit": None,
+        "direction": "low",
+        "absolute_threshold": "-5% 或 -2%",
+        "percentile_threshold": None,
+        "matched": market_matched,
+        "data_date": max(filter(None, (
+            sox_market_condition.get("data_date"),
+            relative_market_condition.get("data_date"),
+        )), default=None),
+        "data_source": "+".join(filter(None, (
+            sox_market_condition.get("data_source"),
+            relative_market_condition.get("data_source"),
+        ))) or None,
+        "available_at": _latest_available_at(
+            sox_market_condition.get("available_at"),
+            relative_market_condition.get("available_at"),
+        ),
+        "missing_reason": market_missing,
+        "components": [sox_market_condition, relative_market_condition],
+    }
+    rate_core = [nominal_condition, real_condition, market_condition]
+    rate_complete = all(item["matched"] is not None for item in rate_core)
+    rate_count = sum(1 for item in rate_core if item["matched"])
+    rate_active = rate_count == 3 if rate_complete else None
+    rate_score = rate_count / 3.0 * 100.0 if rate_complete else None
+    return {
+        "complete": rate_complete,
+        "active": rate_active,
+        "score": rate_score,
+        "matched_condition_count": rate_count,
+        "components": rate_core,
+    }
+
+
 def _combined_metric_points(first_points, second_points, combine):
     first = _metric_lookup(first_points)
     second = _metric_lookup(second_points)
@@ -2171,7 +2422,14 @@ def _combined_metric_points(first_points, second_points, combine):
         "+".join(filter(None, (first[trade_date].get("data_source"), second[trade_date].get("data_source"))))
         for trade_date in dates
     ]
-    return build_metric_points(dates, values, sources)
+    available_ats = [
+        _latest_available_at(
+            first[trade_date].get("available_at"),
+            second[trade_date].get("available_at"),
+        )
+        for trade_date in dates
+    ]
+    return build_metric_points(dates, values, sources, available_ats)
 
 
 def _status_from_conditions(conditions):
@@ -2194,11 +2452,15 @@ def build_risk_strategy_map(
     hk_index_rows,
     us_vix_rows,
     us_credit_rows,
-    turnover_concentration_rows,
+    us_treasury_rows=None,
+    turnover_concentration_rows=None,
+    cn_calendar_dates=None,
     output_start_date=None,
     output_end_date=None,
 ):
     dates = sorted({normalize_date_text(value) for value in trade_dates if normalize_date_text(value)})
+    us_treasury_rows = us_treasury_rows or []
+    turnover_concentration_rows = turnover_concentration_rows or []
     output_start = normalize_date_text(output_start_date)
     output_end = normalize_date_text(output_end_date)
 
@@ -2247,11 +2509,6 @@ def build_risk_strategy_map(
         [to_float((concentration_by_date.get(day) or {}).get("top5_pct")) for day in dates],
         [str((concentration_by_date.get(day) or {}).get("top5_data_source") or "") for day in dates],
     ))
-    concentration_top1_points = _metric_lookup(build_metric_points(
-        dates,
-        [to_float((concentration_by_date.get(day) or {}).get("top1_pct")) for day in dates],
-        [str((concentration_by_date.get(day) or {}).get("top1_data_source") or "") for day in dates],
-    ))
     im_metrics = build_dominant_im_basis_metrics(dates, index_close_map, im_futures_rows)
 
     assets = {}
@@ -2299,8 +2556,23 @@ def build_risk_strategy_map(
     )
 
     vix_level = build_source_series(us_vix_rows, "close_value", default_source="cboe_vix_history")
-    credit_level = build_source_series(
-        us_credit_rows, "high_yield_oas", default_source="fred_public_csv"
+    credit_level = _attach_available_at(
+        build_source_series(
+            us_credit_rows,
+            "high_yield_oas",
+            default_source="fred_public_csv",
+        ),
+        us_credit_rows,
+    )
+    treasury_nominal = _treasury_series_with_available_at(us_treasury_rows, "yield_10y")
+    treasury_real = _treasury_series_with_available_at(us_treasury_rows, "yield_real_10y")
+    nominal_change_5d = _attach_available_at(
+        transform_source_series(treasury_nominal, 5),
+        us_treasury_rows,
+    )
+    real_change_5d = _attach_available_at(
+        transform_source_series(treasury_real, 5),
+        us_treasury_rows,
     )
     source_metrics["vix_level"] = build_metric_points(
         [point["source_date"] for point in vix_level],
@@ -2314,9 +2586,53 @@ def build_risk_strategy_map(
         [point.get("data_source") for point in credit_level],
     )
     source_metrics["hy_oas_change_5d"] = transform_source_series(credit_level, 5)
+    source_metrics["nominal_10y_change_5d"] = nominal_change_5d
+    source_metrics["real_10y_change_5d"] = real_change_5d
     aligned = {
         key: align_metric_points_to_cn_dates(points, dates)
         for key, points in source_metrics.items()
+    }
+    aligned_by_available = {
+        "nominal_10y_change_5d": align_metric_points_to_cn_dates_by_available_at(
+            source_metrics["nominal_10y_change_5d"],
+            dates,
+            cn_calendar_dates,
+        ),
+        "real_10y_change_5d": align_metric_points_to_cn_dates_by_available_at(
+            source_metrics["real_10y_change_5d"],
+            dates,
+            cn_calendar_dates,
+        ),
+        "nominal_10y_level": align_metric_points_to_cn_dates_by_available_at(
+            treasury_nominal,
+            dates,
+            cn_calendar_dates,
+        ),
+        "real_10y_level": align_metric_points_to_cn_dates_by_available_at(
+            treasury_real,
+            dates,
+            cn_calendar_dates,
+        ),
+        "sox_return_10d": align_metric_points_to_cn_dates_by_available_at(
+            source_metrics["sox_return_10d"],
+            dates,
+            cn_calendar_dates,
+        ),
+        "tech_relative_return_10d": align_metric_points_to_cn_dates_by_available_at(
+            source_metrics["tech_relative_return_10d"],
+            dates,
+            cn_calendar_dates,
+        ),
+        "hy_oas_level": align_metric_points_to_cn_dates_by_available_at(
+            _attach_available_at(source_metrics["hy_oas_level"], us_credit_rows),
+            dates,
+            cn_calendar_dates,
+        ),
+        "hy_oas_change_5d": align_metric_points_to_cn_dates_by_available_at(
+            _attach_available_at(source_metrics["hy_oas_change_5d"], us_credit_rows),
+            dates,
+            cn_calendar_dates,
+        ),
     }
 
     results = {}
@@ -2363,7 +2679,6 @@ def build_risk_strategy_map(
         yellow_active, yellow_score = _status_from_conditions(yellow_conditions)
         concentration_source = concentration_by_date.get(trade_date) or {}
         top5_point = concentration_top5_points.get(trade_date) or {}
-        top1_point = concentration_top1_points.get(trade_date) or {}
         concentration_observations = [
             risk_condition(
                 top5_point.get("value"), top5_point.get("percentile"),
@@ -2371,13 +2686,6 @@ def build_risk_strategy_map(
                 data_date=trade_date,
                 data_source=concentration_source.get("top5_data_source"),
                 label="A股成交额前5%集中度MA5", unit="%",
-            ),
-            risk_condition(
-                top1_point.get("value"), top1_point.get("percentile"),
-                direction="high", absolute_threshold=20.0, percentile_threshold=80.0,
-                data_date=trade_date,
-                data_source=concentration_source.get("top1_data_source"),
-                label="A股成交额前1%集中度MA5", unit="%",
             ),
         ]
 
@@ -2454,19 +2762,21 @@ def build_risk_strategy_map(
         ]
         vix_block, _vix_score = _status_from_conditions(vix_conditions)
 
-        hy_point = aligned["hy_oas_level"].get(trade_date) or {}
-        hy_change = aligned["hy_oas_change_5d"].get(trade_date) or {}
+        hy_point = aligned_by_available["hy_oas_level"].get(trade_date) or {}
+        hy_change = aligned_by_available["hy_oas_change_5d"].get(trade_date) or {}
         hy_conditions = [
             risk_condition(
                 hy_point.get("value"), None, direction="high", absolute_threshold=3.5,
                 data_date=hy_point.get("source_date"), data_source=hy_point.get("data_source"),
                 label="美国高收益债OAS", unit="%",
+                available_at=hy_point.get("available_at"),
             ),
             risk_condition(
                 hy_change.get("value"), hy_change.get("percentile"), direction="high",
                 absolute_threshold=0.4, percentile_threshold=80.0,
                 data_date=hy_change.get("source_date"), data_source=hy_change.get("data_source"),
                 label="HY OAS 5D扩大", unit="百分点",
+                available_at=hy_change.get("available_at"),
             ),
         ]
         hy_block, _hy_score = _status_from_conditions(hy_conditions)
@@ -2503,23 +2813,46 @@ def build_risk_strategy_map(
         tech_complete = tech_market_complete
         tech_active = tech_market_count >= 2 if tech_complete else None
 
-        if broad_active is True or tech_active is True:
+        nominal_point = aligned_by_available["nominal_10y_change_5d"].get(trade_date) or {}
+        real_point = aligned_by_available["real_10y_change_5d"].get(trade_date) or {}
+        nominal_level_point = aligned_by_available["nominal_10y_level"].get(trade_date) or {}
+        real_level_point = aligned_by_available["real_10y_level"].get(trade_date) or {}
+        sox_rate_point = aligned_by_available["sox_return_10d"].get(trade_date) or {}
+        relative_rate_point = (
+            aligned_by_available["tech_relative_return_10d"].get(trade_date) or {}
+        )
+        usd_rate_shock = build_usd_rate_shock_state(
+            nominal_point,
+            real_point,
+            sox_rate_point,
+            relative_rate_point,
+            nominal_level_value=nominal_level_point.get("value"),
+            real_level_value=real_level_point.get("value"),
+        )
+        rate_active = usd_rate_shock["active"]
+        rate_score = usd_rate_shock["score"]
+        rate_count = usd_rate_shock["matched_condition_count"]
+        rate_complete = usd_rate_shock["complete"]
+
+        if broad_active is True or tech_active is True or rate_active is True:
             global_active = True
-        elif broad_active is False and tech_active is False:
+        elif broad_active is False and tech_active is False and rate_active is False:
             global_active = False
         else:
             global_active = None
-        if broad_active and tech_active:
-            global_mode = "broad_risk_off+tech_deleveraging"
-        elif broad_active:
-            global_mode = "broad_risk_off"
-        elif tech_active:
-            global_mode = "tech_deleveraging"
-        else:
-            global_mode = None
+        active_modes = []
+        if broad_active:
+            active_modes.append("broad_risk_off")
+        if tech_active:
+            active_modes.append("tech_deleveraging")
+        if rate_active:
+            active_modes.append("usd_rate_shock")
+        global_mode = "+".join(active_modes) if active_modes else None
         broad_score = broad_count / 4.0 * 100.0 if broad_complete else None
         tech_score = tech_market_count / 3.0 * 100.0 if tech_complete else None
-        available_scores = [value for value in (broad_score, tech_score) if value is not None]
+        available_scores = [
+            value for value in (broad_score, tech_score, rate_score) if value is not None
+        ]
         global_score = max(available_scores) if available_scores else None
 
         payload = {
@@ -2574,6 +2907,7 @@ def build_risk_strategy_map(
                     "matched_market_count": tech_market_count,
                     "market_components": tech_market_conditions,
                 },
+                "usd_rate_shock": usd_rate_shock,
             },
         }
         results[trade_date] = {
@@ -3162,10 +3496,22 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         basis_delta_start_date,
         end_date,
     )
+    risk_treasury_rows = await db_tools.get_quant_index_risk_us_treasury_rows(
+        basis_delta_start_date,
+        end_date,
+    )
     turnover_concentration_rows = await db_tools.get_a_share_turnover_concentration_daily_rows(
         basis_delta_start_date,
         end_date,
     )
+    try:
+        risk_cn_calendar_dates = await asyncio.to_thread(load_cn_trade_calendar_dates)
+    except Exception as exc:
+        risk_cn_calendar_dates = cn_basis_delta_trade_dates
+        LOGGER.warning(
+            "A股交易日历读取失败，最新风险日外盘条件将保持数据不完整: %s",
+            exc,
+        )
     risk_strategy_map = build_risk_strategy_map(
         trade_dates=cn_basis_delta_trade_dates,
         index_close_map=cn_index_close_map,
@@ -3178,7 +3524,9 @@ async def compute_and_upsert_range(db_tools, start_date, end_date):
         hk_index_rows=risk_hk_index_rows,
         us_vix_rows=risk_vix_rows,
         us_credit_rows=risk_credit_rows,
+        us_treasury_rows=risk_treasury_rows,
         turnover_concentration_rows=turnover_concentration_rows,
+        cn_calendar_dates=risk_cn_calendar_dates,
         output_start_date=start_date,
         output_end_date=end_date,
     )

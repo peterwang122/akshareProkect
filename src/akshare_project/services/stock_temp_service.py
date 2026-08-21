@@ -198,6 +198,18 @@ async def run_hk_index_futures_handler(target_date=None):
     return result
 
 
+async def run_quant_index_repair_market_previous():
+    previous_trade_date = await quant_index.resolve_market_previous_trade_date("cn")
+    if not previous_trade_date:
+        raise RuntimeError("no previous cn trade date found for quant index repair")
+    affected = await quant_index.repair_market_previous_trade_day("cn")
+    return {
+        "status": "SUCCESS",
+        "previous_cn_trade_date": previous_trade_date,
+        "affected": affected,
+    }
+
+
 async def run_handler_for_previous_trade_day(handler, market: str):
     previous_trade_date = await quant_index.resolve_market_previous_trade_date(market)
     if not previous_trade_date:
@@ -397,6 +409,11 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             task_name="quant_index_daily",
             handler=quant_index.sync_daily,
             direct_network=True,
+        ),
+        "/collect-quant-index-repair-market-previous": DailyRoute(
+            path="/collect-quant-index-repair-market-previous",
+            task_name="quant_index_repair_market_previous",
+            handler=run_quant_index_repair_market_previous,
         ),
         "/collect-index-qvix-daily": DailyRoute(
             path="/collect-index-qvix-daily",

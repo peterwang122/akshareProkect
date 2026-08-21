@@ -6,9 +6,12 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 import requests
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
@@ -83,8 +86,15 @@ FRED_TREASURY_SERIES = {
     'yield_3m': 'DGS3MO',
     'yield_2y': 'DGS2',
     'yield_10y': 'DGS10',
+    'yield_real_10y': 'DFII10',
 }
 FRED_HIGH_YIELD_OAS_SERIES = 'BAMLH0A0HYM2'
+US_TREASURY_AVAILABLE_TIMEZONE = ZoneInfo('America/Chicago')
+SHANGHAI_TIMEZONE = ZoneInfo('Asia/Shanghai')
+US_TREASURY_DAILY_AVAILABLE_HOUR = 16
+US_TREASURY_DAILY_SYNC_RECENT_DAYS = 10
+US_CREDIT_SPREAD_AVAILABLE_HOUR = 0
+US_CREDIT_SPREAD_AVAILABLE_MINUTE = 45
 DEFAULT_HTTP_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -1123,25 +1133,117 @@ def build_us_treasury_yield_rows(series_maps):
         yield_3m = series_maps.get('yield_3m', {}).get(trade_date)
         yield_2y = series_maps.get('yield_2y', {}).get(trade_date)
         yield_10y = series_maps.get('yield_10y', {}).get(trade_date)
+        yield_real_10y = series_maps.get('yield_real_10y', {}).get(trade_date)
         spread_10y_2y = round(yield_10y - yield_2y, 4) if yield_10y is not None and yield_2y is not None else None
         spread_10y_3m = round(yield_10y - yield_3m, 4) if yield_10y is not None and yield_3m is not None else None
-        if yield_3m is None and yield_2y is None and yield_10y is None:
+        if all(value is None for value in (yield_3m, yield_2y, yield_10y, yield_real_10y)):
             continue
         rows.append({
             'trade_date': trade_date,
             'yield_3m': yield_3m,
             'yield_2y': yield_2y,
             'yield_10y': yield_10y,
+            'yield_real_10y': yield_real_10y,
             'spread_10y_2y': spread_10y_2y,
             'spread_10y_3m': spread_10y_3m,
             'data_source': US_TREASURY_YIELD_SOURCE,
         })
-    return rows
+    return attach_us_treasury_available_at(rows)
+
+
+def us_treasury_available_at(trade_date: str, next_us_business_date: str) -> str | None:
+    """观测日后的下一个美国工作日 16:00 America/Chicago，转换为 Asia/Shanghai。"""
+    if not trade_date:
+        return None
+    if not next_us_business_date:
+        next_us_business_date = _next_us_business_day(trade_date, [])
+    try:
+        publish_at = datetime.combine(
+            datetime.strptime(next_us_business_date, '%Y-%m-%d').date(),
+            datetime.min.time().replace(hour=US_TREASURY_DAILY_AVAILABLE_HOUR),
+            tzinfo=US_TREASURY_AVAILABLE_TIMEZONE,
+        )
+    except (TypeError, ValueError):
+        return None
+    return publish_at.astimezone(SHANGHAI_TIMEZONE).isoformat(timespec='seconds')
+
+
+def _next_us_business_day(trade_date: str, _sorted_dates: list[str] | None = None) -> str | None:
+    try:
+        cursor = datetime.strptime(trade_date, '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    cursor = cursor + timedelta(days=1)
+    while cursor.weekday() >= 5 or cursor in _us_federal_holidays(cursor.year):
+        cursor = cursor + timedelta(days=1)
+    return cursor.isoformat()
+
+
+@lru_cache(maxsize=16)
+def _us_federal_holidays(year: int) -> set:
+    """完整美国联邦假日及观察日，包括跨年落在12月31日的元旦观察日。"""
+    calendar = USFederalHolidayCalendar()
+    return {
+        value.date()
+        for value in calendar.holidays(
+            start=f"{year}-01-01",
+            end=f"{year}-12-31",
+        )
+    }
+
+
+def attach_us_treasury_available_at(rows):
+    """按观测日后的真实美国联邦工作日计算公开可用时间。"""
+    return [
+        {
+            **row,
+            'available_at': us_treasury_available_at(
+                row['trade_date'],
+                _next_us_business_day(row['trade_date']),
+            ),
+        }
+        for row in rows
+        if row.get('trade_date')
+    ]
+
+
+def us_credit_spread_available_at(trade_date: str, next_us_business_date: str) -> str | None:
+    """HY OAS 公开可用时间：观测日后的下一个美国工作日 00:45 Asia/Shanghai。"""
+    if not trade_date:
+        return None
+    if not next_us_business_date:
+        next_us_business_date = _next_us_business_day(trade_date, [])
+    try:
+        publish_at = datetime.combine(
+            datetime.strptime(next_us_business_date, '%Y-%m-%d').date(),
+            datetime.min.time().replace(
+                hour=US_CREDIT_SPREAD_AVAILABLE_HOUR,
+                minute=US_CREDIT_SPREAD_AVAILABLE_MINUTE,
+            ),
+            tzinfo=SHANGHAI_TIMEZONE,
+        )
+    except (TypeError, ValueError):
+        return None
+    return publish_at.isoformat(timespec='seconds')
+
+
+def attach_us_credit_spread_available_at(rows):
+    return [
+        {
+            **row,
+            'available_at': us_credit_spread_available_at(
+                row['trade_date'],
+                _next_us_business_day(row['trade_date']),
+            ),
+        }
+        for row in rows
+        if row.get('trade_date')
+    ]
 
 
 def build_us_credit_spread_rows(csv_text):
     points = build_fred_series_points(csv_text, FRED_HIGH_YIELD_OAS_SERIES)
-    return [
+    rows = [
         {
             'trade_date': trade_date,
             'high_yield_oas': value,
@@ -1150,6 +1252,7 @@ def build_us_credit_spread_rows(csv_text):
         for trade_date, value in sorted(points.items())
         if value is not None
     ]
+    return attach_us_credit_spread_available_at(rows)
 
 
 def build_us_fear_greed_rows_from_mirror(csv_text):
@@ -2444,8 +2547,26 @@ async def sync_daily_us_treasury_yield(db_tools):
     if not rows:
         raise ValueError('No valid FRED US Treasury yield rows built.')
 
-    latest_row = rows[-1]
-    upserted = await db_tools.upsert_index_us_treasury_yield_daily([latest_row])
+    complete_rows = [
+        row
+        for row in rows
+        if (
+            row.get('yield_3m') is not None
+            and row.get('yield_2y') is not None
+            and row.get('yield_10y') is not None
+            and row.get('yield_real_10y') is not None
+        )
+    ]
+    if not complete_rows:
+        raise ValueError(
+            'No complete US Treasury row: DGS10 and DFII10 must both be non-null '
+            'on the latest common available trade date.'
+        )
+    latest_row = complete_rows[-1]
+    recent_rows = [
+        row for row in rows if row['trade_date'] <= latest_row['trade_date']
+    ][-US_TREASURY_DAILY_SYNC_RECENT_DAYS:]
+    upserted = await db_tools.upsert_index_us_treasury_yield_daily(recent_rows)
     print(
         'index us treasury yield daily finished, '
         f'index_us_treasury_yield_daily upserted: {upserted}, '
@@ -2459,6 +2580,25 @@ async def backfill_us_credit_spread(db_tools):
     rows = build_us_credit_spread_rows(csv_text)
     if not rows:
         raise ValueError('No valid FRED US high yield credit spread rows built.')
+
+    existing_rows = await db_tools.get_quant_index_risk_us_credit_rows(
+        '1900-01-01',
+        '2100-12-31',
+    )
+    legacy_rows = attach_us_credit_spread_available_at(
+        [
+            {
+                'trade_date': normalize_trade_date(row.get('trade_date')),
+                'high_yield_oas': row.get('high_yield_oas'),
+                'data_source': row.get('data_source') or US_CREDIT_SPREAD_SOURCE,
+            }
+            for row in existing_rows
+            if row.get('available_at') is None
+        ]
+    )
+    merged_rows = {row['trade_date']: row for row in legacy_rows}
+    merged_rows.update({row['trade_date']: row for row in rows})
+    rows = [merged_rows[trade_date] for trade_date in sorted(merged_rows)]
 
     upserted = await db_tools.upsert_index_us_credit_spread_daily(rows)
     print(

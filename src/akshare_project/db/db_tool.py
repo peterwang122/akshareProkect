@@ -2,6 +2,7 @@ import json
 import math
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 
 import aiomysql
 
@@ -199,6 +200,7 @@ class DbTools:
         self._cn_macro_tables_ready = False
         self._fund_purchase_limit_daily_table_ready = False
         self._margin_trading_daily_table_ready = False
+        self._index_us_macro_auxiliary_tables_ready = False
         self._global_risk_asset_daily_table_ready = False
         self._a_share_turnover_concentration_daily_table_ready = False
         self._quant_index_dashboard_option_pc_columns_ready = False
@@ -223,6 +225,19 @@ class DbTools:
             return None
 
         return num
+
+    @staticmethod
+    def _normalize_datetime_for_db(value):
+        text = str(value or '').strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return text
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+        return parsed
 
     def _sanitize_update(self, update):
         sanitized = dict(update)
@@ -514,8 +529,10 @@ class DbTools:
         sanitized['yield_3m'] = self._normalize_numeric('yield_3m', row.get('yield_3m'))
         sanitized['yield_2y'] = self._normalize_numeric('yield_2y', row.get('yield_2y'))
         sanitized['yield_10y'] = self._normalize_numeric('yield_10y', row.get('yield_10y'))
+        sanitized['yield_real_10y'] = self._normalize_numeric('yield_real_10y', row.get('yield_real_10y'))
         sanitized['spread_10y_2y'] = self._normalize_numeric('spread_10y_2y', row.get('spread_10y_2y'))
         sanitized['spread_10y_3m'] = self._normalize_numeric('spread_10y_3m', row.get('spread_10y_3m'))
+        sanitized['available_at'] = self._normalize_datetime_for_db(row.get('available_at'))
         sanitized['data_source'] = str(row.get('data_source', 'fred_public_csv')).strip() or 'fred_public_csv'
         return sanitized
 
@@ -524,6 +541,7 @@ class DbTools:
         trade_date = row.get('trade_date')
         sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
         sanitized['high_yield_oas'] = self._normalize_numeric('high_yield_oas', row.get('high_yield_oas'))
+        sanitized['available_at'] = self._normalize_datetime_for_db(row.get('available_at'))
         sanitized['data_source'] = str(row.get('data_source', 'fred_public_csv')).strip() or 'fred_public_csv'
         return sanitized
 
@@ -5186,6 +5204,8 @@ class DbTools:
                 }
 
     async def ensure_index_us_macro_auxiliary_tables(self):
+        if self._index_us_macro_auxiliary_tables_ready:
+            return
         if self.pool is None:
             await self.init_pool()
 
@@ -5212,8 +5232,10 @@ class DbTools:
               yield_3m DECIMAL(10, 4) NULL COMMENT 'US Treasury 3 month yield',
               yield_2y DECIMAL(10, 4) NULL COMMENT 'US Treasury 2 year yield',
               yield_10y DECIMAL(10, 4) NULL COMMENT 'US Treasury 10 year yield',
+              yield_real_10y DECIMAL(10, 4) NULL COMMENT 'US Treasury 10 year real yield (DFII10)',
               spread_10y_2y DECIMAL(10, 4) NULL COMMENT '10Y minus 2Y spread',
               spread_10y_3m DECIMAL(10, 4) NULL COMMENT '10Y minus 3M spread',
+              available_at DATETIME NULL COMMENT 'Publicly available time (Asia/Shanghai)',
               data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -5226,6 +5248,7 @@ class DbTools:
               id BIGINT PRIMARY KEY AUTO_INCREMENT,
               trade_date DATE NOT NULL COMMENT 'Trading date',
               high_yield_oas DECIMAL(10, 4) NULL COMMENT 'US high yield option-adjusted spread',
+              available_at DATETIME NULL COMMENT 'Publicly available time (Asia/Shanghai)',
               data_source VARCHAR(64) NOT NULL DEFAULT 'fred_public_csv' COMMENT 'Data source',
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -5239,7 +5262,49 @@ class DbTools:
             async with conn.cursor() as cursor:
                 for statement in statements:
                     await cursor.execute(statement)
+                await cursor.execute(
+                    """
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND (
+                        (table_name = 'index_us_treasury_yield_daily'
+                         AND column_name IN ('yield_real_10y', 'available_at'))
+                        OR
+                        (table_name = 'index_us_credit_spread_daily'
+                         AND column_name = 'available_at')
+                      )
+                    """
+                )
+                existing_columns = {}
+                for table_name, column_name in await cursor.fetchall():
+                    existing_columns.setdefault(str(table_name), set()).add(str(column_name))
+
+                migrations = {
+                    'index_us_treasury_yield_daily': {
+                        'yield_real_10y': (
+                            "ADD COLUMN yield_real_10y DECIMAL(10, 4) NULL "
+                            "COMMENT 'US Treasury 10 year real yield (DFII10)' AFTER yield_10y"
+                        ),
+                        'available_at': (
+                            "ADD COLUMN available_at DATETIME NULL "
+                            "COMMENT 'Publicly available time (Asia/Shanghai)' AFTER spread_10y_3m"
+                        ),
+                    },
+                    'index_us_credit_spread_daily': {
+                        'available_at': (
+                            "ADD COLUMN available_at DATETIME NULL "
+                            "COMMENT 'Publicly available time (Asia/Shanghai)' AFTER high_yield_oas"
+                        ),
+                    },
+                }
+                for table_name, definitions in migrations.items():
+                    known = existing_columns.get(table_name, set())
+                    for column_name, clause in definitions.items():
+                        if column_name not in known:
+                            await cursor.execute(f"ALTER TABLE {table_name} {clause}")
                 await conn.commit()
+        self._index_us_macro_auxiliary_tables_ready = True
 
     async def upsert_index_us_put_call_ratio_daily(self, rows):
         if not rows:
@@ -5319,16 +5384,20 @@ class DbTools:
                     yield_3m,
                     yield_2y,
                     yield_10y,
+                    yield_real_10y,
                     spread_10y_2y,
                     spread_10y_3m,
+                    available_at,
                     data_source
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    yield_3m = VALUES(yield_3m),
-                    yield_2y = VALUES(yield_2y),
-                    yield_10y = VALUES(yield_10y),
-                    spread_10y_2y = VALUES(spread_10y_2y),
-                    spread_10y_3m = VALUES(spread_10y_3m),
+                    yield_3m = COALESCE(VALUES(yield_3m), yield_3m),
+                    yield_2y = COALESCE(VALUES(yield_2y), yield_2y),
+                    yield_10y = COALESCE(VALUES(yield_10y), yield_10y),
+                    yield_real_10y = COALESCE(VALUES(yield_real_10y), yield_real_10y),
+                    spread_10y_2y = COALESCE(VALUES(spread_10y_2y), spread_10y_2y),
+                    spread_10y_3m = COALESCE(VALUES(spread_10y_3m), spread_10y_3m),
+                    available_at = COALESCE(VALUES(available_at), available_at),
                     data_source = VALUES(data_source),
                     updated_at = CURRENT_TIMESTAMP
                 """
@@ -5338,8 +5407,10 @@ class DbTools:
                         row['yield_3m'],
                         row['yield_2y'],
                         row['yield_10y'],
+                        row['yield_real_10y'],
                         row['spread_10y_2y'],
                         row['spread_10y_3m'],
+                        row['available_at'],
                         row['data_source'],
                     )
                     for row in sanitized_rows
@@ -5372,10 +5443,12 @@ class DbTools:
                 INSERT INTO index_us_credit_spread_daily (
                     trade_date,
                     high_yield_oas,
+                    available_at,
                     data_source
-                ) VALUES (%s, %s, %s)
+                ) VALUES (%s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    high_yield_oas = VALUES(high_yield_oas),
+                    high_yield_oas = COALESCE(VALUES(high_yield_oas), high_yield_oas),
+                    available_at = COALESCE(VALUES(available_at), available_at),
                     data_source = VALUES(data_source),
                     updated_at = CURRENT_TIMESTAMP
                 """
@@ -5383,6 +5456,7 @@ class DbTools:
                     (
                         row['trade_date'],
                         row['high_yield_oas'],
+                        row['available_at'],
                         row['data_source'],
                     )
                     for row in sanitized_rows
@@ -6499,10 +6573,32 @@ class DbTools:
     async def get_quant_index_risk_us_credit_rows(self, start_date, end_date):
         await self.ensure_index_us_macro_auxiliary_tables()
         query = """
-        SELECT trade_date, high_yield_oas, data_source
+        SELECT trade_date, high_yield_oas, available_at, data_source
         FROM index_us_credit_spread_daily
         WHERE trade_date BETWEEN %s AND %s
           AND high_yield_oas IS NOT NULL
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_us_treasury_rows(self, start_date, end_date):
+        await self.ensure_index_us_macro_auxiliary_tables()
+        query = """
+        SELECT
+          trade_date,
+          yield_3m,
+          yield_2y,
+          yield_10y,
+          yield_real_10y,
+          spread_10y_2y,
+          spread_10y_3m,
+          available_at,
+          data_source
+        FROM index_us_treasury_yield_daily
+        WHERE trade_date BETWEEN %s AND %s
         ORDER BY trade_date ASC
         """
         async with self.pool.acquire() as conn:
