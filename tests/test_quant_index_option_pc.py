@@ -6,6 +6,7 @@ from akshare_project.collectors.quant_index import (
     build_index_option_pc_map,
     build_option_flow_pc_payload_for_product,
     build_option_pc_payload_for_product,
+    build_us_etf_option_pc_map,
     interpolate_option_price,
     select_option_pc_contract_months,
     third_friday_of_contract_month,
@@ -46,6 +47,39 @@ def test_interpolation_uses_exact_strike_and_does_not_extrapolate():
     assert interpolate_option_price({8100: 23, 8200: 44}, 8200) == pytest.approx(44)
     assert interpolate_option_price({8100: 23, 8200: 44}, 8300) is None
     assert interpolate_option_price({8100: 23}, 8132) is None
+
+
+def test_us_etf_option_price_pc_uses_etf_close_and_keeps_products_separate():
+    rows = []
+    for index_name, symbol, underlying_close, put_base, call_base in (
+        ("标普500指数", "SPY", 505.0, 10.0, 20.0),
+        ("纳斯达克100指数", "QQQ", 405.0, 30.0, 15.0),
+    ):
+        for contract_month in ("2609", "2610", "2612", "2703"):
+            for option_type, lower_price, upper_price in (
+                ("PUT", put_base, put_base + 2.0),
+                ("CALL", call_base + 2.0, call_base),
+            ):
+                for strike_price, close_price in (
+                    (underlying_close - 5.0, lower_price),
+                    (underlying_close + 5.0, upper_price),
+                ):
+                    rows.append({
+                        "trade_date": "2026-08-28",
+                        "index_name": index_name,
+                        "underlying_code": symbol,
+                        "underlying_close": underlying_close,
+                        "contract_month": contract_month,
+                        "option_type": option_type,
+                        "strike_price": strike_price,
+                        "close_price": close_price,
+                    })
+
+    payloads = build_us_etf_option_pc_map(rows)
+
+    assert payloads[("2026-08-28", "标普500指数")]["option_pc_current_month"] == pytest.approx(11 / 21)
+    assert payloads[("2026-08-28", "纳斯达克100指数")]["option_pc_current_month"] == pytest.approx(31 / 16)
+    assert payloads[("2026-08-28", "标普500指数")]["option_pc_quarter_2_contract_month"] == "2703"
 
 
 def test_contract_month_selection_uses_current_next_and_two_quarters():

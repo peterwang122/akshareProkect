@@ -49,6 +49,17 @@ QUANT_INDEX_RISK_FIELDS = (
     "risk_global_shock",
     "risk_global_shock_score",
     "risk_global_shock_mode",
+    "risk_global_raw_leading",
+    "risk_global_raw_leading_mode",
+    "risk_global_leading",
+    "risk_global_leading_score",
+    "risk_global_leading_mode",
+    "risk_global_score",
+    "risk_as_of_at",
+    "risk_decision_trade_date",
+    "risk_overall_score",
+    "risk_base_state",
+    "risk_display_state",
     "risk_strategy_components_json",
 )
 QUANT_INDEX_TURNOVER_CONCENTRATION_FIELDS = (
@@ -129,6 +140,9 @@ class DbTools:
         'risk_yellow_vulnerability_score': 100.0,
         'risk_red_escalation_score': 100.0,
         'risk_global_shock_score': 100.0,
+        'risk_global_leading_score': 100.0,
+        'risk_global_score': 100.0,
+        'risk_overall_score': 100.0,
         'fund_purchase_limit_pct': 100.0,
         **{field: 9999999999999999999999.99 for field in QUANT_INDEX_MARGIN_TRADING_FIELDS},
         **{field: 99999999999999.99 for field in QUANT_INDEX_CFFEX_NET_SHORT_DELTA_FIELDS},
@@ -203,6 +217,7 @@ class DbTools:
         self._index_us_macro_auxiliary_tables_ready = False
         self._global_risk_asset_daily_table_ready = False
         self._a_share_turnover_concentration_daily_table_ready = False
+        self._cn_bank_liquidity_tables_ready = False
         self._quant_index_dashboard_option_pc_columns_ready = False
 
     def load_db_info(self):
@@ -522,6 +537,55 @@ class DbTools:
         sanitized['data_source'] = str(row.get('data_source', 'cboe_market_statistics')).strip() or 'cboe_market_statistics'
         return sanitized
 
+    def _sanitize_index_us_option_premium_row(self, row):
+        sanitized = dict(row)
+        trade_date = row.get('trade_date')
+        sanitized['trade_date'] = str(trade_date).split(' ')[0].strip() if trade_date else ''
+        for field in (
+            'total_premium_million_usd',
+            'call_premium_million_usd',
+            'put_premium_million_usd',
+            'premium_put_call_ratio',
+            'rounding_unit_million_usd',
+        ):
+            sanitized[field] = self._normalize_numeric(field, row.get(field))
+        sanitized['value_basis'] = (
+            str(row.get('value_basis', 'source_display_rounded_0.1m_usd')).strip()
+            or 'source_display_rounded_0.1m_usd'
+        )
+        sanitized['data_source'] = (
+            str(row.get('data_source', 'optionomics_public_pulse')).strip()
+            or 'optionomics_public_pulse'
+        )
+        sanitized['source_url'] = str(row.get('source_url', '')).strip() or None
+        sanitized['raw_json'] = self._serialize_json_field(row.get('raw_json'))
+        return sanitized
+
+    def _sanitize_index_us_etf_option_daily_row(self, row):
+        sanitized = dict(row)
+        for field in ('trade_date', 'expiration_date'):
+            raw_value = row.get(field)
+            sanitized[field] = str(raw_value).split(' ')[0].strip() if raw_value else ''
+        for field in ('index_code', 'index_name', 'underlying_code', 'underlying_name'):
+            sanitized[field] = str(row.get(field, '')).strip()
+        sanitized['underlying_code'] = sanitized['underlying_code'].upper()
+        sanitized['contract_code'] = str(row.get('contract_code', '')).strip().upper()
+        sanitized['contract_month'] = str(row.get('contract_month', '')).strip()
+        sanitized['option_type'] = str(row.get('option_type', '')).strip().upper()
+        for field in ('underlying_close', 'strike_price', 'close_price'):
+            sanitized[field] = self._normalize_numeric(field, row.get(field))
+        for field in ('volume', 'open_interest'):
+            numeric = self._normalize_numeric(field, row.get(field))
+            sanitized[field] = int(numeric) if numeric is not None and numeric >= 0 else None
+        sanitized['value_basis'] = (
+            str(row.get('value_basis', 'last_trade_with_positive_daily_volume')).strip()
+            or 'last_trade_with_positive_daily_volume'
+        )
+        sanitized['data_source'] = str(row.get('data_source', '')).strip()
+        sanitized['source_url'] = str(row.get('source_url', '')).strip() or None
+        sanitized['raw_json'] = self._serialize_json_field(row.get('raw_json'))
+        return sanitized
+
     def _sanitize_index_us_treasury_yield_row(self, row):
         sanitized = dict(row)
         trade_date = row.get('trade_date')
@@ -770,6 +834,8 @@ class DbTools:
             'risk_yellow_vulnerability',
             'risk_red_escalation',
             'risk_global_shock',
+            'risk_global_raw_leading',
+            'risk_global_leading',
         ):
             raw_value = row.get(field)
             sanitized[field] = None if raw_value is None else (1 if raw_value else 0)
@@ -777,6 +843,9 @@ class DbTools:
             'risk_yellow_vulnerability_score',
             'risk_red_escalation_score',
             'risk_global_shock_score',
+            'risk_global_leading_score',
+            'risk_global_score',
+            'risk_overall_score',
         ):
             value = self._normalize_numeric(field, row.get(field))
             sanitized[field] = (
@@ -790,6 +859,37 @@ class DbTools:
             if raw_mode is not None and str(raw_mode).strip()
             else None
         )
+        raw_global_leading_mode = row.get('risk_global_raw_leading_mode')
+        sanitized['risk_global_raw_leading_mode'] = (
+            str(raw_global_leading_mode).strip()[:64]
+            if raw_global_leading_mode is not None and str(raw_global_leading_mode).strip()
+            else None
+        )
+        raw_leading_mode = row.get('risk_global_leading_mode')
+        sanitized['risk_global_leading_mode'] = (
+            str(raw_leading_mode).strip()[:64]
+            if raw_leading_mode is not None and str(raw_leading_mode).strip()
+            else None
+        )
+        raw_as_of_at = row.get('risk_as_of_at')
+        try:
+            parsed_as_of_at = datetime.fromisoformat(str(raw_as_of_at)) if raw_as_of_at else None
+        except (TypeError, ValueError):
+            parsed_as_of_at = None
+        if parsed_as_of_at is not None and parsed_as_of_at.tzinfo is not None:
+            parsed_as_of_at = parsed_as_of_at.replace(tzinfo=None)
+        sanitized['risk_as_of_at'] = parsed_as_of_at
+        raw_decision_date = row.get('risk_decision_trade_date')
+        sanitized['risk_decision_trade_date'] = (
+            str(raw_decision_date).split(' ')[0].strip() if raw_decision_date else None
+        )
+        for field in ('risk_base_state', 'risk_display_state'):
+            raw_value = row.get(field)
+            sanitized[field] = (
+                str(raw_value).strip()[:32]
+                if raw_value is not None and str(raw_value).strip()
+                else None
+            )
         for field in self.QUANT_INDEX_OPTION_PC_CONTRACT_MONTH_FIELDS:
             raw_value = row.get(field)
             sanitized[field] = str(raw_value).strip() if raw_value is not None and str(raw_value).strip() else None
@@ -5226,6 +5326,55 @@ class DbTools:
             ) COMMENT='Daily US options put call ratio from Cboe'
             """,
             """
+            CREATE TABLE IF NOT EXISTS index_us_option_premium_daily (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              trade_date DATE NOT NULL COMMENT 'Optionomics displayed market date',
+              total_premium_million_usd DECIMAL(20, 1) NOT NULL COMMENT 'Displayed total premium in USD millions',
+              call_premium_million_usd DECIMAL(20, 1) NOT NULL COMMENT 'Displayed call premium in USD millions',
+              put_premium_million_usd DECIMAL(20, 1) NOT NULL COMMENT 'Displayed put premium in USD millions',
+              premium_put_call_ratio DECIMAL(12, 6) NOT NULL COMMENT 'Put divided by call using displayed values',
+              rounding_unit_million_usd DECIMAL(10, 1) NOT NULL DEFAULT 0.1 COMMENT 'Source display rounding unit in USD millions',
+              value_basis VARCHAR(64) NOT NULL DEFAULT 'source_display_rounded_0.1m_usd' COMMENT 'Value precision and basis',
+              data_source VARCHAR(64) NOT NULL DEFAULT 'optionomics_public_pulse' COMMENT 'Data source',
+              source_url VARCHAR(512) NULL COMMENT 'Public source webpage',
+              raw_json JSON NULL COMMENT 'Original displayed strings',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_index_us_option_premium_trade_date (trade_date),
+              KEY idx_index_us_option_premium_trade_date (trade_date)
+            ) COMMENT='Daily US option premium from rounded Optionomics public display'
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS index_us_etf_option_daily_data (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              trade_date DATE NOT NULL COMMENT 'US option market trade date',
+              index_code VARCHAR(32) NOT NULL COMMENT 'Mapped US index code',
+              index_name VARCHAR(64) NOT NULL COMMENT 'Mapped US index name',
+              underlying_code VARCHAR(16) NOT NULL COMMENT 'SPY or QQQ',
+              underlying_name VARCHAR(64) NOT NULL COMMENT 'ETF option product name',
+              underlying_close DECIMAL(18, 6) NOT NULL COMMENT 'Unadjusted ETF close used for interpolation',
+              contract_code VARCHAR(64) NOT NULL COMMENT 'Option contract identifier',
+              expiration_date DATE NOT NULL COMMENT 'Actual option expiration date',
+              contract_month VARCHAR(4) NOT NULL COMMENT 'YYMM contract month',
+              option_type VARCHAR(8) NOT NULL COMMENT 'CALL or PUT',
+              strike_price DECIMAL(18, 6) NOT NULL COMMENT 'Strike price',
+              close_price DECIMAL(18, 6) NOT NULL COMMENT 'Last traded close price',
+              volume BIGINT NOT NULL COMMENT 'Daily contract volume, must be positive',
+              open_interest BIGINT NULL COMMENT 'Open interest',
+              value_basis VARCHAR(64) NOT NULL DEFAULT 'last_trade_with_positive_daily_volume',
+              data_source VARCHAR(64) NOT NULL COMMENT 'Historical mirror or Nasdaq public chain',
+              source_url VARCHAR(512) NULL COMMENT 'Source page or parquet file',
+              raw_json JSON NULL COMMENT 'Source fields used by this row',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              UNIQUE KEY uk_index_us_etf_option_daily (
+                trade_date, underlying_code, expiration_date, option_type, strike_price
+              ),
+              KEY idx_index_us_etf_option_daily_product_date (underlying_code, trade_date),
+              KEY idx_index_us_etf_option_daily_index_date (index_name, trade_date)
+            ) COMMENT='Selected real SPY and QQQ option closes used for price Put/Call interpolation'
+            """,
+            """
             CREATE TABLE IF NOT EXISTS index_us_treasury_yield_daily (
               id BIGINT PRIMARY KEY AUTO_INCREMENT,
               trade_date DATE NOT NULL COMMENT 'Trading date',
@@ -5357,6 +5506,209 @@ class DbTools:
                 await cursor.executemany(query_upsert, values)
                 await conn.commit()
                 return len(sanitized_rows)
+
+    async def upsert_index_us_option_premium_daily(self, rows):
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+
+        sanitized_rows = [self._sanitize_index_us_option_premium_row(row) for row in rows]
+        sanitized_rows = [
+            row
+            for row in sanitized_rows
+            if row['trade_date']
+            and row['total_premium_million_usd'] is not None
+            and row['call_premium_million_usd'] is not None
+            and row['put_premium_million_usd'] is not None
+            and row['premium_put_call_ratio'] is not None
+        ]
+        if not sanitized_rows:
+            return 0
+
+        deduped_rows = {row['trade_date']: row for row in sanitized_rows}
+        sanitized_rows = list(deduped_rows.values())
+        query_upsert = """
+            INSERT INTO index_us_option_premium_daily (
+                trade_date,
+                total_premium_million_usd,
+                call_premium_million_usd,
+                put_premium_million_usd,
+                premium_put_call_ratio,
+                rounding_unit_million_usd,
+                value_basis,
+                data_source,
+                source_url,
+                raw_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                total_premium_million_usd = VALUES(total_premium_million_usd),
+                call_premium_million_usd = VALUES(call_premium_million_usd),
+                put_premium_million_usd = VALUES(put_premium_million_usd),
+                premium_put_call_ratio = VALUES(premium_put_call_ratio),
+                rounding_unit_million_usd = VALUES(rounding_unit_million_usd),
+                value_basis = VALUES(value_basis),
+                data_source = VALUES(data_source),
+                source_url = VALUES(source_url),
+                raw_json = VALUES(raw_json),
+                updated_at = CURRENT_TIMESTAMP
+        """
+        values = [
+            (
+                row['trade_date'],
+                row['total_premium_million_usd'],
+                row['call_premium_million_usd'],
+                row['put_premium_million_usd'],
+                row['premium_put_call_ratio'],
+                row['rounding_unit_million_usd'],
+                row['value_basis'],
+                row['data_source'],
+                row['source_url'],
+                row['raw_json'],
+            )
+            for row in sanitized_rows
+        ]
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query_upsert, values)
+                await conn.commit()
+        return len(sanitized_rows)
+
+    async def upsert_index_us_etf_option_daily(self, rows):
+        if not rows:
+            return 0
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+
+        sanitized_rows = [self._sanitize_index_us_etf_option_daily_row(row) for row in rows]
+        sanitized_rows = [
+            row
+            for row in sanitized_rows
+            if row['trade_date']
+            and row['expiration_date']
+            and row['index_code']
+            and row['index_name']
+            and row['underlying_code'] in {'SPY', 'QQQ'}
+            and row['underlying_name']
+            and row['underlying_close'] is not None
+            and row['underlying_close'] > 0
+            and row['contract_code']
+            and len(row['contract_month']) == 4
+            and row['contract_month'].isdigit()
+            and row['option_type'] in {'CALL', 'PUT'}
+            and row['strike_price'] is not None
+            and row['close_price'] is not None
+            and row['close_price'] > 0
+            and row['volume'] is not None
+            and row['volume'] > 0
+            and row['data_source']
+        ]
+        if not sanitized_rows:
+            return 0
+        deduped = {
+            (
+                row['trade_date'],
+                row['underlying_code'],
+                row['expiration_date'],
+                row['option_type'],
+                row['strike_price'],
+            ): row
+            for row in sanitized_rows
+        }
+        sanitized_rows = list(deduped.values())
+        query = """
+        INSERT INTO index_us_etf_option_daily_data (
+            trade_date, index_code, index_name, underlying_code, underlying_name,
+            underlying_close, contract_code, expiration_date, contract_month,
+            option_type, strike_price, close_price, volume, open_interest,
+            value_basis, data_source, source_url, raw_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            index_code = VALUES(index_code),
+            index_name = VALUES(index_name),
+            underlying_name = VALUES(underlying_name),
+            underlying_close = VALUES(underlying_close),
+            contract_code = VALUES(contract_code),
+            contract_month = VALUES(contract_month),
+            close_price = VALUES(close_price),
+            volume = VALUES(volume),
+            open_interest = VALUES(open_interest),
+            value_basis = VALUES(value_basis),
+            data_source = VALUES(data_source),
+            source_url = VALUES(source_url),
+            raw_json = VALUES(raw_json),
+            updated_at = CURRENT_TIMESTAMP
+        """
+        values = [
+            (
+                row['trade_date'], row['index_code'], row['index_name'],
+                row['underlying_code'], row['underlying_name'], row['underlying_close'],
+                row['contract_code'], row['expiration_date'], row['contract_month'],
+                row['option_type'], row['strike_price'], row['close_price'],
+                row['volume'], row['open_interest'], row['value_basis'],
+                row['data_source'], row['source_url'], row['raw_json'],
+            )
+            for row in sanitized_rows
+        ]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(sanitized_rows)
+
+    async def get_index_us_etf_option_daily_rows(self, start_date, end_date):
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+        query = """
+        SELECT trade_date, index_code, index_name, underlying_code, underlying_name,
+               underlying_close, contract_code, expiration_date, contract_month,
+               option_type, strike_price, close_price, volume, open_interest,
+               value_basis, data_source, source_url
+        FROM index_us_etf_option_daily_data
+        WHERE trade_date BETWEEN %s AND %s
+        ORDER BY trade_date ASC, index_name ASC, expiration_date ASC,
+                 option_type ASC, strike_price ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_index_us_put_call_missing_trade_dates(self, start_date, end_date, limit=256):
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_index_us_macro_auxiliary_tables()
+
+        normalized_limit = max(1, int(limit or 256))
+        query = """
+            SELECT DISTINCT daily.trade_date
+            FROM index_us_daily_data daily
+            LEFT JOIN index_us_put_call_ratio_daily put_call
+              ON put_call.trade_date = daily.trade_date
+            WHERE daily.index_code = '.INX'
+              AND daily.trade_date BETWEEN %s AND %s
+              AND (
+                put_call.trade_date IS NULL
+                OR put_call.total_put_call_ratio IS NULL
+                OR put_call.index_put_call_ratio IS NULL
+                OR put_call.equity_put_call_ratio IS NULL
+                OR put_call.etf_put_call_ratio IS NULL
+              )
+            ORDER BY daily.trade_date DESC
+            LIMIT %s
+        """
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, [start_date, end_date, normalized_limit])
+                rows = await cursor.fetchall()
+
+        return sorted(str(row[0]) for row in rows if row and row[0] is not None)
 
     async def upsert_index_us_treasury_yield_daily(self, rows):
         if not rows:
@@ -6038,9 +6390,20 @@ class DbTools:
             ("risk_red_escalation", "TINYINT(1) NULL COMMENT '中证1000红色风险升级状态'"),
             ("risk_red_escalation_score", "DECIMAL(18, 6) NULL COMMENT '红色风险升级条件完成度'"),
             ("risk_global_shock", "TINYINT(1) NULL COMMENT '中证1000全球冲击状态'"),
-            ("risk_global_shock_score", "DECIMAL(18, 6) NULL COMMENT '全球冲击模块完成度'"),
+            ("risk_global_shock_score", "DECIMAL(18, 6) NULL COMMENT '全球冲击确认分'"),
             ("risk_global_shock_mode", "VARCHAR(64) NULL COMMENT '全球冲击命中模式'"),
-            ("risk_strategy_components_json", "JSON NULL COMMENT '三套风险策略完整组件审计信息'"),
+            ("risk_global_raw_leading", "TINYINT(1) NULL COMMENT '不含A股门槛的全球风险原始前兆状态'"),
+            ("risk_global_raw_leading_mode", "VARCHAR(64) NULL COMMENT '全球风险原始前兆路径'"),
+            ("risk_global_leading", "TINYINT(1) NULL COMMENT '中证1000全球风险前兆有效状态'"),
+            ("risk_global_leading_score", "DECIMAL(18, 6) NULL COMMENT '全球风险前兆原始条件分'"),
+            ("risk_global_leading_mode", "VARCHAR(64) NULL COMMENT '全球风险前兆路径'"),
+            ("risk_global_score", "DECIMAL(18, 6) NULL COMMENT '前兆与确认合并后的最终全球分'"),
+            ("risk_as_of_at", "DATETIME NULL COMMENT '风险点按北京时间计算的数据截止时点'"),
+            ("risk_decision_trade_date", "DATE NULL COMMENT '风险点对应的下一A股决策交易日'"),
+            ("risk_overall_score", "DECIMAL(18, 6) NULL COMMENT '中证1000统一风险总分'"),
+            ("risk_base_state", "VARCHAR(32) NULL COMMENT '中证1000统一风险基础状态'"),
+            ("risk_display_state", "VARCHAR(32) NULL COMMENT '中证1000统一风险最终显示状态'"),
+            ("risk_strategy_components_json", "JSON NULL COMMENT '统一风险评分完整组件审计信息'"),
         )
         for column_name, definition in risk_columns:
             column_definitions.append(
@@ -6225,6 +6588,368 @@ class DbTools:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, [str(index_name), str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def ensure_cn_bank_liquidity_tables(self):
+        if self._cn_bank_liquidity_tables_ready:
+            return
+        if self.pool is None:
+            await self.init_pool()
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS cn_bank_liquidity_daily (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                trade_date DATE NOT NULL,
+                fr001_pct DECIMAL(18, 8) NULL,
+                fr007_pct DECIMAL(18, 8) NULL,
+                fdr001_pct DECIMAL(18, 8) NULL,
+                fdr007_pct DECIMAL(18, 8) NULL,
+                dr001_weighted_pct DECIMAL(18, 8) NULL,
+                dr007_weighted_pct DECIMAL(18, 8) NULL,
+                r001_weighted_pct DECIMAL(18, 8) NULL,
+                r007_weighted_pct DECIMAL(18, 8) NULL,
+                reverse_repo_7d_policy_rate_pct DECIMAL(18, 8) NULL,
+                bank_bond_aaa_1y_yield_pct DECIMAL(18, 8) NULL,
+                cgb_1y_yield_pct DECIMAL(18, 8) NULL,
+                factor_fdr007_policy_spread_bp DECIMAL(18, 8) NULL,
+                factor_overnight_pressure_bp DECIMAL(18, 8) NULL,
+                factor_nonbank_layering_bp DECIMAL(18, 8) NULL,
+                factor_bank_funding_spread_bp DECIMAL(18, 8) NULL,
+                pct_fdr007_policy_spread DECIMAL(18, 8) NULL,
+                pct_overnight_pressure DECIMAL(18, 8) NULL,
+                pct_nonbank_layering DECIMAL(18, 8) NULL,
+                pct_bank_funding_spread DECIMAL(18, 8) NULL,
+                liquidity_tightness_score DECIMAL(18, 8) NULL,
+                liquidity_state VARCHAR(16) NULL,
+                liquidity_trend VARCHAR(16) NULL,
+                score_change_5d DECIMAL(18, 8) NULL,
+                reverse_repo_injection_cny DECIMAL(30, 2) NULL,
+                reverse_repo_maturity_cny DECIMAL(30, 2) NULL,
+                reverse_repo_net_cny DECIMAL(30, 2) NULL,
+                reverse_repo_net_5d_cny DECIMAL(30, 2) NULL,
+                reverse_repo_net_20d_cny DECIMAL(30, 2) NULL,
+                frr_source_date DATE NULL,
+                frr_available_at DATETIME NULL,
+                closing_repo_source_date DATE NULL,
+                closing_repo_available_at DATETIME NULL,
+                chinabond_source_date DATE NULL,
+                chinabond_available_at DATETIME NULL,
+                pbc_source_date DATE NULL,
+                pbc_available_at DATETIME NULL,
+                source_url_frr VARCHAR(1024) NULL,
+                source_url_closing_repo VARCHAR(1024) NULL,
+                source_url_chinabond VARCHAR(1024) NULL,
+                source_url_pbc VARCHAR(1024) NULL,
+                components_json LONGTEXT NULL,
+                sources_json LONGTEXT NULL,
+                raw_frr_json LONGTEXT NULL,
+                raw_closing_repo_json LONGTEXT NULL,
+                raw_chinabond_json LONGTEXT NULL,
+                fetched_at DATETIME NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_cn_bank_liquidity_trade_date (trade_date),
+                KEY idx_cn_bank_liquidity_score (trade_date, liquidity_tightness_score)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_pbc_open_market_operation (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                source_item_key VARCHAR(160) NOT NULL,
+                operation_date DATE NOT NULL,
+                tool_type VARCHAR(64) NOT NULL,
+                tenor_label VARCHAR(64) NULL,
+                tenor_days INT NULL,
+                awarded_amount_cny DECIMAL(30, 2) NULL,
+                operation_rate_pct DECIMAL(18, 8) NULL,
+                maturity_date DATE NULL,
+                no_operation TINYINT(1) NOT NULL DEFAULT 0,
+                announcement_title VARCHAR(255) NOT NULL,
+                published_at DATETIME NOT NULL,
+                source_url VARCHAR(1024) NOT NULL,
+                raw_json LONGTEXT NULL,
+                raw_text LONGTEXT NULL,
+                fetched_at DATETIME NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_cn_pbc_omo_source_item (source_item_key),
+                KEY idx_cn_pbc_omo_operation_date (operation_date, tool_type),
+                KEY idx_cn_pbc_omo_maturity_date (maturity_date, tool_type)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cn_pbc_liquidity_tool_monthly (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                period_end DATE NOT NULL,
+                category VARCHAR(128) NULL,
+                tool_type VARCHAR(96) NOT NULL,
+                tool_name VARCHAR(255) NOT NULL,
+                injection_cny DECIMAL(30, 2) NULL,
+                withdrawal_cny DECIMAL(30, 2) NULL,
+                net_injection_cny DECIMAL(30, 2) NULL,
+                coverage_status VARCHAR(64) NOT NULL,
+                published_at DATETIME NOT NULL,
+                source_url VARCHAR(1024) NOT NULL,
+                raw_json LONGTEXT NULL,
+                fetched_at DATETIME NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_cn_pbc_liquidity_month_tool (period_end, tool_type, tool_name),
+                KEY idx_cn_pbc_liquidity_month_pub (published_at, period_end)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+        ]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for statement in statements:
+                    await cursor.execute(statement)
+                await cursor.execute(
+                    """
+                    SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index)
+                    FROM information_schema.statistics
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'cn_pbc_liquidity_tool_monthly'
+                      AND index_name = 'uq_cn_pbc_liquidity_month_tool'
+                    """
+                )
+                index_row = await cursor.fetchone()
+                index_columns = str(index_row[0] or "") if index_row else ""
+                if index_columns == "period_end,tool_type":
+                    await cursor.execute(
+                        """
+                        ALTER TABLE cn_pbc_liquidity_tool_monthly
+                        DROP INDEX uq_cn_pbc_liquidity_month_tool,
+                        ADD UNIQUE KEY uq_cn_pbc_liquidity_month_tool (
+                            period_end, tool_type, tool_name
+                        )
+                        """
+                    )
+                await conn.commit()
+        self._cn_bank_liquidity_tables_ready = True
+
+    async def upsert_cn_bank_liquidity_daily_rows(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_cn_bank_liquidity_tables()
+        columns = (
+            "trade_date", "fr001_pct", "fr007_pct", "fdr001_pct", "fdr007_pct",
+            "dr001_weighted_pct", "dr007_weighted_pct", "r001_weighted_pct", "r007_weighted_pct",
+            "reverse_repo_7d_policy_rate_pct", "bank_bond_aaa_1y_yield_pct", "cgb_1y_yield_pct",
+            "factor_fdr007_policy_spread_bp", "factor_overnight_pressure_bp",
+            "factor_nonbank_layering_bp", "factor_bank_funding_spread_bp",
+            "pct_fdr007_policy_spread", "pct_overnight_pressure",
+            "pct_nonbank_layering", "pct_bank_funding_spread",
+            "liquidity_tightness_score", "liquidity_state", "liquidity_trend", "score_change_5d",
+            "reverse_repo_injection_cny", "reverse_repo_maturity_cny", "reverse_repo_net_cny",
+            "reverse_repo_net_5d_cny", "reverse_repo_net_20d_cny",
+            "frr_source_date", "frr_available_at", "closing_repo_source_date", "closing_repo_available_at",
+            "chinabond_source_date", "chinabond_available_at", "pbc_source_date", "pbc_available_at",
+            "source_url_frr", "source_url_closing_repo", "source_url_chinabond", "source_url_pbc",
+            "components_json", "sources_json", "raw_frr_json", "raw_closing_repo_json",
+            "raw_chinabond_json", "fetched_at",
+        )
+        text_fields = {
+            "liquidity_state", "liquidity_trend", "source_url_frr", "source_url_closing_repo",
+            "source_url_chinabond", "source_url_pbc",
+        }
+        json_fields = {
+            "components_json", "sources_json", "raw_frr_json", "raw_closing_repo_json",
+            "raw_chinabond_json",
+        }
+        datetime_fields = {
+            "frr_available_at", "closing_repo_available_at", "chinabond_available_at",
+            "pbc_available_at", "fetched_at",
+        }
+        date_fields = {
+            "trade_date", "frr_source_date", "closing_repo_source_date", "chinabond_source_date",
+            "pbc_source_date",
+        }
+        numeric_fields = set(columns) - text_fields - json_fields - datetime_fields - date_fields
+        deduped = {}
+        for raw in rows:
+            trade_date = str(raw.get("trade_date") or "").split(" ")[0].strip()
+            if trade_date:
+                deduped[trade_date] = dict(raw)
+        values = []
+        for trade_date, row in sorted(deduped.items()):
+            normalized = []
+            for column in columns:
+                value = trade_date if column == "trade_date" else row.get(column)
+                if column in numeric_fields:
+                    value = self._normalize_numeric(column, value)
+                    if value is not None:
+                        decimal_places = 2 if column.endswith("_cny") else 8
+                        value = round(float(value), decimal_places)
+                elif column in json_fields:
+                    value = self._serialize_json_field(value)
+                elif column in datetime_fields:
+                    value = self._normalize_datetime_for_db(value)
+                elif column in text_fields:
+                    value = str(value).strip() if value not in (None, "") else None
+                elif value not in (None, ""):
+                    value = str(value).split(" ")[0]
+                else:
+                    value = None
+                normalized.append(value)
+            values.append(tuple(normalized))
+        if not values:
+            return 0
+        update_columns = [column for column in columns if column != "trade_date"]
+        query = f"""
+        INSERT INTO cn_bank_liquidity_daily ({', '.join(columns)})
+        VALUES ({', '.join(['%s'] * len(columns))})
+        ON DUPLICATE KEY UPDATE
+            {', '.join(f'{column} = COALESCE(VALUES({column}), {column})' for column in update_columns)},
+            updated_at = CURRENT_TIMESTAMP
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def upsert_cn_pbc_open_market_operations(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_cn_bank_liquidity_tables()
+        columns = (
+            "source_item_key", "operation_date", "tool_type", "tenor_label", "tenor_days",
+            "awarded_amount_cny", "operation_rate_pct", "maturity_date", "no_operation",
+            "announcement_title", "published_at", "source_url", "raw_json", "raw_text", "fetched_at",
+        )
+        deduped = {}
+        for raw in rows:
+            key = str(raw.get("source_item_key") or "").strip()
+            operation_date = str(raw.get("operation_date") or "").split(" ")[0].strip()
+            if key and operation_date:
+                deduped[key] = dict(raw)
+        values = []
+        for key, row in sorted(deduped.items()):
+            maturity_date = str(row.get("maturity_date") or "").split(" ")[0].strip() or None
+            values.append((
+                key,
+                str(row.get("operation_date")).split(" ")[0],
+                str(row.get("tool_type") or "").strip(),
+                str(row.get("tenor_label") or "").strip() or None,
+                int(row["tenor_days"]) if row.get("tenor_days") is not None else None,
+                self._normalize_numeric("awarded_amount_cny", row.get("awarded_amount_cny")),
+                self._normalize_numeric("operation_rate_pct", row.get("operation_rate_pct")),
+                maturity_date,
+                1 if row.get("no_operation") else 0,
+                str(row.get("announcement_title") or "").strip(),
+                self._normalize_datetime_for_db(row.get("published_at")),
+                str(row.get("source_url") or "").strip(),
+                self._serialize_json_field(row.get("raw_json")),
+                str(row.get("raw_text") or "").strip() or None,
+                self._normalize_datetime_for_db(row.get("fetched_at")),
+            ))
+        if not values:
+            return 0
+        update_columns = [column for column in columns if column != "source_item_key"]
+        query = f"""
+        INSERT INTO cn_pbc_open_market_operation ({', '.join(columns)})
+        VALUES ({', '.join(['%s'] * len(columns))})
+        ON DUPLICATE KEY UPDATE
+            {', '.join(f'{column} = COALESCE(VALUES({column}), {column})' for column in update_columns)},
+            updated_at = CURRENT_TIMESTAMP
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def upsert_cn_pbc_liquidity_tool_monthly_rows(self, rows):
+        if not rows:
+            return 0
+        await self.ensure_cn_bank_liquidity_tables()
+        columns = (
+            "period_end", "category", "tool_type", "tool_name", "injection_cny",
+            "withdrawal_cny", "net_injection_cny", "coverage_status", "published_at",
+            "source_url", "raw_json", "fetched_at",
+        )
+        deduped = {}
+        for raw in rows:
+            period_end = str(raw.get("period_end") or "").split(" ")[0].strip()
+            tool_type = str(raw.get("tool_type") or "").strip()
+            tool_name = str(raw.get("tool_name") or tool_type).strip()
+            if period_end and tool_type and tool_name:
+                deduped[(period_end, tool_type, tool_name)] = dict(raw)
+        values = []
+        for (period_end, tool_type, tool_name), row in sorted(deduped.items()):
+            values.append((
+                period_end,
+                str(row.get("category") or "").strip() or None,
+                tool_type,
+                tool_name,
+                self._normalize_numeric("injection_cny", row.get("injection_cny")),
+                self._normalize_numeric("withdrawal_cny", row.get("withdrawal_cny")),
+                self._normalize_numeric("net_injection_cny", row.get("net_injection_cny")),
+                str(row.get("coverage_status") or "official_complete").strip(),
+                self._normalize_datetime_for_db(row.get("published_at")),
+                str(row.get("source_url") or "").strip(),
+                self._serialize_json_field(row.get("raw_json")),
+                self._normalize_datetime_for_db(row.get("fetched_at")),
+            ))
+        if not values:
+            return 0
+        update_columns = [
+            column
+            for column in columns
+            if column not in {"period_end", "tool_type", "tool_name"}
+        ]
+        query = f"""
+        INSERT INTO cn_pbc_liquidity_tool_monthly ({', '.join(columns)})
+        VALUES ({', '.join(['%s'] * len(columns))})
+        ON DUPLICATE KEY UPDATE
+            {', '.join(f'{column} = COALESCE(VALUES({column}), {column})' for column in update_columns)},
+            updated_at = CURRENT_TIMESTAMP
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+        return len(values)
+
+    async def get_cn_bank_liquidity_daily_rows(self, start_date, end_date):
+        await self.ensure_cn_bank_liquidity_tables()
+        query = """
+        SELECT *
+        FROM cn_bank_liquidity_daily
+        WHERE trade_date BETWEEN %s AND %s
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_cn_pbc_open_market_operations(self, start_date, end_date):
+        await self.ensure_cn_bank_liquidity_tables()
+        query = """
+        SELECT *
+        FROM cn_pbc_open_market_operation
+        WHERE operation_date BETWEEN %s AND %s
+           OR maturity_date BETWEEN %s AND %s
+        ORDER BY operation_date ASC, source_item_key ASC
+        """
+        params = [str(start_date), str(end_date), str(start_date), str(end_date)]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, params)
+                return list(await cursor.fetchall())
+
+    async def get_cn_pbc_liquidity_tool_monthly_rows(self, start_date, end_date):
+        await self.ensure_cn_bank_liquidity_tables()
+        query = """
+        SELECT *
+        FROM cn_pbc_liquidity_tool_monthly
+        WHERE period_end BETWEEN %s AND %s
+        ORDER BY period_end ASC, category ASC, tool_name ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, [str(start_date), str(end_date)])
                 return list(await cursor.fetchall())
 
     async def ensure_global_risk_asset_daily_table(self):
@@ -6538,21 +7263,76 @@ class DbTools:
                 await cursor.execute(query, [str(start_date), str(end_date)])
                 return list(await cursor.fetchall())
 
-    async def get_quant_index_risk_im_contract_rows(self, start_date, end_date):
+    async def get_quant_index_risk_futures_contract_rows(
+        self,
+        start_date,
+        end_date,
+        product_code,
+    ):
         if self.pool is None:
             await self.init_pool()
+        normalized_product = str(product_code or '').strip().upper()
+        if normalized_product not in {'IF', 'IM'}:
+            raise ValueError(f'unsupported risk futures product: {normalized_product}')
         query = """
         SELECT trade_date, symbol, close_price, open_interest, volume, data_source
         FROM futures_daily_data
         WHERE trade_date BETWEEN %s AND %s
-          AND symbol REGEXP '^IM[0-9]{4}$'
+          AND symbol REGEXP %s
           AND close_price IS NOT NULL
           AND open_interest IS NOT NULL
         ORDER BY trade_date ASC, open_interest DESC, symbol ASC
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    query,
+                    [str(start_date), str(end_date), f'^{normalized_product}[0-9]{{4}}$'],
+                )
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_im_contract_rows(self, start_date, end_date):
+        return await self.get_quant_index_risk_futures_contract_rows(
+            start_date,
+            end_date,
+            'IM',
+        )
+
+    async def get_quant_index_risk_macro_indicator_rows(self, start_date, end_date):
+        await self.ensure_cn_macro_tables()
+        query = """
+        SELECT trade_date, hs300_equity_bond_spread_pp, data_source
+        FROM cn_macro_indicator_daily
+        WHERE trade_date BETWEEN %s AND %s
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_qvix_rows(
+        self,
+        start_date,
+        end_date,
+        index_code='300ETF_QVIX',
+    ):
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        SELECT trade_date, close_price, data_source
+        FROM index_qvix_daily_data
+        WHERE index_code = %s
+          AND trade_date BETWEEN %s AND %s
+          AND close_price IS NOT NULL
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    query,
+                    [str(index_code).strip(), str(start_date), str(end_date)],
+                )
                 return list(await cursor.fetchall())
 
     async def get_quant_index_risk_us_vix_rows(self, start_date, end_date):
@@ -6604,6 +7384,25 @@ class DbTools:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, [str(start_date), str(end_date)])
+                return list(await cursor.fetchall())
+
+    async def get_quant_index_risk_forex_rows(self, start_date, end_date, symbol_code="UDI"):
+        if self.pool is None:
+            await self.init_pool()
+        query = """
+        SELECT symbol_code, symbol_name, trade_date, latest_price, data_source
+        FROM forex_daily_data
+        WHERE symbol_code = %s
+          AND trade_date BETWEEN %s AND %s
+          AND latest_price IS NOT NULL
+        ORDER BY trade_date ASC
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    query,
+                    [str(symbol_code).strip().upper(), str(start_date), str(end_date)],
+                )
                 return list(await cursor.fetchall())
 
     async def get_quant_index_risk_csi_tech_turnover_rows(self, start_date, end_date):
@@ -7502,6 +8301,55 @@ class DbTools:
                 await cursor.executemany(query, values)
                 await conn.commit()
                 return len(sanitized_rows)
+
+    async def update_quant_index_dashboard_risk_fields(self, rows):
+        """Update only risk columns on existing dashboard rows.
+
+        Historical risk rebuilds must not replace unrelated dashboard metrics with
+        defaults or nulls. The target index rows are created by the normal dashboard
+        pipeline, so this deliberately uses UPDATE instead of an upsert.
+        """
+        if not rows:
+            return 0
+
+        if self.pool is None:
+            await self.init_pool()
+        await self.ensure_quant_index_dashboard_option_pc_columns()
+
+        deduped_rows = {}
+        for source_row in rows:
+            row = self._sanitize_quant_index_dashboard_row(source_row)
+            if not (row.get('trade_date') and row.get('index_code')):
+                continue
+            deduped_rows[(row['index_code'], row['trade_date'])] = row
+        sanitized_rows = list(deduped_rows.values())
+        if not sanitized_rows:
+            return 0
+
+        risk_columns = list(self.QUANT_INDEX_RISK_FIELDS)
+        assignments = ",\n                    ".join(
+            f"{field} = %s" for field in risk_columns
+        )
+        query = f"""
+        UPDATE quant_index_dashboard_daily
+        SET {assignments},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE index_code = %s
+          AND trade_date = %s
+        """
+        values = [
+            (
+                *[row[field] for field in risk_columns],
+                row['index_code'],
+                row['trade_date'],
+            )
+            for row in sanitized_rows
+        ]
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(query, values)
+                await conn.commit()
+                return int(cursor.rowcount or 0)
 
     async def batch_futures_daily_data(self, rows):
         if not rows:

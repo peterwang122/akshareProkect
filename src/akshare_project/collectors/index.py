@@ -7,6 +7,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -15,6 +17,7 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 import requests
 
 from akshare_project.core.logging_utils import echo_and_log, get_logger
+from akshare_project.core.paths import get_cache_dir
 from akshare_project.core.progress import ProgressStore
 from akshare_project.core.retry import fetch_with_retry as shared_fetch_with_retry
 from akshare_project.db.db_tool import DbTools
@@ -24,6 +27,7 @@ API_RETRY_SLEEP_SECONDS = 3
 MAX_CONCURRENCY = 5
 LOGGER = get_logger('index')
 PROGRESS_STORE = ProgressStore('index')
+US_OPTION_PRICE_PC_PROGRESS_STORE = ProgressStore('index_us_option_price_pc')
 
 SPECIAL_INDEX_CODE = 'bj899050'
 SPECIAL_INDEX_SIMPLE_CODE = '899050'
@@ -52,6 +56,9 @@ US_FEAR_GREED_HISTORY_SOURCE = 'cnn_fear_greed_history'
 US_FEAR_GREED_MIRROR_SOURCE = 'fear_greed_history_mirror'
 US_HEDGE_PROXY_SOURCE = 'ofr_tff'
 US_PUT_CALL_SOURCE = 'cboe_market_statistics'
+US_OPTION_PREMIUM_SOURCE = 'optionomics_public_pulse'
+US_OPTION_PRICE_PC_LIVE_SOURCE = 'nasdaq_public_option_chain'
+US_OPTION_PRICE_PC_HISTORY_SOURCE = 'options_dataset_hist_mirror'
 US_TREASURY_YIELD_SOURCE = 'fred_public_csv'
 US_CREDIT_SPREAD_SOURCE = 'fred_public_csv'
 CN_MARKET_FEAR_GREED_SOURCE = 'miumiu_market_fear_greed'
@@ -65,6 +72,31 @@ US_PUT_CALL_HISTORY_URLS = {
     'etf_put_call_ratio': 'https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/etppc.csv',
 }
 US_PUT_CALL_MARKET_STATS_URL = 'https://www.cboe.com/us/options/market_statistics/market/'
+US_OPTION_PREMIUM_URL = 'https://optionomics.ai/pulse'
+US_OPTION_PREMIUM_VALUE_BASIS = 'source_display_rounded_0.1m_usd'
+US_OPTION_PREMIUM_ROUNDING_UNIT_MILLION_USD = 0.1
+US_OPTION_PRICE_PC_NASDAQ_URL = 'https://api.nasdaq.com/api/quote/{symbol}/option-chain'
+US_OPTION_PRICE_PC_HISTORY_BASE_URL = (
+    'https://raw.githubusercontent.com/anahatsingh-ui/options-dataset-hist/main'
+)
+US_OPTION_PRICE_PC_HISTORY_REPOSITORY_URL = (
+    'https://github.com/anahatsingh-ui/options-dataset-hist'
+)
+US_OPTION_PRICE_PC_PRODUCTS = {
+    'SPY': {
+        'index_name': '标普500指数',
+        'index_code': '.INX',
+        'product_name': 'SPY ETF期权',
+        'history_start_year': 2008,
+    },
+    'QQQ': {
+        'index_name': '纳斯达克100指数',
+        'index_code': '.NDX',
+        'product_name': 'QQQ ETF期权',
+        'history_start_year': 2011,
+    },
+}
+US_OPTION_PRICE_PC_HISTORY_END_YEAR = 2025
 US_PUT_CALL_DAILY_JSON_URL_TEMPLATE = (
     'https://cdn.cboe.com/data/us/options/market_statistics/daily/{trade_date}_daily_options'
 )
@@ -89,6 +121,14 @@ FRED_TREASURY_SERIES = {
     'yield_real_10y': 'DFII10',
 }
 FRED_HIGH_YIELD_OAS_SERIES = 'BAMLH0A0HYM2'
+FRED_HIGH_YIELD_OAS_ARCHIVE_URL = (
+    'https://raw.githubusercontent.com/maaurocp/Trading_Protocol/'
+    'bf64e83fa4c2a6e72c37d3883476dc81bd9d2e31/data/raw/'
+    'fred_BAMLH0A0HYM2.csv'
+)
+US_CREDIT_SPREAD_ARCHIVE_SOURCE = (
+    'fred_archive:maaurocp@bf64e83f'
+)
 US_TREASURY_AVAILABLE_TIMEZONE = ZoneInfo('America/Chicago')
 SHANGHAI_TIMEZONE = ZoneInfo('Asia/Shanghai')
 US_TREASURY_DAILY_AVAILABLE_HOUR = 16
@@ -429,6 +469,45 @@ def fetch_us_put_call_market_stats_html():
     return http_get_text(US_PUT_CALL_MARKET_STATS_URL)
 
 
+def fetch_us_option_premium_html():
+    return http_get_text(
+        US_OPTION_PREMIUM_URL,
+        headers={
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://optionomics.ai/',
+        },
+    )
+
+
+def fetch_nasdaq_us_option_chain(symbol, from_date='all', to_date='undefined'):
+    normalized_symbol = str(symbol or '').strip().upper()
+    if normalized_symbol not in US_OPTION_PRICE_PC_PRODUCTS:
+        raise ValueError(f'Unsupported US ETF option product: {normalized_symbol}')
+    query = urlencode({
+        'assetclass': 'etf',
+        'limit': 5000,
+        'fromdate': from_date,
+        'todate': to_date,
+        'excode': 'oprac',
+        'callput': 'callput',
+        'money': 'all',
+        'type': 'all',
+    })
+    return http_get_json(
+        f'{US_OPTION_PRICE_PC_NASDAQ_URL.format(symbol=normalized_symbol)}?{query}',
+        headers={
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://www.nasdaq.com',
+            'Referer': (
+                f'https://www.nasdaq.com/market-activity/etf/'
+                f'{normalized_symbol.lower()}/option-chain'
+            ),
+        },
+    )
+
+
 def fetch_us_put_call_daily_options_json(trade_date):
     normalized_trade_date = normalize_trade_date(trade_date)
     if not normalized_trade_date:
@@ -477,6 +556,33 @@ def fetch_fred_series_csv_with_curl(series_id):
             f'curl returned unexpected FRED payload for {series_id}: {text[:200]}'
         )
     return text
+
+
+def fetch_us_credit_spread_archive_csv():
+    """Fetch the pinned pre-restriction FRED export used only for old gaps."""
+    try:
+        return http_get(FRED_HIGH_YIELD_OAS_ARCHIVE_URL).text
+    except Exception as exc:
+        print(f'FRED HY OAS archive requests fetch failed, fallback to curl: {exc}')
+        completed = subprocess.run(
+            [
+                'curl', '-L', '--silent', '--show-error', '--max-time', '120',
+                FRED_HIGH_YIELD_OAS_ARCHIVE_URL,
+            ],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f'curl failed for FRED HY OAS archive: {completed.stderr.strip()}'
+            )
+        text = completed.stdout or ''
+        if FRED_HIGH_YIELD_OAS_SERIES not in text[:200]:
+            raise ValueError('FRED HY OAS archive returned an unexpected response.')
+        return text
 
 
 def fetch_us_fear_greed_current_payload():
@@ -994,6 +1100,496 @@ def build_us_put_call_ratio_row_from_daily_options_json(payload, trade_date):
     }
 
 
+def parse_optionomics_option_premium_html(html_text):
+    normalized_html = str(html_text or '')
+    date_match = re.search(
+        r'Live\s+board\s*(?:·|&middot;|&#183;|&#x0*B7;)\s*'
+        r'([A-Za-z]+\s+\d{1,2},\s+\d{4})',
+        normalized_html,
+        flags=re.IGNORECASE,
+    )
+    total_match = re.search(
+        r'\$\s*([\d,]+(?:\.\d+)?)\s*<small[^>]*>\s*M\s*</small>',
+        normalized_html,
+        flags=re.IGNORECASE,
+    )
+    call_match = re.search(
+        r'\$\s*([\d,]+(?:\.\d+)?)\s*M\s+in\s+calls',
+        normalized_html,
+        flags=re.IGNORECASE,
+    )
+    put_match = re.search(
+        r'\$\s*([\d,]+(?:\.\d+)?)\s*M\s+in\s+puts',
+        normalized_html,
+        flags=re.IGNORECASE,
+    )
+    if not all((date_match, total_match, call_match, put_match)):
+        raise ValueError('Optionomics page is missing date or premium display values.')
+
+    try:
+        trade_date = datetime.strptime(date_match.group(1), '%B %d, %Y').strftime('%Y-%m-%d')
+        total_premium = float(total_match.group(1).replace(',', ''))
+        call_premium = float(call_match.group(1).replace(',', ''))
+        put_premium = float(put_match.group(1).replace(',', ''))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'Invalid Optionomics premium display values: {exc}') from exc
+
+    if min(total_premium, call_premium, put_premium) <= 0:
+        raise ValueError('Optionomics premium display values must be positive.')
+    if abs(total_premium - call_premium - put_premium) > 0.2:
+        raise ValueError(
+            'Optionomics total premium does not match rounded call plus put premium: '
+            f'{total_premium} != {call_premium} + {put_premium}'
+        )
+
+    return {
+        'trade_date': trade_date,
+        'total_premium_million_usd': round(total_premium, 1),
+        'call_premium_million_usd': round(call_premium, 1),
+        'put_premium_million_usd': round(put_premium, 1),
+        'premium_put_call_ratio': round(put_premium / call_premium, 6),
+        'rounding_unit_million_usd': US_OPTION_PREMIUM_ROUNDING_UNIT_MILLION_USD,
+        'value_basis': US_OPTION_PREMIUM_VALUE_BASIS,
+        'data_source': US_OPTION_PREMIUM_SOURCE,
+        'source_url': US_OPTION_PREMIUM_URL,
+        'raw_json': {
+            'date_display': date_match.group(1),
+            'total_display': f'${total_match.group(1)}M',
+            'call_display': f'${call_match.group(1)}M',
+            'put_display': f'${put_match.group(1)}M',
+        },
+    }
+
+
+def parse_us_option_display_number(value):
+    text = str(value or '').strip().replace('$', '').replace(',', '')
+    if not text or text.lower() in {'--', 'n/a', 'na', 'null', 'none'}:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_us_option_display_integer(value):
+    numeric = parse_us_option_display_number(value)
+    if numeric is None or numeric < 0:
+        return None
+    return int(numeric)
+
+
+def parse_us_option_expiration(value, reference_date=None):
+    text = str(value or '').strip()
+    if not text:
+        return None
+    for fmt in ('%Y-%m-%d', '%B %d, %Y', '%b %d, %Y'):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+
+    reference_day = reference_date
+    if isinstance(reference_day, str):
+        try:
+            reference_day = datetime.strptime(reference_day[:10], '%Y-%m-%d').date()
+        except ValueError:
+            reference_day = None
+    if reference_day is None:
+        return None
+    for fmt in ('%B %d', '%b %d'):
+        try:
+            parsed = datetime.strptime(text, fmt).date().replace(year=reference_day.year)
+        except ValueError:
+            continue
+        if parsed < reference_day - timedelta(days=31):
+            parsed = parsed.replace(year=reference_day.year + 1)
+        return parsed
+    return None
+
+
+def third_friday_of_us_month(year, month):
+    first_day = datetime(int(year), int(month), 1).date()
+    first_friday = first_day + timedelta(days=(4 - first_day.weekday()) % 7)
+    return first_friday + timedelta(days=14)
+
+
+def is_standard_us_monthly_expiration(expiration):
+    expiration_day = parse_us_option_expiration(expiration)
+    if expiration_day is None:
+        return False
+    standard_day = third_friday_of_us_month(expiration_day.year, expiration_day.month)
+    day_offset = (expiration_day - standard_day).days
+    return -3 <= day_offset <= 1
+
+
+def select_us_option_pc_expirations(expirations, trade_date):
+    trade_day = parse_us_option_expiration(trade_date)
+    if trade_day is None:
+        raise ValueError(f'Invalid US option trade date: {trade_date}')
+    parsed_expirations = sorted({
+        expiration_day
+        for value in (expirations if expirations is not None else [])
+        if (expiration_day := parse_us_option_expiration(value, trade_day)) is not None
+        and expiration_day > trade_day
+        and is_standard_us_monthly_expiration(expiration_day.isoformat())
+    })
+    expirations_by_month = {}
+    for expiration_day in parsed_expirations:
+        expirations_by_month.setdefault(
+            (expiration_day.year, expiration_day.month),
+            [],
+        ).append(expiration_day)
+    sorted_expirations = []
+    for (year, month), candidates in sorted(expirations_by_month.items()):
+        standard_day = third_friday_of_us_month(year, month)
+        priority_days = (
+            standard_day,
+            standard_day + timedelta(days=1),
+            standard_day - timedelta(days=1),
+            standard_day - timedelta(days=2),
+            standard_day - timedelta(days=3),
+        )
+        selected_day = next(
+            (candidate for candidate in priority_days if candidate in candidates),
+            None,
+        )
+        if selected_day is not None:
+            sorted_expirations.append(selected_day)
+    selected = {
+        'current_month': sorted_expirations[0] if len(sorted_expirations) >= 1 else None,
+        'next_month': sorted_expirations[1] if len(sorted_expirations) >= 2 else None,
+        'quarter_1': None,
+        'quarter_2': None,
+    }
+    regular_expirations = {selected['current_month'], selected['next_month']}
+    quarter_expirations = [
+        expiration_day
+        for expiration_day in sorted_expirations
+        if expiration_day not in regular_expirations
+        and expiration_day.month in {3, 6, 9, 12}
+    ]
+    selected['quarter_1'] = quarter_expirations[0] if len(quarter_expirations) >= 1 else None
+    selected['quarter_2'] = quarter_expirations[1] if len(quarter_expirations) >= 2 else None
+    return selected
+
+
+def parse_nasdaq_option_chain_last_trade(payload):
+    data = (payload or {}).get('data') or {}
+    last_trade_text = str(data.get('lastTrade') or '').strip()
+    price_match = re.search(r'\$\s*([\d,]+(?:\.\d+)?)', last_trade_text)
+    date_match = re.search(
+        r'AS\s+OF\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})',
+        last_trade_text,
+        flags=re.IGNORECASE,
+    )
+    underlying_close = parse_us_option_display_number(price_match.group(1)) if price_match else None
+    trade_date = normalize_flexible_date(date_match.group(1)) if date_match else None
+    if underlying_close is None or underlying_close <= 0 or not trade_date:
+        raise ValueError(f'Nasdaq option chain has invalid lastTrade: {last_trade_text!r}')
+    return trade_date, underlying_close, last_trade_text
+
+
+def extract_nasdaq_option_expirations(payload):
+    trade_date, _underlying_close, _last_trade_text = parse_nasdaq_option_chain_last_trade(payload)
+    reference_day = datetime.strptime(trade_date, '%Y-%m-%d').date()
+    table = ((payload or {}).get('data') or {}).get('table') or {}
+    rows = table.get('rows') or []
+    expirations = set()
+    current_group_expiration = None
+    for row in rows:
+        row = row or {}
+        group_value = row.get('expirygroup') or row.get('expiryGroup')
+        group_expiration = parse_us_option_expiration(group_value, reference_day)
+        if group_expiration is not None:
+            current_group_expiration = group_expiration
+            expirations.add(group_expiration)
+        row_expiration = parse_us_option_expiration(
+            row.get('expiryDate') or row.get('expirationDate'),
+            reference_day,
+        )
+        if row_expiration is not None:
+            expirations.add(row_expiration)
+        elif current_group_expiration is not None and row.get('strike') not in (None, ''):
+            expirations.add(current_group_expiration)
+    return sorted(expirations)
+
+
+def build_us_option_contract_code(symbol, expiration, option_type, strike_price):
+    expiration_day = parse_us_option_expiration(expiration)
+    normalized_type = str(option_type or '').strip().upper()
+    strike = parse_us_option_display_number(strike_price)
+    if expiration_day is None or normalized_type not in {'CALL', 'PUT'} or strike is None:
+        return None
+    side = 'C' if normalized_type == 'CALL' else 'P'
+    return f'{str(symbol).strip().upper()}{expiration_day:%y%m%d}{side}{int(round(strike * 1000)):08d}'
+
+
+def build_us_option_price_rows_from_nasdaq_payload(payload, symbol, expiration=None):
+    normalized_symbol = str(symbol or '').strip().upper()
+    product = US_OPTION_PRICE_PC_PRODUCTS.get(normalized_symbol)
+    if product is None:
+        raise ValueError(f'Unsupported US ETF option product: {normalized_symbol}')
+    trade_date, underlying_close, last_trade_text = parse_nasdaq_option_chain_last_trade(payload)
+    reference_day = datetime.strptime(trade_date, '%Y-%m-%d').date()
+    fixed_expiration = parse_us_option_expiration(expiration, reference_day)
+    table = ((payload or {}).get('data') or {}).get('table') or {}
+    rows = table.get('rows') or []
+    result = []
+    current_group_expiration = fixed_expiration
+    for source_row in rows:
+        source_row = source_row or {}
+        group_expiration = parse_us_option_expiration(
+            source_row.get('expirygroup') or source_row.get('expiryGroup'),
+            reference_day,
+        )
+        if group_expiration is not None:
+            current_group_expiration = group_expiration
+        row_expiration = (
+            fixed_expiration
+            or parse_us_option_expiration(
+                source_row.get('expiryDate') or source_row.get('expirationDate'),
+                reference_day,
+            )
+            or current_group_expiration
+        )
+        strike_price = parse_us_option_display_number(source_row.get('strike'))
+        if row_expiration is None or strike_price is None:
+            continue
+        for option_type, prefix in (('CALL', 'c'), ('PUT', 'p')):
+            close_price = parse_us_option_display_number(
+                source_row.get(f'{prefix}_Last') or source_row.get(f'{prefix}_last')
+            )
+            volume = parse_us_option_display_integer(
+                source_row.get(f'{prefix}_Volume') or source_row.get(f'{prefix}_volume')
+            )
+            if close_price is None or close_price <= 0 or volume is None or volume <= 0:
+                continue
+            open_interest = parse_us_option_display_integer(
+                source_row.get(f'{prefix}_Openinterest')
+                or source_row.get(f'{prefix}_OpenInterest')
+                or source_row.get(f'{prefix}_openinterest')
+            )
+            result.append({
+                'trade_date': trade_date,
+                'index_code': product['index_code'],
+                'index_name': product['index_name'],
+                'underlying_code': normalized_symbol,
+                'underlying_name': product['product_name'],
+                'underlying_close': underlying_close,
+                'contract_code': build_us_option_contract_code(
+                    normalized_symbol,
+                    row_expiration.isoformat(),
+                    option_type,
+                    strike_price,
+                ),
+                'expiration_date': row_expiration.isoformat(),
+                'contract_month': row_expiration.strftime('%y%m'),
+                'option_type': option_type,
+                'strike_price': strike_price,
+                'close_price': close_price,
+                'volume': volume,
+                'open_interest': open_interest,
+                'value_basis': 'last_trade_with_positive_daily_volume',
+                'data_source': US_OPTION_PRICE_PC_LIVE_SOURCE,
+                'source_url': (
+                    f'https://www.nasdaq.com/market-activity/etf/'
+                    f'{normalized_symbol.lower()}/option-chain'
+                ),
+                'raw_json': {
+                    'last_trade': last_trade_text,
+                    'expiration': row_expiration.isoformat(),
+                    'strike': source_row.get('strike'),
+                    'last': source_row.get(f'{prefix}_Last') or source_row.get(f'{prefix}_last'),
+                    'volume': source_row.get(f'{prefix}_Volume') or source_row.get(f'{prefix}_volume'),
+                    'open_interest': (
+                        source_row.get(f'{prefix}_Openinterest')
+                        or source_row.get(f'{prefix}_OpenInterest')
+                        or source_row.get(f'{prefix}_openinterest')
+                    ),
+                },
+            })
+    return result
+
+
+def select_adjacent_us_option_price_rows(rows, underlying_close):
+    target = parse_us_option_display_number(underlying_close)
+    if target is None or target <= 0:
+        return []
+    selected = []
+    grouped = {}
+    for row in rows or []:
+        expiration_date = normalize_trade_date(row.get('expiration_date'))
+        option_type = str(row.get('option_type') or '').strip().upper()
+        strike_price = parse_us_option_display_number(row.get('strike_price'))
+        close_price = parse_us_option_display_number(row.get('close_price'))
+        if (
+            not expiration_date
+            or option_type not in {'CALL', 'PUT'}
+            or strike_price is None
+            or close_price is None
+            or close_price <= 0
+        ):
+            continue
+        grouped.setdefault((expiration_date, option_type), {})[strike_price] = row
+
+    for point_rows in grouped.values():
+        strikes = sorted(point_rows)
+        exact = next((strike for strike in strikes if abs(strike - target) < 1e-9), None)
+        if exact is not None:
+            selected.append(point_rows[exact])
+            continue
+        lower = next((strike for strike in reversed(strikes) if strike < target), None)
+        upper = next((strike for strike in strikes if strike > target), None)
+        if lower is not None and upper is not None:
+            selected.extend((point_rows[lower], point_rows[upper]))
+    return selected
+
+
+def _normalize_history_option_type(value):
+    normalized = str(value or '').strip().upper()
+    if normalized in {'C', 'CALL'}:
+        return 'CALL'
+    if normalized in {'P', 'PUT'}:
+        return 'PUT'
+    return None
+
+
+def _history_underlying_close_map(underlying_frame):
+    if underlying_frame is None or underlying_frame.empty:
+        return {}
+    columns = {str(column).strip().lower(): column for column in underlying_frame.columns}
+    date_column = columns.get('date') or columns.get('trade_date')
+    close_column = columns.get('close')
+    if date_column is None or close_column is None:
+        raise ValueError('US option history underlying file is missing date or close.')
+    result = {}
+    for raw_date, raw_close in zip(underlying_frame[date_column], underlying_frame[close_column]):
+        trade_date = normalize_trade_date(raw_date)
+        close_price = to_float(raw_close)
+        if trade_date and close_price is not None and close_price > 0:
+            result[trade_date] = close_price
+    return result
+
+
+def build_us_option_price_rows_from_history_frames(
+    option_frame,
+    underlying_frame,
+    symbol,
+    start_date=None,
+    end_date=None,
+    source_url=None,
+):
+    normalized_symbol = str(symbol or '').strip().upper()
+    product = US_OPTION_PRICE_PC_PRODUCTS.get(normalized_symbol)
+    if product is None:
+        raise ValueError(f'Unsupported US ETF option product: {normalized_symbol}')
+    if option_frame is None or option_frame.empty:
+        return []
+    columns = {str(column).strip().lower(): column for column in option_frame.columns}
+    required = ('date', 'expiration', 'strike', 'type', 'last', 'volume')
+    missing = [column for column in required if column not in columns]
+    if missing:
+        raise ValueError('US option history file is missing columns: ' + ', '.join(missing))
+    underlying_close_map = _history_underlying_close_map(underlying_frame)
+    normalized_start = normalize_trade_date(start_date) if start_date else None
+    normalized_end = normalize_trade_date(end_date) if end_date else None
+
+    working = option_frame[[columns[column] for column in required] + [
+        column for key, column in columns.items()
+        if key in {'contract_id', 'open_interest'} and column not in {columns[item] for item in required}
+    ]].copy()
+    working['_trade_date'] = working[columns['date']].map(normalize_trade_date)
+    working['_expiration_date'] = working[columns['expiration']].map(normalize_trade_date)
+    working['_option_type'] = working[columns['type']].map(_normalize_history_option_type)
+    working['_strike_price'] = pd.to_numeric(working[columns['strike']], errors='coerce')
+    working['_close_price'] = pd.to_numeric(working[columns['last']], errors='coerce')
+    working['_volume'] = pd.to_numeric(working[columns['volume']], errors='coerce')
+    working = working[
+        working['_trade_date'].notna()
+        & working['_expiration_date'].notna()
+        & working['_option_type'].notna()
+        & (working['_close_price'] > 0)
+        & (working['_volume'] > 0)
+    ]
+    if normalized_start:
+        working = working[working['_trade_date'] >= normalized_start]
+    if normalized_end:
+        working = working[working['_trade_date'] <= normalized_end]
+
+    result = []
+    contract_id_column = columns.get('contract_id')
+    open_interest_column = columns.get('open_interest')
+    for trade_date, daily_frame in working.groupby('_trade_date', sort=True):
+        underlying_close = underlying_close_map.get(trade_date)
+        if underlying_close is None:
+            continue
+        selected_expirations = select_us_option_pc_expirations(
+            daily_frame['_expiration_date'].unique(),
+            trade_date,
+        )
+        expiration_values = {
+            expiration.isoformat()
+            for expiration in selected_expirations.values()
+            if expiration is not None
+        }
+        if not expiration_values:
+            continue
+        candidate_rows = []
+        for _index, source_row in daily_frame[
+            daily_frame['_expiration_date'].isin(expiration_values)
+        ].iterrows():
+            expiration_date = source_row['_expiration_date']
+            option_type = source_row['_option_type']
+            strike_price = float(source_row['_strike_price'])
+            close_price = float(source_row['_close_price'])
+            volume = int(source_row['_volume'])
+            open_interest = (
+                parse_us_option_display_integer(source_row.get(open_interest_column))
+                if open_interest_column is not None
+                else None
+            )
+            contract_code = (
+                str(source_row.get(contract_id_column) or '').strip()
+                if contract_id_column is not None
+                else ''
+            ) or build_us_option_contract_code(
+                normalized_symbol,
+                expiration_date,
+                option_type,
+                strike_price,
+            )
+            candidate_rows.append({
+                'trade_date': trade_date,
+                'index_code': product['index_code'],
+                'index_name': product['index_name'],
+                'underlying_code': normalized_symbol,
+                'underlying_name': product['product_name'],
+                'underlying_close': underlying_close,
+                'contract_code': contract_code,
+                'expiration_date': expiration_date,
+                'contract_month': expiration_date[2:4] + expiration_date[5:7],
+                'option_type': option_type,
+                'strike_price': strike_price,
+                'close_price': close_price,
+                'volume': volume,
+                'open_interest': open_interest,
+                'value_basis': 'last_trade_with_positive_daily_volume',
+                'data_source': US_OPTION_PRICE_PC_HISTORY_SOURCE,
+                'source_url': source_url or US_OPTION_PRICE_PC_HISTORY_REPOSITORY_URL,
+                'raw_json': {
+                    'date': trade_date,
+                    'expiration': expiration_date,
+                    'type': source_row.get(columns['type']),
+                    'strike': strike_price,
+                    'last': close_price,
+                    'volume': volume,
+                    'open_interest': open_interest,
+                },
+            })
+        result.extend(select_adjacent_us_option_price_rows(candidate_rows, underlying_close))
+    return result
+
+
 def build_weekday_date_strings(start_date, end_date):
     start = datetime.strptime(normalize_trade_date(start_date), '%Y-%m-%d').date()
     end = datetime.strptime(normalize_trade_date(end_date), '%Y-%m-%d').date()
@@ -1248,6 +1844,20 @@ def build_us_credit_spread_rows(csv_text):
             'trade_date': trade_date,
             'high_yield_oas': value,
             'data_source': US_CREDIT_SPREAD_SOURCE,
+        }
+        for trade_date, value in sorted(points.items())
+        if value is not None
+    ]
+    return attach_us_credit_spread_available_at(rows)
+
+
+def build_us_credit_spread_archive_rows(csv_text):
+    points = build_fred_series_points(csv_text, FRED_HIGH_YIELD_OAS_SERIES)
+    rows = [
+        {
+            'trade_date': trade_date,
+            'high_yield_oas': value,
+            'data_source': US_CREDIT_SPREAD_ARCHIVE_SOURCE,
         }
         for trade_date, value in sorted(points.items())
         if value is not None
@@ -2387,6 +2997,15 @@ async def sync_daily_us_hedge_fund_ls_proxy(db_tools):
 
 async def fetch_us_put_call_daily_json_rows(start_date, end_date, concurrency=8):
     candidate_dates = build_weekday_date_strings(start_date, end_date)
+    return await fetch_us_put_call_daily_json_rows_for_dates(candidate_dates, concurrency=concurrency)
+
+
+async def fetch_us_put_call_daily_json_rows_for_dates(candidate_dates, concurrency=8):
+    candidate_dates = sorted({
+        normalized_date
+        for trade_date in candidate_dates or []
+        if (normalized_date := normalize_trade_date(trade_date))
+    })
     semaphore = asyncio.Semaphore(concurrency)
     rows = []
     skipped = 0
@@ -2473,15 +3092,37 @@ async def backfill_us_put_call_ratio(db_tools):
 
 async def sync_daily_us_put_call_ratio(db_tools):
     rows = []
+    today = datetime.now().date()
+    recent_dates = build_weekday_date_strings(
+        (today - timedelta(days=14)).strftime('%Y-%m-%d'),
+        today.strftime('%Y-%m-%d'),
+    )
+    missing_dates = []
+    get_missing_dates = getattr(db_tools, 'get_index_us_put_call_missing_trade_dates', None)
+    if callable(get_missing_dates):
+        try:
+            missing_dates = await get_missing_dates(
+                US_PUT_CALL_DAILY_JSON_START_DATE,
+                today.strftime('%Y-%m-%d'),
+                limit=256,
+            )
+        except Exception as exc:
+            print(f'index us put call missing-date lookup failed, continue recent repair: {exc}')
+
+    candidate_dates = sorted(set(recent_dates).union(missing_dates))
     try:
-        daily_rows, _, daily_failures = await fetch_us_put_call_daily_json_rows(
-            (datetime.now().date() - timedelta(days=14)).strftime('%Y-%m-%d'),
-            datetime.now().strftime('%Y-%m-%d'),
+        daily_rows, skipped_daily, daily_failures = await fetch_us_put_call_daily_json_rows_for_dates(
+            candidate_dates,
             concurrency=4,
         )
-        rows.extend(daily_rows[-1:] if daily_rows else [])
+        rows.extend(daily_rows)
         if daily_failures:
             print(f'index us put call daily-json recent failures: {len(daily_failures)}')
+        print(
+            'index us put call daily-json repair scanned, '
+            f'candidate_dates: {len(candidate_dates)}, missing_dates: {len(missing_dates)}, '
+            f'valid_rows: {len(daily_rows)}, skipped_dates: {skipped_daily}'
+        )
     except Exception as exc:
         print(f'index us put call daily-json fetch failed, fallback to current page: {exc}')
 
@@ -2505,17 +3146,301 @@ async def sync_daily_us_put_call_ratio(db_tools):
     if not rows:
         raise ValueError('No valid Cboe Put/Call daily row built.')
 
+    rows = merge_us_put_call_ratio_rows(rows)
     latest_row = rows[-1]
     latest_date = datetime.strptime(latest_row['trade_date'], '%Y-%m-%d').date()
     if latest_date < (datetime.now().date() - timedelta(days=14)):
         raise ValueError(f'Cboe Put/Call daily row is stale: {latest_row["trade_date"]}')
-    upserted = await db_tools.upsert_index_us_put_call_ratio_daily([latest_row])
+    upserted = await db_tools.upsert_index_us_put_call_ratio_daily(rows)
     print(
         'index us put call ratio daily finished, '
         f'index_us_put_call_ratio_daily upserted: {upserted}, '
-        f'trade_date: {latest_row["trade_date"]}'
+        f'range: {rows[0]["trade_date"]} -> {rows[-1]["trade_date"]}'
     )
     return upserted
+
+
+async def sync_daily_us_option_premium(db_tools):
+    html_text = await asyncio.to_thread(fetch_us_option_premium_html)
+    row = parse_optionomics_option_premium_html(html_text)
+    trade_date = datetime.strptime(row['trade_date'], '%Y-%m-%d').date()
+    age_days = (datetime.now().date() - trade_date).days
+    if age_days < 0:
+        raise ValueError(f'Optionomics premium date is in the future: {row["trade_date"]}')
+    if age_days > 7:
+        raise ValueError(f'Optionomics premium page is stale: {row["trade_date"]}')
+
+    upserted = await db_tools.upsert_index_us_option_premium_daily([row])
+    print(
+        'index us option premium daily finished, '
+        f'index_us_option_premium_daily upserted: {upserted}, '
+        f'trade_date: {row["trade_date"]}, '
+        f'call_musd: {row["call_premium_million_usd"]:.1f}, '
+        f'put_musd: {row["put_premium_million_usd"]:.1f}, '
+        f'premium_pc: {row["premium_put_call_ratio"]:.6f}, '
+        'basis: source display rounded to 0.1M USD'
+    )
+    return upserted
+
+
+def _us_option_history_url(symbol, filename):
+    return (
+        f'{US_OPTION_PRICE_PC_HISTORY_BASE_URL}/'
+        f'{str(symbol).strip().lower()}/{str(filename).strip()}'
+    )
+
+
+def _download_us_option_history_file(url, target_path):
+    path = Path(target_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > 0:
+        return path
+    temporary_path = path.with_suffix(path.suffix + '.part')
+    response = requests.get(url, headers=DEFAULT_HTTP_HEADERS, timeout=180, stream=True)
+    response.raise_for_status()
+    with temporary_path.open('wb') as file:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                file.write(chunk)
+    if temporary_path.stat().st_size <= 0:
+        raise ValueError(f'US option history download is empty: {url}')
+    temporary_path.replace(path)
+    return path
+
+
+def _read_us_option_history_parquet(path):
+    try:
+        return pd.read_parquet(path)
+    except ImportError as exc:
+        raise RuntimeError(
+            'Historical US option backfill requires pyarrow; install requirements.txt first.'
+        ) from exc
+
+
+def fetch_live_us_option_price_rows(symbol):
+    normalized_symbol = str(symbol or '').strip().upper()
+    discovery_payload = fetch_nasdaq_us_option_chain(normalized_symbol)
+    trade_date, underlying_close, _last_trade_text = parse_nasdaq_option_chain_last_trade(
+        discovery_payload
+    )
+    selected_expirations = select_us_option_pc_expirations(
+        extract_nasdaq_option_expirations(discovery_payload),
+        trade_date,
+    )
+    if any(expiration is None for expiration in selected_expirations.values()):
+        missing = [key for key, expiration in selected_expirations.items() if expiration is None]
+        raise ValueError(
+            f'Nasdaq {normalized_symbol} option chain is missing standard expiries: '
+            + ', '.join(missing)
+        )
+
+    candidate_rows = []
+    for expiration in dict.fromkeys(selected_expirations.values()):
+        expiration_text = expiration.isoformat()
+        payload = fetch_nasdaq_us_option_chain(
+            normalized_symbol,
+            from_date=expiration_text,
+            to_date=expiration_text,
+        )
+        payload_trade_date, payload_underlying_close, _payload_last_trade = (
+            parse_nasdaq_option_chain_last_trade(payload)
+        )
+        if payload_trade_date != trade_date:
+            raise ValueError(
+                f'Nasdaq {normalized_symbol} option chain source dates disagree: '
+                f'{trade_date} != {payload_trade_date}'
+            )
+        if abs(payload_underlying_close - underlying_close) > 1e-6:
+            raise ValueError(
+                f'Nasdaq {normalized_symbol} underlying closes disagree: '
+                f'{underlying_close} != {payload_underlying_close}'
+            )
+        candidate_rows.extend(
+            build_us_option_price_rows_from_nasdaq_payload(
+                payload,
+                normalized_symbol,
+                expiration=expiration_text,
+            )
+        )
+
+    selected_rows = select_adjacent_us_option_price_rows(candidate_rows, underlying_close)
+    coverage = {
+        (row['expiration_date'], row['option_type'])
+        for row in selected_rows
+    }
+    incomplete = []
+    for bucket, expiration in selected_expirations.items():
+        for option_type in ('CALL', 'PUT'):
+            if (expiration.isoformat(), option_type) not in coverage:
+                incomplete.append(f'{bucket}:{option_type}')
+    if incomplete:
+        raise ValueError(
+            f'Nasdaq {normalized_symbol} option chain lacks traded adjacent strikes: '
+            + ', '.join(incomplete)
+        )
+    return {
+        'symbol': normalized_symbol,
+        'trade_date': trade_date,
+        'underlying_close': underlying_close,
+        'selected_expirations': {
+            bucket: expiration.isoformat()
+            for bucket, expiration in selected_expirations.items()
+        },
+        'rows': selected_rows,
+    }
+
+
+async def sync_daily_us_option_price_pc(db_tools):
+    product_results = []
+    for symbol in US_OPTION_PRICE_PC_PRODUCTS:
+        product_results.append(
+            await asyncio.to_thread(fetch_live_us_option_price_rows, symbol)
+        )
+    trade_dates = sorted({result['trade_date'] for result in product_results})
+    if len(trade_dates) != 1:
+        raise ValueError(
+            'SPY and QQQ Nasdaq option chains returned different source dates: '
+            + ', '.join(trade_dates)
+        )
+    trade_date = trade_dates[0]
+    age_days = (datetime.now().date() - datetime.strptime(trade_date, '%Y-%m-%d').date()).days
+    if age_days < 0 or age_days > 7:
+        raise ValueError(f'Nasdaq option chain source date is invalid or stale: {trade_date}')
+    rows = [row for result in product_results for row in result['rows']]
+    if not rows:
+        raise ValueError('No valid SPY/QQQ option close rows built from Nasdaq.')
+    upserted = await db_tools.upsert_index_us_etf_option_daily(rows)
+    result = {
+        'status': 'SUCCESS',
+        'trade_date': trade_date,
+        'trade_dates': [trade_date],
+        'upserted': upserted,
+        'row_count': len(rows),
+        'data_source': US_OPTION_PRICE_PC_LIVE_SOURCE,
+        'products': {
+            item['symbol']: {
+                'underlying_close': item['underlying_close'],
+                'selected_expirations': item['selected_expirations'],
+                'row_count': len(item['rows']),
+            }
+            for item in product_results
+        },
+    }
+    print(
+        'US ETF option price P/C daily finished, '
+        f'trade_date: {trade_date}, rows: {len(rows)}, upserted: {upserted}, '
+        'products: SPY,QQQ, basis: last trade with positive daily volume'
+    )
+    return result
+
+
+async def backfill_us_option_price_pc(
+    db_tools,
+    start_date='2008-01-01',
+    end_date='2025-12-31',
+):
+    normalized_start = normalize_trade_date(start_date)
+    normalized_end = normalize_trade_date(end_date)
+    if not normalized_start or not normalized_end or normalized_start > normalized_end:
+        raise ValueError(f'Invalid US option history range: {start_date} -> {end_date}')
+    cache_dir = get_cache_dir('us_option_price_pc')
+    completed = US_OPTION_PRICE_PC_PROGRESS_STORE.load()
+    total_upserted = 0
+    processed_parts = 0
+    skipped_parts = 0
+    failures = []
+
+    for symbol, product in US_OPTION_PRICE_PC_PRODUCTS.items():
+        start_year = max(int(normalized_start[:4]), int(product['history_start_year']))
+        end_year = min(int(normalized_end[:4]), US_OPTION_PRICE_PC_HISTORY_END_YEAR)
+        if start_year > end_year:
+            continue
+        underlying_url = _us_option_history_url(symbol, 'underlying_prices.parquet')
+        underlying_path = cache_dir / symbol.lower() / 'underlying_prices.parquet'
+        try:
+            await asyncio.to_thread(
+                _download_us_option_history_file,
+                underlying_url,
+                underlying_path,
+            )
+            underlying_frame = await asyncio.to_thread(
+                _read_us_option_history_parquet,
+                underlying_path,
+            )
+        except Exception as exc:
+            failures.append(f'{symbol}:underlying:{exc}')
+            continue
+
+        for year in range(start_year, end_year + 1):
+            part_start = max(normalized_start, f'{year}-01-01')
+            part_end = min(normalized_end, f'{year}-12-31')
+            progress_key = f'{symbol},{year},{part_start},{part_end}'
+            if progress_key in completed:
+                skipped_parts += 1
+                continue
+            filename = f'options_{year}.parquet'
+            source_url = _us_option_history_url(symbol, filename)
+            source_path = cache_dir / symbol.lower() / filename
+            try:
+                await asyncio.to_thread(
+                    _download_us_option_history_file,
+                    source_url,
+                    source_path,
+                )
+                option_frame = await asyncio.to_thread(
+                    _read_us_option_history_parquet,
+                    source_path,
+                )
+                rows = await asyncio.to_thread(
+                    build_us_option_price_rows_from_history_frames,
+                    option_frame,
+                    underlying_frame,
+                    symbol,
+                    part_start,
+                    part_end,
+                    source_url,
+                )
+                upserted = await db_tools.upsert_index_us_etf_option_daily(rows)
+                total_upserted += upserted
+                processed_parts += 1
+                await asyncio.to_thread(
+                    US_OPTION_PRICE_PC_PROGRESS_STORE.append,
+                    progress_key,
+                )
+                completed.add(progress_key)
+                print(
+                    'US ETF option price P/C history part finished, '
+                    f'symbol: {symbol}, year: {year}, rows: {len(rows)}, '
+                    f'upserted: {upserted}'
+                )
+            except Exception as exc:
+                failures.append(f'{symbol}:{year}:{exc}')
+                print(f'US ETF option price P/C history failed for {symbol} {year}: {exc}')
+            finally:
+                if 'option_frame' in locals():
+                    del option_frame
+
+    if failures:
+        raise RuntimeError(
+            'US ETF option price P/C history backfill has failures: '
+            + '; '.join(failures[:8])
+        )
+    result = {
+        'status': 'SUCCESS',
+        'start_date': normalized_start,
+        'end_date': normalized_end,
+        'processed_parts': processed_parts,
+        'skipped_parts': skipped_parts,
+        'upserted': total_upserted,
+        'data_source': US_OPTION_PRICE_PC_HISTORY_SOURCE,
+    }
+    print(
+        'US ETF option price P/C history finished, '
+        f'range: {normalized_start} -> {normalized_end}, '
+        f'processed_parts: {processed_parts}, skipped_parts: {skipped_parts}, '
+        f'upserted: {total_upserted}'
+    )
+    return result
 
 
 async def backfill_us_treasury_yield(db_tools):
@@ -2581,6 +3506,30 @@ async def backfill_us_credit_spread(db_tools):
     if not rows:
         raise ValueError('No valid FRED US high yield credit spread rows built.')
 
+    archive_text = await asyncio.to_thread(fetch_us_credit_spread_archive_csv)
+    archive_rows = build_us_credit_spread_archive_rows(archive_text)
+    if not archive_rows:
+        raise ValueError('No valid archived FRED US high yield credit spread rows built.')
+
+    live_by_date = {row['trade_date']: row for row in rows}
+    archive_by_date = {row['trade_date']: row for row in archive_rows}
+    overlap_dates = sorted(set(live_by_date) & set(archive_by_date))
+    if not overlap_dates:
+        raise ValueError('Archived and live FRED HY OAS rows have no overlap to verify.')
+    mismatched_dates = [
+        trade_date
+        for trade_date in overlap_dates
+        if abs(
+            float(live_by_date[trade_date]['high_yield_oas'])
+            - float(archive_by_date[trade_date]['high_yield_oas'])
+        ) > 1e-9
+    ]
+    if mismatched_dates:
+        raise ValueError(
+            'Archived FRED HY OAS values disagree with the live official series: '
+            + ', '.join(mismatched_dates[:5])
+        )
+
     existing_rows = await db_tools.get_quant_index_risk_us_credit_rows(
         '1900-01-01',
         '2100-12-31',
@@ -2596,7 +3545,10 @@ async def backfill_us_credit_spread(db_tools):
             if row.get('available_at') is None
         ]
     )
-    merged_rows = {row['trade_date']: row for row in legacy_rows}
+    # The pinned archive restores the observations that FRED stopped serving in
+    # April 2026. Existing rows and the live FRED response always take priority.
+    merged_rows = dict(archive_by_date)
+    merged_rows.update({row['trade_date']: row for row in legacy_rows})
     merged_rows.update({row['trade_date']: row for row in rows})
     rows = [merged_rows[trade_date] for trade_date in sorted(merged_rows)]
 
@@ -2775,6 +3727,40 @@ async def sync_daily_us_put_call_ratio_only():
 
     try:
         return await sync_daily_us_put_call_ratio(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_us_option_premium_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await sync_daily_us_option_premium(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def sync_daily_us_option_price_pc_only():
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await sync_daily_us_option_price_pc(db_tools)
+    finally:
+        await db_tools.close()
+
+
+async def backfill_us_option_price_pc_only(start_date=None, end_date=None):
+    db_tools = DbTools()
+    await db_tools.init_pool()
+
+    try:
+        return await backfill_us_option_price_pc(
+            db_tools,
+            start_date=start_date or '2008-01-01',
+            end_date=end_date or '2025-12-31',
+        )
     finally:
         await db_tools.close()
 
@@ -3050,6 +4036,17 @@ async def main():
     if command == 'daily-us-put-call-ratio':
         await sync_daily_us_put_call_ratio_only()
         return
+    if command == 'daily-us-option-premium':
+        await sync_daily_us_option_premium_only()
+        return
+    if command == 'daily-us-option-price-pc':
+        await sync_daily_us_option_price_pc_only()
+        return
+    if command == 'backfill-us-option-price-pc':
+        start_date = sys.argv[2] if len(sys.argv) > 2 else None
+        end_date = sys.argv[3] if len(sys.argv) > 3 else None
+        await backfill_us_option_price_pc_only(start_date=start_date, end_date=end_date)
+        return
     if command == 'backfill-us-treasury-yield':
         await backfill_us_treasury_yield_only()
         return
@@ -3081,7 +4078,8 @@ async def main():
         'backfill-cn-baifenwei-fear-greed, daily-cn-baifenwei-fear-greed, '
         'backfill-us-vix, daily-us-vix, backfill-us-fear-greed, daily-us-fear-greed, '
         'backfill-us-hedge-proxy, daily-us-hedge-proxy, '
-        'backfill-us-put-call-ratio, daily-us-put-call-ratio, '
+        'backfill-us-put-call-ratio, daily-us-put-call-ratio, daily-us-option-premium, '
+        'backfill-us-option-price-pc, daily-us-option-price-pc, '
         'backfill-us-treasury-yield, daily-us-treasury-yield, '
         'backfill-us-credit-spread, daily-us-credit-spread, '
         'backfill-us-market-sentiment, daily-us-market-sentiment, daily'

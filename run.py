@@ -9,6 +9,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from akshare_project.collectors import (  # noqa: E402
+    bank_liquidity,
     cffex,
     douyin_emotion,
     etf,
@@ -43,7 +44,7 @@ async def dispatch():
         raise ValueError(
             "usage: python run.py <domain> <command> [args]\n"
             "domains: stock, index, quant-index, cffex, douyin, forex, futures, etf, "
-            "option, option-minute, exchange-option, risk-free-rate, macro, margin-trading, fund-purchase-limit, "
+            "option, option-minute, exchange-option, risk-free-rate, bank-liquidity, macro, margin-trading, fund-purchase-limit, "
             "global-risk, runner, emotion-excel"
         )
 
@@ -98,6 +99,10 @@ async def dispatch():
     if domain == "risk-free-rate":
         set_argv("risk-free-rate", [command, *args])
         await risk_free_rate.main()
+        return
+    if domain == "bank-liquidity":
+        set_argv("bank-liquidity", [command, *args])
+        await bank_liquidity.main()
         return
     if domain == "macro":
         set_argv("macro", [command, *args])

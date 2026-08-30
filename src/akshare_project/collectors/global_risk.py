@@ -1,6 +1,8 @@
 import asyncio
 import ast
+import csv
 import html
+import io
 import json
 import os
 import re
@@ -24,9 +26,29 @@ FRED_ASSETS = {
     "WTI": ("WTI原油", "DCOILWTICO"),
     "BRENT": ("布伦特原油", "DCOILBRENTEU"),
 }
+CBOE_ASSETS = {
+    "VIX9D": (
+        "Cboe 9日波动率指数",
+        "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv",
+    ),
+    "VIX3M": (
+        "Cboe 3个月波动率指数",
+        "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv",
+    ),
+    "VVIX": (
+        "Cboe VIX波动率指数",
+        "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv",
+    ),
+    "VXEEM": (
+        "Cboe新兴市场ETF波动率指数",
+        "https://cdn.cboe.com/api/global/us_indices/daily_prices/VXEEM_History.csv",
+    ),
+}
 ISHARES_ASSETS = {
     "IXN_NAV": ("iShares全球科技ETF NAV", "239750"),
     "ACWI_NAV": ("iShares全球股票ETF NAV", "239600"),
+    "EFA_NAV": ("iShares MSCI EAFE ETF NAV", "239623"),
+    "EEM_NAV": ("iShares MSCI新兴市场ETF NAV", "239637"),
 }
 ISHARES_DOWNLOAD_URL = (
     "https://www.blackrock.com/varnish-api/blk-one01-product-data/product-data/"
@@ -45,7 +67,7 @@ CSI_TECH_INDEXES = {
 }
 PEAKSTONE_PANEL_URL = "https://panel.peakstone-labs.com/"
 TURNOVER_CONCENTRATION_HISTORY_START = date(2016, 9, 26)
-GLOBAL_HISTORY_START = date(2004, 1, 1)
+GLOBAL_HISTORY_START = date(2001, 1, 1)
 TECH_HISTORY_START = date(2005, 1, 1)
 RECENT_REPAIR_CALENDAR_DAYS = 24
 
@@ -126,6 +148,59 @@ def build_fred_asset_rows(csv_text, asset_code, asset_name, series_id):
         for trade_date, value in sorted(points.items())
         if value is not None
     ]
+
+
+def build_cboe_index_rows(csv_text, asset_code, asset_name, source_url):
+    """Parse Cboe historical-index CSVs with either OHLC or one-value layouts."""
+    reader = csv.DictReader(io.StringIO(csv_text or ""))
+    if not reader.fieldnames:
+        raise ValueError(f"Cboe {asset_code} response has no CSV header")
+    normalized_headers = {
+        str(header or "").strip().upper(): header
+        for header in reader.fieldnames
+    }
+    date_column = normalized_headers.get("DATE")
+    close_column = normalized_headers.get("CLOSE") or normalized_headers.get(asset_code.upper())
+    if date_column is None or close_column is None:
+        raise ValueError(
+            f"Cboe {asset_code} columns are unsupported: {reader.fieldnames}"
+        )
+    open_column = normalized_headers.get("OPEN")
+    high_column = normalized_headers.get("HIGH")
+    low_column = normalized_headers.get("LOW")
+    rows = []
+    for source in reader:
+        trade_date = _date_text(source.get(date_column))
+        close_value = _to_float(source.get(close_column))
+        if not trade_date or close_value is None or close_value <= 0:
+            continue
+        rows.append(_row(
+            asset_code,
+            asset_name,
+            trade_date,
+            close_value,
+            open_value=_to_float(source.get(open_column)) if open_column else None,
+            high_value=_to_float(source.get(high_column)) if high_column else None,
+            low_value=_to_float(source.get(low_column)) if low_column else None,
+            data_source="cboe_official_historical_index",
+            source_url=source_url,
+            raw_json={
+                str(key): value
+                for key, value in source.items()
+            },
+        ))
+    deduped = {row["trade_date"]: row for row in rows}
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def fetch_cboe_index_csv(source_url):
+    response = requests.get(
+        source_url,
+        headers=index_collector.DEFAULT_HTTP_HEADERS,
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.text
 
 
 def _extract_xml_values(row_xml):
@@ -525,6 +600,36 @@ def build_top1_turnover_concentration_rows(source_rows):
     return rows
 
 
+async def collect_cboe_rows(start_date, end_date, daily_only=False):
+    payloads = await asyncio.gather(*(
+        asyncio.to_thread(fetch_cboe_index_csv, source_url)
+        for _asset_code, (_asset_name, source_url) in CBOE_ASSETS.items()
+    ))
+    rows = []
+    for (asset_code, (asset_name, source_url)), csv_text in zip(
+        CBOE_ASSETS.items(), payloads
+    ):
+        rows.extend(build_cboe_index_rows(
+            csv_text,
+            asset_code,
+            asset_name,
+            source_url,
+        ))
+    start_text = start_date.isoformat()
+    end_text = end_date.isoformat()
+    rows = [row for row in rows if start_text <= row["trade_date"] <= end_text]
+    if daily_only:
+        by_asset = {}
+        for row in rows:
+            by_asset.setdefault(row["asset_code"], []).append(row)
+        rows = [
+            row
+            for asset_rows in by_asset.values()
+            for row in sorted(asset_rows, key=lambda item: item["trade_date"])[-10:]
+        ]
+    return rows
+
+
 async def collect_global_rows(start_date, end_date, daily_only=False):
     tasks = []
     for asset_code, (asset_name, series_id) in FRED_ASSETS.items():
@@ -533,6 +638,8 @@ async def collect_global_rows(start_date, end_date, daily_only=False):
     rows = []
     for (asset_code, (asset_name, series_id)), csv_text in zip(FRED_ASSETS.items(), fred_payloads):
         rows.extend(build_fred_asset_rows(csv_text, asset_code, asset_name, series_id))
+
+    rows.extend(await collect_cboe_rows(start_date, end_date, daily_only=daily_only))
 
     for asset_code, (asset_name, portfolio_id) in ISHARES_ASSETS.items():
         document = await asyncio.to_thread(fetch_ishares_nav_document, portfolio_id)
@@ -577,6 +684,34 @@ async def backfill_global_risk_assets(start_date=None, end_date=None):
     return result
 
 
+async def backfill_cboe_risk_assets(start_date=None, end_date=None):
+    start_date = start_date or GLOBAL_HISTORY_START
+    end_date = end_date or date.today()
+    rows = await collect_cboe_rows(start_date, end_date, daily_only=False)
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        affected = await db_tools.upsert_global_risk_asset_daily_rows(rows)
+    finally:
+        await db_tools.close()
+    counts = {
+        asset_code: sum(row["asset_code"] == asset_code for row in rows)
+        for asset_code in CBOE_ASSETS
+    }
+    missing = sorted(asset_code for asset_code, count in counts.items() if count <= 0)
+    if missing:
+        raise RuntimeError(f"Cboe risk backfill missing assets: {missing}")
+    result = {
+        "status": "SUCCESS",
+        "affected": affected,
+        "counts": counts,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+    }
+    print(f"Cboe risk asset backfill finished: {json.dumps(result, ensure_ascii=False)}")
+    return result
+
+
 async def sync_global_risk_daily(target_date=None):
     end_date = pd.to_datetime(target_date).date() if target_date else date.today()
     start_date = end_date - timedelta(days=RECENT_REPAIR_CALENDAR_DAYS)
@@ -592,7 +727,12 @@ async def sync_global_risk_daily(target_date=None):
         latest_dates[row["asset_code"]] = max(
             latest_dates.get(row["asset_code"], ""), row["trade_date"]
         )
-    required = set(FRED_ASSETS) | set(ISHARES_ASSETS) | {"KOSPI", "COPPER_HG"}
+    required = (
+        set(FRED_ASSETS)
+        | set(CBOE_ASSETS)
+        | set(ISHARES_ASSETS)
+        | {"KOSPI", "COPPER_HG"}
+    )
     missing = sorted(required - set(latest_dates))
     if missing:
         raise RuntimeError(f"global risk daily missing assets: {missing}")
@@ -713,6 +853,12 @@ async def main():
     if command == "daily":
         await sync_global_risk_daily(args[0] if args else None)
         return
+    if command == "backfill-cboe":
+        await backfill_cboe_risk_assets(
+            _parse_date(args[0], GLOBAL_HISTORY_START) if args else GLOBAL_HISTORY_START,
+            _parse_date(args[1], date.today()) if len(args) > 1 else date.today(),
+        )
+        return
     if command == "backfill-tech":
         await backfill_csi_tech_indexes(
             _parse_date(args[0], TECH_HISTORY_START) if args else TECH_HISTORY_START,
@@ -734,6 +880,7 @@ async def main():
         return
     raise ValueError(
         "global-risk supports: backfill [start_date] [end_date] | daily [target_date] | "
+        "backfill-cboe [start_date] [end_date] | "
         "backfill-tech [start_date] [end_date] | daily-tech [target_date] | "
         "backfill-concentration [start_date] [end_date] | daily-concentration [target_date]"
     )

@@ -171,12 +171,41 @@ def test_credit_backfill_fills_available_at_for_legacy_database_rows(monkeypatch
             [("2023-08-22", 3.93)],
         ),
     )
+    monkeypatch.setattr(
+        index,
+        "fetch_us_credit_spread_archive_csv",
+        lambda: "date,BAMLH0A0HYM2\n1996-12-31,3.13\n2023-08-22,3.93\n",
+    )
     db = _FakeCreditDbTools()
     asyncio.run(index.backfill_us_credit_spread(db))
     rows_by_date = {row["trade_date"]: row for row in db.upserted_rows}
+    assert rows_by_date["1996-12-31"]["high_yield_oas"] == 3.13
+    assert rows_by_date["1996-12-31"]["data_source"].startswith(
+        "fred_archive:"
+    )
     assert rows_by_date["2023-04-25"]["high_yield_oas"] == 4.25
     assert rows_by_date["2023-04-25"]["available_at"] is not None
+    # The live FRED response must overwrite an overlapping verified archive row.
     assert rows_by_date["2023-08-22"]["high_yield_oas"] == 3.93
+    assert rows_by_date["2023-08-22"]["data_source"] == index.US_CREDIT_SPREAD_SOURCE
+
+
+def test_credit_backfill_rejects_archive_that_disagrees_with_live_fred(monkeypatch):
+    monkeypatch.setattr(
+        index,
+        "fetch_fred_series_csv",
+        lambda _series_id: _fred_csv(
+            "BAMLH0A0HYM2",
+            [("2023-08-22", 3.93)],
+        ),
+    )
+    monkeypatch.setattr(
+        index,
+        "fetch_us_credit_spread_archive_csv",
+        lambda: "date,BAMLH0A0HYM2\n2023-08-22,9.99\n",
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        asyncio.run(index.backfill_us_credit_spread(_FakeCreditDbTools()))
 
 
 def _point(value, percentile, source_date="2026-08-14", data_source="fred_public_csv", available_at="2026-08-15T05:00:00+08:00"):
@@ -193,8 +222,7 @@ def test_rate_shock_active_when_all_conditions_match():
     state = quant_index.build_usd_rate_shock_state(
         _point(0.25, 95.0),
         _point(0.20, 92.0),
-        _point(-6.0, 8.0, data_source="global_risk"),
-        _point(-3.0, 5.0, data_source="blackrock_ishares_historical_nav"),
+        _point(3.5, 95.0, data_source="forex_daily_data"),
     )
     assert state["active"] is True
     assert state["complete"] is True
@@ -204,10 +232,9 @@ def test_rate_shock_active_when_all_conditions_match():
 
 def test_rate_shock_boundary_nominal_below_20bp_not_active():
     state = quant_index.build_usd_rate_shock_state(
-        _point(0.19, 95.0),
+        _point(0.10, 50.0),
         _point(0.20, 92.0),
-        _point(-6.0, 8.0, data_source="global_risk"),
-        _point(None, None, data_source="blackrock_ishares_historical_nav"),
+        _point(3.5, 95.0, data_source="forex_daily_data"),
     )
     assert state["active"] is False
     assert state["complete"] is True
@@ -217,46 +244,42 @@ def test_rate_shock_missing_core_input_is_incomplete():
     state = quant_index.build_usd_rate_shock_state(
         _point(None, None),
         _point(0.20, 92.0),
-        _point(None, None, data_source="global_risk"),
-        _point(None, None, data_source="blackrock_ishares_historical_nav"),
+        _point(3.5, 95.0, data_source="forex_daily_data"),
     )
     assert state["active"] is None
     assert state["complete"] is False
 
 
-def test_rate_shock_market_confirm_accepts_sox_only():
+def test_rate_shock_dxy_partial_match_scores_half():
     state = quant_index.build_usd_rate_shock_state(
         _point(0.25, 95.0),
         _point(0.20, 92.0),
-        _point(-5.0, 8.0, data_source="global_risk"),
-        _point(None, None, data_source="blackrock_ishares_historical_nav"),
+        _point(3.5, 50.0, data_source="forex_daily_data"),
     )
     assert state["active"] is True
+    assert state["components"][2]["score"] == 50.0
 
 
-def test_rate_shock_market_confirm_incomplete_when_one_missing_one_false():
+def test_rate_shock_dxy_missing_keeps_module_incomplete():
     state = quant_index.build_usd_rate_shock_state(
         _point(0.25, 95.0),
         _point(0.20, 92.0),
-        _point(-1.0, 90.0, data_source="global_risk"),
-        _point(None, None, data_source="blackrock_ishares_historical_nav"),
+        _point(None, None, data_source="forex_daily_data"),
     )
-    # 一项明确未命中、另一项缺失：市场确认为 None/incomplete，不能判 False
-    market = state["components"][2]
-    assert market["matched"] is None
+    dxy = state["components"][2]
+    assert dxy["matched"] is None
     assert state["active"] is None
     assert state["complete"] is False
 
 
-def test_rate_shock_market_confirm_false_only_when_both_false():
+def test_rate_shock_dxy_false_when_both_thresholds_fail():
     state = quant_index.build_usd_rate_shock_state(
         _point(0.25, 95.0),
         _point(0.20, 92.0),
-        _point(-1.0, 90.0, data_source="global_risk"),
-        _point(-0.5, 90.0, data_source="blackrock_ishares_historical_nav"),
+        _point(0.5, 50.0, data_source="forex_daily_data"),
     )
-    market = state["components"][2]
-    assert market["matched"] is False
+    dxy = state["components"][2]
+    assert dxy["matched"] is False
     assert state["active"] is False
     assert state["complete"] is True
 
@@ -265,8 +288,7 @@ def test_rate_conditions_include_level_value_and_available_at():
     state = quant_index.build_usd_rate_shock_state(
         _point(0.25, 95.0),
         _point(0.20, 92.0),
-        _point(-6.0, 8.0, data_source="global_risk"),
-        _point(-3.0, 5.0, data_source="blackrock_ishares_historical_nav"),
+        _point(3.5, 95.0, data_source="forex_daily_data"),
         nominal_level_value=4.5,
         real_level_value=2.3,
     )
@@ -418,6 +440,15 @@ def test_build_risk_strategy_map_rate_mode_and_top1_removed():
         us_vix_rows=[],
         us_credit_rows=[],
         us_treasury_rows=treasury_rows,
+        forex_rows=[
+            {
+                "symbol_code": "UDI",
+                "trade_date": trade_date,
+                "latest_price": 100.0 if index < len(dates) - 10 else 100.0 + 0.5 * (index - (len(dates) - 10)),
+                "data_source": "test_dxy",
+            }
+            for index, trade_date in enumerate(dates)
+        ],
         cn_calendar_dates=[
             *dates,
             (date.fromisoformat(final_date) + timedelta(days=3)).isoformat(),
@@ -435,13 +466,14 @@ def test_build_risk_strategy_map_rate_mode_and_top1_removed():
 
     payload = result["risk_strategy_components_json"]
     assert payload["global"]["usd_rate_shock"]["active"] is True
-    assert payload["global"]["mode"] == "usd_rate_shock"
+    assert payload["global"]["mode"] is None
     serialized = json.dumps(payload, ensure_ascii=False)
     assert "前1%" not in serialized
     assert "前5%" in serialized
-    observations = payload["yellow"]["observations"]["turnover_concentration"]["components"]
-    assert len(observations) == 1
-    assert observations[0]["label"] == "A股成交额前5%集中度MA5"
+    assert "SOX 10D" not in serialized
+    assert "IXN/ACWI" not in serialized
+    vulnerability = payload["domestic_vulnerability"]["components"]
+    assert vulnerability[-1]["label"] == "A股成交额前5%集中度MA5"
 
 
 class _MigrationCursor:

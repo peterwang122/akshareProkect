@@ -17,6 +17,39 @@ def test_build_fred_asset_rows_skips_missing_values():
     assert rows[0]["available_at"].strftime("%Y-%m-%d %H:%M") == "2025-01-03 08:00"
 
 
+def test_build_cboe_index_rows_supports_ohlc_and_filters_nonpositive_values():
+    rows = global_risk.build_cboe_index_rows(
+        "DATE,OPEN,HIGH,LOW,CLOSE\n03/28/2025,18,21,17,20.5\n03/31/2025,0,0,0,0\n",
+        "VIX9D",
+        "Cboe 9日波动率指数",
+        global_risk.CBOE_ASSETS["VIX9D"][1],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["trade_date"] == "2025-03-28"
+    assert rows[0]["open_value"] == 18.0
+    assert rows[0]["high_value"] == 21.0
+    assert rows[0]["low_value"] == 17.0
+    assert rows[0]["close_value"] == 20.5
+    assert rows[0]["available_at"].strftime("%Y-%m-%d %H:%M") == "2025-03-29 08:00"
+
+
+def test_build_cboe_index_rows_supports_single_value_vvix_layout():
+    rows = global_risk.build_cboe_index_rows(
+        "DATE,VVIX\n03/28/2025,112.34\n",
+        "VVIX",
+        "Cboe VIX波动率指数",
+        global_risk.CBOE_ASSETS["VVIX"][1],
+    )
+
+    assert rows[0]["close_value"] == 112.34
+    assert rows[0]["data_source"] == "cboe_official_historical_index"
+
+
+def test_cboe_assets_are_all_required_for_daily_repair():
+    assert set(global_risk.CBOE_ASSETS) == {"VIX9D", "VIX3M", "VVIX", "VXEEM"}
+
+
 def test_build_ishares_nav_rows_reads_historical_worksheet():
     payload = """
     <ss:Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
@@ -36,6 +69,12 @@ def test_build_ishares_nav_rows_reads_historical_worksheet():
     assert len(rows) == 1
     assert rows[0]["trade_date"] == "2025-01-03"
     assert rows[0]["close_value"] == 91.25
+
+
+def test_efa_and_eem_use_official_ishares_nav_products():
+    assert global_risk.ISHARES_ASSETS["EFA_NAV"][1] == "239623"
+    assert global_risk.ISHARES_ASSETS["EEM_NAV"][1] == "239637"
+    assert global_risk.GLOBAL_HISTORY_START.isoformat() == "2001-01-01"
 
 
 def test_build_dataframe_asset_rows_preserves_ohlc():

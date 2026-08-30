@@ -11,6 +11,7 @@ from typing import Awaitable, Callable, Dict
 import requests
 
 from akshare_project.collectors import (
+    bank_liquidity,
     cffex,
     douyin_emotion,
     etf,
@@ -32,6 +33,7 @@ from akshare_project.collectors import (
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.network import without_proxy_env
 from akshare_project.core.paths import ensure_runtime_layout, get_config_dir
+from akshare_project.db.db_tool import DbTools
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8786
@@ -221,6 +223,25 @@ async def run_handler_for_previous_trade_day(handler, market: str):
     }
 
 
+async def run_us_option_price_pc_daily():
+    result = await index.sync_daily_us_option_price_pc_only()
+    trade_date = str((result or {}).get("trade_date") or "").strip()[:10]
+    if not trade_date:
+        raise RuntimeError("US ETF option price P/C collector did not return trade_date")
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        refreshed = await quant_index.compute_and_upsert_range(
+            db_tools,
+            trade_date,
+            trade_date,
+        )
+    finally:
+        await db_tools.close()
+    result["quant_index_refresh"] = refreshed
+    return result
+
+
 def build_daily_routes() -> Dict[str, DailyRoute]:
     return {
         "/collect-index-us-daily": DailyRoute(
@@ -382,6 +403,14 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             ),
             direct_network=True,
         ),
+        "/collect-cn-bank-liquidity-daily": DailyRoute(
+            path="/collect-cn-bank-liquidity-daily",
+            task_name="cn_bank_liquidity_daily",
+            handler=lambda target_date=None: bank_liquidity.sync_daily(
+                target_date=target_date
+            ),
+            direct_network=True,
+        ),
         "/collect-cn-macro-daily": DailyRoute(
             path="/collect-cn-macro-daily",
             task_name="cn_macro_daily",
@@ -474,6 +503,18 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             task_name="index_us_put_call_ratio_daily",
             handler=index.sync_daily_us_put_call_ratio_only,
         ),
+        "/collect-index-us-option-premium-daily": DailyRoute(
+            path="/collect-index-us-option-premium-daily",
+            task_name="index_us_option_premium_daily",
+            handler=index.sync_daily_us_option_premium_only,
+            direct_network=True,
+        ),
+        "/collect-index-us-option-price-pc-daily": DailyRoute(
+            path="/collect-index-us-option-price-pc-daily",
+            task_name="index_us_option_price_pc_daily",
+            handler=run_us_option_price_pc_daily,
+            direct_network=True,
+        ),
         "/collect-index-us-treasury-yield-daily": DailyRoute(
             path="/collect-index-us-treasury-yield-daily",
             task_name="index_us_treasury_yield_daily",
@@ -557,6 +598,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "exchange_option_stats_daily",
             "option_minute_daily",
             "cn_risk_free_rate_daily",
+            "cn_bank_liquidity_daily",
             "cn_macro_daily",
             "margin_trading_daily",
             "fund_purchase_limit_daily",
