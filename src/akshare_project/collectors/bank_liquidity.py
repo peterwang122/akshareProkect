@@ -2,6 +2,7 @@ import asyncio
 import calendar
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -76,6 +77,24 @@ def direct_session():
     session.trust_env = False
     session.headers.update(HTTP_HEADERS)
     return session
+
+
+def request_with_retry(method, url, attempts=3, **kwargs):
+    transient_errors = (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.SSLError,
+    )
+    for attempt in range(1, attempts + 1):
+        try:
+            response = direct_session().request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except transient_errors:
+            if attempt >= attempts:
+                raise
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"request retry exhausted: {url}")
 
 
 def decode_pbc_html(response):
@@ -205,13 +224,13 @@ def parse_chinamoney_frr_payload(payload):
 def fetch_chinamoney_frr_rows_sync(start_date, end_date):
     start = parse_date(start_date)
     end = parse_date(end_date)
-    response = direct_session().get(
+    response = request_with_retry(
+        "GET",
         CHINAMONEY_FRR_URL,
         params={"lang": "CN", "startDate": start.isoformat(), "endDate": end.isoformat()},
         headers={"Referer": CHINAMONEY_FRR_PAGE},
         timeout=60,
     )
-    response.raise_for_status()
     payload = response.json()
     rep_code = str(((payload or {}).get("head") or {}).get("rep_code") or "")
     if rep_code and rep_code != "200":
@@ -252,7 +271,8 @@ def fetch_closing_repo_row_sync(target_date):
     target = parse_date(target_date)
     merged = None
     for market, index_type in (("DR", "markInterBankVOList"), ("R", "markVOList")):
-        response = direct_session().post(
+        response = request_with_retry(
+            "POST",
             CHINAMONEY_CLOSING_REPO_URL,
             data={
                 "indexType": index_type,
@@ -263,7 +283,6 @@ def fetch_closing_repo_row_sync(target_date):
             headers={"Referer": CHINAMONEY_CLOSING_REPO_PAGE},
             timeout=60,
         )
-        response.raise_for_status()
         payload = response.json()
         parsed = parse_closing_repo_payload(payload, market)
         if parsed is None:
@@ -318,7 +337,8 @@ def parse_chinabond_history_html(html):
 def fetch_chinabond_rows_sync(start_date, end_date):
     start = parse_date(start_date)
     end = parse_date(end_date)
-    response = direct_session().get(
+    response = request_with_retry(
+        "GET",
         CHINABOND_HISTORY_URL,
         params={
             "startDate": start.isoformat(),
@@ -331,7 +351,6 @@ def fetch_chinabond_rows_sync(start_date, end_date):
         headers={"Referer": CHINABOND_PAGE},
         timeout=90,
     )
-    response.raise_for_status()
     return parse_chinabond_history_html(response.text)
 
 
@@ -375,8 +394,7 @@ def fetch_pbc_listing_page_sync(section="omo", page=1):
         if page != 1:
             raise ValueError("PBC monthly listing currently has only one page")
         url = PBC_MONTHLY_LIST_URL
-    response = direct_session().get(url, timeout=90)
-    response.raise_for_status()
+    response = request_with_retry("GET", url, timeout=90)
     items, total_pages = parse_pbc_listing_html(decode_pbc_html(response), section)
     return {"items": items, "total_pages": total_pages, "source_url": url}
 
@@ -418,10 +436,24 @@ def pbc_article_metadata(soup, fallback_date=None):
     return title, pub_date, published_at
 
 
-def _pbc_tool_type(context_text):
-    if "买断式逆回购" in context_text:
+def _pbc_tool_type(context_text, tenor_days=None, article_text=""):
+    normalized_context = clean_text(context_text).upper()
+    normalized_article = clean_text(article_text).upper()
+    if "TMLF" in normalized_context or "定向中期借贷便利" in normalized_context:
+        return "tmlf"
+    if "MLF" in normalized_context or "中期借贷便利" in normalized_context:
+        return "mlf"
+    if (
+        tenor_days is not None
+        and tenor_days >= 90
+        and ("MLF" in normalized_article or "中期借贷便利" in normalized_article)
+    ):
+        return "mlf"
+    if "央行票据互换" in normalized_context or "CBS" in normalized_context:
+        return "central_bank_bill_swap"
+    if "买断式逆回购" in normalized_context:
         return "outright_reverse_repo"
-    if "正回购" in context_text and "逆回购" not in context_text:
+    if "正回购" in normalized_context and "逆回购" not in normalized_context:
         return "repo"
     return "reverse_repo"
 
@@ -458,7 +490,6 @@ def parse_pbc_omo_article_html(html, source_url, fallback_date=None):
         preceding = table.find_previous(["p", "strong", "h3", "h4"])
         table_text = clean_text(table.get_text(" ", strip=True))
         context_text = clean_text(preceding.get_text(" ", strip=True) if preceding else table_text[:100])
-        tool_type = _pbc_tool_type(context_text)
         for row_index, tr in enumerate(table_rows[1:], start=1):
             cells = [clean_text(cell.get_text(" ", strip=True)) for cell in tr.find_all(["td", "th"])]
             if max(tenor_index, amount_index, rate_index or 0) >= len(cells):
@@ -468,6 +499,11 @@ def parse_pbc_omo_article_html(html, source_url, fallback_date=None):
             amount = parse_amount_cny(cells[amount_index])
             if tenor_days is None or amount is None:
                 continue
+            tool_type = _pbc_tool_type(
+                context_text,
+                tenor_days=tenor_days,
+                article_text=raw_text,
+            )
             signature = (tool_type, tenor_days, round(amount, 2))
             if signature in dedupe:
                 continue
@@ -538,7 +574,8 @@ def parse_pbc_omo_article_html(html, source_url, fallback_date=None):
 
     no_operation = bool(
         re.search(
-            r"(?:不开展|未开展)[^。；]{0,30}(?:逆回购|公开市场)操作|无逆回购操作",
+            r"(?:不开展|未开展)[^。；]{0,30}(?:逆回购|公开市场)操作"
+            r"|无逆回购操作|逆回购操作(?:量)?(?:为|是)?(?:零|0)",
             raw_text,
         )
     )
@@ -667,8 +704,7 @@ def parse_pbc_monthly_article_html(html, source_url, fallback_date=None):
 
 
 def fetch_pbc_monthly_article_sync(item):
-    response = direct_session().get(item["source_url"], timeout=90)
-    response.raise_for_status()
+    response = request_with_retry("GET", item["source_url"], timeout=90)
     return parse_pbc_monthly_article_html(
         decode_pbc_html(response),
         item["source_url"],
@@ -718,7 +754,7 @@ def resolve_operation_maturity_dates(operations, official_market_dates):
 def append_open_market_fields(rows, operations):
     operations_by_date = {}
     maturities_by_date = {}
-    policy_by_date = {}
+    policy_candidates = []
     for operation in operations or []:
         try:
             operation_date = parse_date(operation.get("operation_date")).isoformat()
@@ -739,7 +775,23 @@ def append_open_market_fields(rows, operations):
             and int(operation.get("tenor_days") or 0) == 7
             and operation.get("operation_rate_pct") is not None
         ):
-            policy_by_date[operation_date] = float(operation["operation_rate_pct"])
+            policy_candidates.append({
+                "rate": float(operation["operation_rate_pct"]),
+                "source_date": operation_date,
+                "available_at": operation.get("published_at"),
+                "source_url": operation.get("source_url"),
+            })
+
+    policy_by_date = {}
+    last_policy_rate = None
+    for candidate in sorted(
+        policy_candidates,
+        key=lambda item: (str(item.get("source_date") or ""), str(item.get("available_at") or "")),
+    ):
+        rate = candidate["rate"]
+        if last_policy_rate is None or not math.isclose(rate, last_policy_rate, abs_tol=1e-9):
+            policy_by_date[candidate["source_date"]] = candidate
+            last_policy_rate = rate
 
     ordered_rows = sorted(rows, key=lambda item: str(item.get("trade_date") or ""))
     first_row_date = str(ordered_rows[0].get("trade_date") or "") if ordered_rows else ""
@@ -750,23 +802,44 @@ def append_open_market_fields(rows, operations):
     net_window = deque(maxlen=20)
     for row in ordered_rows:
         trade_date = str(row["trade_date"])
-        if row.get("reverse_repo_7d_policy_rate_pct") is not None:
-            last_policy = float(row["reverse_repo_7d_policy_rate_pct"])
+        if row.get("reverse_repo_7d_policy_rate_pct") is not None and last_policy is None:
+            last_policy = {
+                "rate": float(row["reverse_repo_7d_policy_rate_pct"]),
+                "source_date": row.get("reverse_repo_7d_policy_source_date"),
+                "available_at": row.get("reverse_repo_7d_policy_available_at"),
+                "source_url": row.get("source_url_reverse_repo_7d_policy"),
+            }
         if trade_date in policy_by_date:
             last_policy = policy_by_date[trade_date]
-        row["reverse_repo_7d_policy_rate_pct"] = last_policy
+        row["reverse_repo_7d_policy_rate_pct"] = (
+            last_policy.get("rate") if last_policy else None
+        )
+        row["reverse_repo_7d_policy_source_date"] = (
+            last_policy.get("source_date") if last_policy else None
+        )
+        row["reverse_repo_7d_policy_available_at"] = (
+            last_policy.get("available_at") if last_policy else None
+        )
+        row["source_url_reverse_repo_7d_policy"] = (
+            last_policy.get("source_url") if last_policy else None
+        )
 
         daily_operations = operations_by_date.get(trade_date) or []
+        reverse_repo_sources = [
+            item
+            for item in daily_operations
+            if str(item.get("tool_type") or "") == "reverse_repo"
+        ]
         regular_operations = [
-            item for item in daily_operations
+            item for item in reverse_repo_sources
             if str(item.get("tool_type") or "") == "reverse_repo" and not item.get("no_operation")
         ]
-        explicit_source = bool(daily_operations)
+        explicit_source = bool(reverse_repo_sources)
         injection = None
         if explicit_source:
             injection = sum(float(item.get("awarded_amount_cny") or 0) for item in regular_operations)
             latest_source = max(
-                daily_operations,
+                reverse_repo_sources,
                 key=lambda item: str(item.get("published_at") or ""),
             )
             row["pbc_source_date"] = trade_date
@@ -887,6 +960,11 @@ def compute_liquidity_scores(rows):
                 "source_date": str(row.get("pbc_source_date") or "") or None,
                 "available_at": str(row.get("pbc_available_at") or "") or None,
                 "url": row.get("source_url_pbc"),
+            },
+            "reverse_repo_7d_policy": {
+                "source_date": str(row.get("reverse_repo_7d_policy_source_date") or "") or None,
+                "available_at": str(row.get("reverse_repo_7d_policy_available_at") or "") or None,
+                "url": row.get("source_url_reverse_repo_7d_policy"),
             },
         }
         row["fetched_at"] = datetime.now().replace(microsecond=0)
@@ -1034,6 +1112,7 @@ REQUIRED_DAILY_FIELDS = {
     "fdr001_pct": "FDR001定盘利率",
     "fdr007_pct": "FDR007定盘利率",
     "reverse_repo_7d_policy_rate_pct": "7天逆回购政策利率",
+    "reverse_repo_7d_policy_source_date": "7天逆回购政策利率来源",
     "bank_bond_aaa_1y_yield_pct": "1年AAA银行普通债收益率",
     "cgb_1y_yield_pct": "1年国债收益率",
     "dr001_weighted_pct": "DR001日终加权利率",
@@ -1139,6 +1218,9 @@ async def sync_daily(target_date=None):
                 "closing_repo": str(target_row.get("closing_repo_source_date") or "") or None,
                 "chinabond": str(target_row.get("chinabond_source_date") or "") or None,
                 "pbc": str(target_row.get("pbc_source_date") or "") or None,
+                "policy_rate": (
+                    str(target_row.get("reverse_repo_7d_policy_source_date") or "") or None
+                ),
             },
         }
     finally:
@@ -1260,6 +1342,16 @@ async def backfill(start_date=HISTORY_START, end_date=None):
             "score_rows": complete_scores,
             "progress_path": str(PROGRESS_PATH),
         }
+    except Exception as exc:
+        progress.update(
+            {
+                "status": "failed",
+                "failed_at": datetime.now().isoformat(timespec="seconds"),
+                "error": str(exc),
+            }
+        )
+        save_progress(progress)
+        raise
     finally:
         await db.close()
 

@@ -739,6 +739,7 @@ def single_instance_lock():
 async def launch_browser_context(playwright, *, headless):
     context = await playwright.chromium.launch_persistent_context(
         str(USER_DATA_DIR),
+        channel="chrome",
         headless=headless,
         viewport={"width": 1440, "height": 960},
         args=[
@@ -755,6 +756,22 @@ async def launch_browser_context(playwright, *, headless):
         except (OSError, ValueError, TypeError):
             pass
     return context
+
+
+async def launch_visible_coze_context(playwright):
+    browser = await playwright.chromium.launch(
+        channel="chrome",
+        headless=False,
+        args=[
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    context_kwargs = {"viewport": {"width": 1440, "height": 960}}
+    if STORAGE_STATE_PATH.exists():
+        context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
+    context = await browser.new_context(**context_kwargs)
+    return browser, context
 
 
 async def persist_browser_storage_state(context):
@@ -1366,7 +1383,13 @@ async def _process_video_card(coze_page, selected, douyin_page=None):
     }
 
 
-async def run_pipeline_with_context(context, target_date=None, douyin_page=None):
+async def run_pipeline_with_context(
+    context,
+    target_date=None,
+    douyin_page=None,
+    *,
+    show_coze=False,
+):
     owns_douyin_page = douyin_page is None
     if douyin_page is None:
         douyin_page = await context.new_page()
@@ -1423,8 +1446,7 @@ async def run_pipeline_with_context(context, target_date=None, douyin_page=None)
                 "latest_video_id": latest["video_id"],
                 "minimum_publish_time": EMOTION_CONTENT_MIN_PUBLISH_TIME.strftime("%H:%M"),
             }
-        coze_page = await context.new_page()
-        try:
+        async def process_selected(coze_page):
             try:
                 result = await _process_video_card(coze_page, selected, douyin_page=douyin_page)
             except NonEmotionContentError:
@@ -1444,6 +1466,22 @@ async def run_pipeline_with_context(context, target_date=None, douyin_page=None)
                 return build_update_found_failed_result(selected, exc)
             await persist_browser_storage_state(context)
             return result
+
+        if show_coze and selected.get("content_type", "video") != "note":
+            async with async_playwright() as coze_playwright:
+                browser, coze_context = await launch_visible_coze_context(coze_playwright)
+                try:
+                    coze_page = await coze_context.new_page()
+                    return await process_selected(coze_page)
+                finally:
+                    try:
+                        await persist_browser_storage_state(coze_context)
+                    finally:
+                        await browser.close()
+
+        coze_page = await context.new_page()
+        try:
+            return await process_selected(coze_page)
         finally:
             await coze_page.close()
     finally:
@@ -1454,8 +1492,9 @@ async def run_pipeline_with_context(context, target_date=None, douyin_page=None)
 class PersistentDouyinBrowserSession:
     KEEP_OPEN_STATUSES = {"NO_UPDATE", "UPDATE_FOUND_RETRYABLE"}
 
-    def __init__(self, *, headless=True):
+    def __init__(self, *, headless=True, show_coze=False):
         self.headless = bool(headless)
+        self.show_coze = bool(show_coze)
         self._operation_lock = None
         self._playwright = None
         self._context = None
@@ -1539,6 +1578,7 @@ class PersistentDouyinBrowserSession:
                     self._context,
                     target_date=target_date,
                     douyin_page=self._douyin_page,
+                    show_coze=self.show_coze,
                 )
             except Exception:
                 await self._close_browser()

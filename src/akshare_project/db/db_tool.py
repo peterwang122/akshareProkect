@@ -3154,7 +3154,7 @@ class DbTools:
                 rows_to_upsert = []
                 protected_names = []
                 for index_name, emotion_value in index_value_map.items():
-                    if existing_sources.get(index_name) == "excel":
+                    if existing_sources.get(index_name) in {"excel", "manual_task_center"}:
                         protected_names.append(index_name)
                         continue
                     rows_to_upsert.append(
@@ -6609,6 +6609,9 @@ class DbTools:
                 r001_weighted_pct DECIMAL(18, 8) NULL,
                 r007_weighted_pct DECIMAL(18, 8) NULL,
                 reverse_repo_7d_policy_rate_pct DECIMAL(18, 8) NULL,
+                reverse_repo_7d_policy_source_date DATE NULL,
+                reverse_repo_7d_policy_available_at DATETIME NULL,
+                source_url_reverse_repo_7d_policy VARCHAR(1024) NULL,
                 bank_bond_aaa_1y_yield_pct DECIMAL(18, 8) NULL,
                 cgb_1y_yield_pct DECIMAL(18, 8) NULL,
                 factor_fdr007_policy_spread_bp DECIMAL(18, 8) NULL,
@@ -6705,6 +6708,35 @@ class DbTools:
                     await cursor.execute(statement)
                 await cursor.execute(
                     """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'cn_bank_liquidity_daily'
+                    """
+                )
+                daily_columns = {str(row[0]) for row in await cursor.fetchall()}
+                daily_alter_clauses = []
+                if "reverse_repo_7d_policy_source_date" not in daily_columns:
+                    daily_alter_clauses.append(
+                        "ADD COLUMN reverse_repo_7d_policy_source_date DATE NULL "
+                        "AFTER reverse_repo_7d_policy_rate_pct"
+                    )
+                if "reverse_repo_7d_policy_available_at" not in daily_columns:
+                    daily_alter_clauses.append(
+                        "ADD COLUMN reverse_repo_7d_policy_available_at DATETIME NULL "
+                        "AFTER reverse_repo_7d_policy_source_date"
+                    )
+                if "source_url_reverse_repo_7d_policy" not in daily_columns:
+                    daily_alter_clauses.append(
+                        "ADD COLUMN source_url_reverse_repo_7d_policy VARCHAR(1024) NULL "
+                        "AFTER reverse_repo_7d_policy_available_at"
+                    )
+                if daily_alter_clauses:
+                    await cursor.execute(
+                        f"ALTER TABLE cn_bank_liquidity_daily {', '.join(daily_alter_clauses)}"
+                    )
+                await cursor.execute(
+                    """
                     SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index)
                     FROM information_schema.statistics
                     WHERE table_schema = DATABASE()
@@ -6734,7 +6766,9 @@ class DbTools:
         columns = (
             "trade_date", "fr001_pct", "fr007_pct", "fdr001_pct", "fdr007_pct",
             "dr001_weighted_pct", "dr007_weighted_pct", "r001_weighted_pct", "r007_weighted_pct",
-            "reverse_repo_7d_policy_rate_pct", "bank_bond_aaa_1y_yield_pct", "cgb_1y_yield_pct",
+            "reverse_repo_7d_policy_rate_pct", "reverse_repo_7d_policy_source_date",
+            "reverse_repo_7d_policy_available_at", "source_url_reverse_repo_7d_policy",
+            "bank_bond_aaa_1y_yield_pct", "cgb_1y_yield_pct",
             "factor_fdr007_policy_spread_bp", "factor_overnight_pressure_bp",
             "factor_nonbank_layering_bp", "factor_bank_funding_spread_bp",
             "pct_fdr007_policy_spread", "pct_overnight_pressure",
@@ -6750,7 +6784,7 @@ class DbTools:
         )
         text_fields = {
             "liquidity_state", "liquidity_trend", "source_url_frr", "source_url_closing_repo",
-            "source_url_chinabond", "source_url_pbc",
+            "source_url_chinabond", "source_url_pbc", "source_url_reverse_repo_7d_policy",
         }
         json_fields = {
             "components_json", "sources_json", "raw_frr_json", "raw_closing_repo_json",
@@ -6758,11 +6792,11 @@ class DbTools:
         }
         datetime_fields = {
             "frr_available_at", "closing_repo_available_at", "chinabond_available_at",
-            "pbc_available_at", "fetched_at",
+            "pbc_available_at", "reverse_repo_7d_policy_available_at", "fetched_at",
         }
         date_fields = {
             "trade_date", "frr_source_date", "closing_repo_source_date", "chinabond_source_date",
-            "pbc_source_date",
+            "pbc_source_date", "reverse_repo_7d_policy_source_date",
         }
         numeric_fields = set(columns) - text_fields - json_fields - datetime_fields - date_fields
         deduped = {}
@@ -6832,7 +6866,12 @@ class DbTools:
                 str(row.get("tool_type") or "").strip(),
                 str(row.get("tenor_label") or "").strip() or None,
                 int(row["tenor_days"]) if row.get("tenor_days") is not None else None,
-                self._normalize_numeric("awarded_amount_cny", row.get("awarded_amount_cny")),
+                (
+                    round(self._normalize_numeric("awarded_amount_cny", row.get("awarded_amount_cny")), 2)
+                    if self._normalize_numeric("awarded_amount_cny", row.get("awarded_amount_cny"))
+                    is not None
+                    else None
+                ),
                 self._normalize_numeric("operation_rate_pct", row.get("operation_rate_pct")),
                 maturity_date,
                 1 if row.get("no_operation") else 0,

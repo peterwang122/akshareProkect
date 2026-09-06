@@ -21,6 +21,8 @@ from akshare_project.collectors.douyin_emotion import (
     is_non_emotion_content_failure,
     is_profile_works_card,
     is_retryable_processing_error,
+    launch_browser_context,
+    launch_visible_coze_context,
     parse_douyin_content_url,
     parse_transcript_emotions,
     PersistentDouyinBrowserSession,
@@ -34,6 +36,73 @@ from akshare_project.services.stock_temp_service import build_daily_routes
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def test_launch_browser_context_uses_google_chrome(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeContext:
+        pass
+
+    class FakeChromium:
+        async def launch_persistent_context(self, user_data_dir, **kwargs):
+            captured["user_data_dir"] = user_data_dir
+            captured.update(kwargs)
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(
+        "akshare_project.collectors.douyin_emotion.USER_DATA_DIR",
+        tmp_path / "profile",
+    )
+    monkeypatch.setattr(
+        "akshare_project.collectors.douyin_emotion.STORAGE_STATE_PATH",
+        tmp_path / "storage.json",
+    )
+
+    context = asyncio.run(launch_browser_context(FakePlaywright(), headless=True))
+
+    assert isinstance(context, FakeContext)
+    assert captured["user_data_dir"] == str(tmp_path / "profile")
+    assert captured["channel"] == "chrome"
+    assert captured["headless"] is True
+
+
+def test_launch_visible_coze_context_uses_headed_chrome_and_saved_login(monkeypatch, tmp_path):
+    captured = {}
+    storage_path = tmp_path / "storage.json"
+    storage_path.write_text('{"cookies": []}', encoding="utf-8")
+
+    class FakeContext:
+        pass
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs):
+            captured["context_kwargs"] = kwargs
+            return FakeContext()
+
+    class FakeChromium:
+        async def launch(self, **kwargs):
+            captured["launch_kwargs"] = kwargs
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(
+        "akshare_project.collectors.douyin_emotion.STORAGE_STATE_PATH",
+        storage_path,
+    )
+
+    browser, context = asyncio.run(launch_visible_coze_context(FakePlaywright()))
+
+    assert isinstance(browser, FakeBrowser)
+    assert isinstance(context, FakeContext)
+    assert captured["launch_kwargs"]["channel"] == "chrome"
+    assert captured["launch_kwargs"]["headless"] is False
+    assert captured["context_kwargs"]["storage_state"] == str(storage_path)
 
 
 def test_parse_transcript_emotions_supports_chinese_names():
@@ -455,9 +524,16 @@ def test_persistent_browser_session_reuses_context_until_terminal_result(monkeyp
         ]
     )
 
-    async def fake_run_pipeline_with_context(_context, target_date=None, douyin_page=None):
+    async def fake_run_pipeline_with_context(
+        _context,
+        target_date=None,
+        douyin_page=None,
+        *,
+        show_coze=False,
+    ):
         assert target_date == date(2026, 7, 16)
         assert douyin_page is not None
+        assert show_coze is False
         return next(results)
 
     monkeypatch.setattr(

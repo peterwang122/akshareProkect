@@ -63,7 +63,10 @@ class DouyinPersistentBrowserRunner:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
-        self._session = douyin_emotion.PersistentDouyinBrowserSession(headless=True)
+        self._session = douyin_emotion.PersistentDouyinBrowserSession(
+            headless=True,
+            show_coze=True,
+        )
         self._ready.set()
         try:
             loop.run_forever()
@@ -602,6 +605,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "cn_macro_daily",
             "margin_trading_daily",
             "fund_purchase_limit_daily",
+            "quant_index_daily",
             "index_csi_dividend_daily",
             "global_risk_daily",
             "csi_tech_concentration_daily",

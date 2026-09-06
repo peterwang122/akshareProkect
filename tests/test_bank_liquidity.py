@@ -1,6 +1,8 @@
+import asyncio
 from datetime import date, timedelta
 
 import pytest
+import requests
 
 from akshare_project.collectors import bank_liquidity
 
@@ -43,6 +45,28 @@ def test_parse_chinamoney_frr_payload_keeps_official_values_and_publish_time():
             },
         }
     ]
+
+
+def test_request_with_retry_recovers_from_transient_connection_error(monkeypatch):
+    calls = []
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise requests.exceptions.ConnectionError("temporary disconnect")
+            return self
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(bank_liquidity, "direct_session", lambda: FakeSession())
+    monkeypatch.setattr(bank_liquidity.time, "sleep", lambda _seconds: None)
+
+    response = bank_liquidity.request_with_retry("GET", "https://example.test/data")
+
+    assert response is not None
+    assert len(calls) == 2
 
 
 def test_parse_closing_repo_payload_reads_dr_and_r_weighted_rates():
@@ -165,6 +189,52 @@ def test_parse_pbc_omo_explicit_no_reverse_repo_operation():
     assert rows[0]["published_at"].strftime("%Y-%m-%d %H:%M:%S") == "2018-04-20 09:10:13"
 
 
+def test_parse_pbc_omo_explicit_zero_operation_volume():
+    rows = bank_liquidity.parse_pbc_omo_article_html(
+        """
+        <html><body><div id="zoom">
+          <p>文章来源：2024-08-07 09:20:30</p>
+          <p>2024年8月7日逆回购操作量为零。</p>
+        </div></body></html>
+        """,
+        "https://www.pbc.gov.cn/example/5425164/index.html",
+        fallback_date="2024-08-07",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["tool_type"] == "reverse_repo"
+    assert rows[0]["no_operation"] is True
+    assert rows[0]["awarded_amount_cny"] == 0
+
+
+def test_parse_pbc_omo_keeps_mlf_out_of_reverse_repo():
+    rows = bank_liquidity.parse_pbc_omo_article_html(
+        """
+        <html><body><div id="zoom">
+          <p>文章来源：2024-07-15 09:20:30</p>
+          <p>开展1290亿元逆回购操作。此外，开展1000亿元中期借贷便利（MLF）操作。</p>
+          <p>逆回购操作情况</p>
+          <table>
+            <tr><td>期限</td><td>中标量</td><td>中标利率</td></tr>
+            <tr><td>7天</td><td>1290亿元</td><td>1.80%</td></tr>
+          </table>
+          <p>MLF操作情况</p>
+          <table>
+            <tr><td>期限</td><td>操作量</td><td>中标利率</td></tr>
+            <tr><td>1年</td><td>1000亿元</td><td>2.50%</td></tr>
+          </table>
+        </div></body></html>
+        """,
+        "https://www.pbc.gov.cn/example/5403927/index.html",
+        fallback_date="2024-07-15",
+    )
+
+    assert [(row["tool_type"], row["tenor_days"]) for row in rows] == [
+        ("reverse_repo", 7),
+        ("mlf", 365),
+    ]
+
+
 def test_parse_pbc_central_bank_bill_article_is_not_reverse_repo():
     html = """
     <html><head>
@@ -225,12 +295,55 @@ def test_append_open_market_fields_carries_policy_rate_from_before_history_start
             "awarded_amount_cny": 10_000_000_000,
             "maturity_date": None,
             "no_operation": False,
+            "published_at": "2017-05-25 09:20:00",
+            "source_url": "https://www.pbc.gov.cn/policy-source/index.html",
         }
     ]
 
     result = bank_liquidity.append_open_market_fields(rows, operations)
 
     assert result[0]["reverse_repo_7d_policy_rate_pct"] == 2.45
+    assert result[0]["reverse_repo_7d_policy_source_date"] == "2017-05-25"
+    assert result[0]["reverse_repo_7d_policy_available_at"] == "2017-05-25 09:20:00"
+    assert result[0]["source_url_reverse_repo_7d_policy"].endswith("policy-source/index.html")
+
+
+def test_append_open_market_fields_keeps_original_source_until_policy_rate_changes():
+    rows = [
+        {"trade_date": "2026-08-27", "fdr001_pct": 1.3, "fdr007_pct": 1.4},
+        {"trade_date": "2026-08-28", "fdr001_pct": 1.3, "fdr007_pct": 1.4},
+    ]
+    operations = [
+        {
+            "operation_date": "2026-01-02",
+            "tool_type": "reverse_repo",
+            "tenor_days": 7,
+            "operation_rate_pct": 1.4,
+            "awarded_amount_cny": 10_000_000_000,
+            "maturity_date": None,
+            "no_operation": False,
+            "published_at": "2026-01-02 09:20:00",
+            "source_url": "https://www.pbc.gov.cn/rate-change/index.html",
+        },
+        {
+            "operation_date": "2026-08-28",
+            "tool_type": "reverse_repo",
+            "tenor_days": 7,
+            "operation_rate_pct": 1.4,
+            "awarded_amount_cny": 20_000_000_000,
+            "maturity_date": None,
+            "no_operation": False,
+            "published_at": "2026-08-28 09:20:00",
+            "source_url": "https://www.pbc.gov.cn/daily-operation/index.html",
+        },
+    ]
+
+    result = bank_liquidity.append_open_market_fields(rows, operations)
+
+    assert result[-1]["reverse_repo_7d_policy_rate_pct"] == 1.4
+    assert result[-1]["reverse_repo_7d_policy_source_date"] == "2026-01-02"
+    assert result[-1]["source_url_reverse_repo_7d_policy"].endswith("rate-change/index.html")
+    assert result[-1]["pbc_source_date"] == "2026-08-28"
 
 
 def test_parse_pbc_monthly_keeps_two_reverse_repo_subitems():
@@ -292,3 +405,44 @@ def test_compute_liquidity_scores_excludes_current_and_requires_all_factors():
     assert bank_liquidity.compute_liquidity_scores(rows[:-1] + [incomplete])[-1][
         "liquidity_tightness_score"
     ] is None
+
+
+def test_sync_pbc_operations_retries_transient_network_errors(monkeypatch):
+    item = {
+        "source_url": "https://www.pbc.gov.cn/example/index.html",
+        "source_date": "2026-08-28",
+    }
+    calls = []
+
+    class FakeDb:
+        async def get_cn_pbc_open_market_operations(self, _start, _end):
+            return []
+
+        async def upsert_cn_pbc_open_market_operations(self, rows):
+            return len(rows)
+
+    def fake_fetch(_item):
+        calls.append(_item)
+        if len(calls) < 3:
+            raise requests.exceptions.SSLError("temporary eof")
+        return [{"source_url": _item["source_url"]}]
+
+    async def no_wait(_seconds):
+        return None
+
+    monotonic_values = iter(range(0, 100, 3))
+    monkeypatch.setattr(bank_liquidity, "pbc_items_between_sync", lambda *_args: [item])
+    monkeypatch.setattr(bank_liquidity, "fetch_pbc_omo_article_sync", fake_fetch)
+    monkeypatch.setattr(bank_liquidity.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(bank_liquidity.time, "monotonic", lambda: next(monotonic_values))
+
+    written = asyncio.run(
+        bank_liquidity.sync_pbc_operations(
+            FakeDb(),
+            date(2026, 8, 28),
+            date(2026, 8, 28),
+        )
+    )
+
+    assert written == 1
+    assert len(calls) == 3
