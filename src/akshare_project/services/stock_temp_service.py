@@ -23,6 +23,8 @@ from akshare_project.collectors import (
     global_risk,
     index,
     macro,
+    macro_cycle,
+    market_regime,
     margin_trading,
     option,
     option_minute,
@@ -420,6 +422,14 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             handler=lambda target_date=None: macro.sync_daily(target_date=target_date),
             direct_network=True,
         ),
+        "/collect-cn-macro-cycle-daily": DailyRoute(
+            path="/collect-cn-macro-cycle-daily", task_name="cn_macro_cycle_daily",
+            handler=lambda target_date=None: macro_cycle.sync_daily(target_date), direct_network=True,
+        ),
+        "/collect-market-regime-daily": DailyRoute(
+            path="/collect-market-regime-daily", task_name="market_regime_daily",
+            handler=lambda target_date=None: market_regime.sync_daily(target_date), direct_network=True,
+        ),
         "/collect-margin-trading-daily": DailyRoute(
             path="/collect-margin-trading-daily",
             task_name="margin_trading_daily",
@@ -603,6 +613,8 @@ class StockTempHandler(BaseHTTPRequestHandler):
             "cn_risk_free_rate_daily",
             "cn_bank_liquidity_daily",
             "cn_macro_daily",
+            "cn_macro_cycle_daily",
+            "market_regime_daily",
             "margin_trading_daily",
             "fund_purchase_limit_daily",
             "quant_index_daily",

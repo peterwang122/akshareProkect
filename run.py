@@ -22,6 +22,8 @@ from akshare_project.collectors import (  # noqa: E402
     global_risk,
     index,
     macro,
+    macro_cycle,
+    market_regime,
     margin_trading,
     option,
     option_minute,
@@ -107,6 +109,15 @@ async def dispatch():
     if domain == "macro":
         set_argv("macro", [command, *args])
         await macro.main()
+        return
+    if domain == "macro-cycle":
+        set_argv("macro-cycle", [command, *args])
+        await macro_cycle.main()
+        return
+    if domain == "market-regime":
+        if command != "daily":
+            raise ValueError("market-regime daily [YYYY-MM-DD]")
+        print(await market_regime.sync_daily(args[0] if args else None))
         return
     if domain == "margin-trading":
         set_argv("margin-trading", [command, *args])
