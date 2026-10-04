@@ -77,6 +77,27 @@ def get_timestamp():
     return f"{date_string}_{timestamp}"
 
 
+def add_missing_szse_159922_contract_rows(rows, contracts):
+    """Expose missing listed contracts without inventing prices or writing rows."""
+    result = list(rows)
+    seen = {}
+    for row in rows:
+        if row.get("exchange") == "SZSE" and row.get("underlying_code") == "159922":
+            day = str(row["trade_date"])[:10]
+            seen.setdefault(day, set()).add(str(row["contract_code"]))
+    for day, codes in sorted(seen.items()):
+        for info in contracts:
+            if (info.get("exchange") != "SZSE" or info.get("underlying_code") != "159922"
+                    or not info.get("listed_date") or not info.get("last_trade_date")
+                    or not str(info["listed_date"])[:10] <= day < str(info["last_trade_date"])[:10]
+                    or str(info["contract_code"]) in codes):
+                continue
+            result.append({**info, "trade_date": day, "close_price": None,
+                           "volume": None, "turnover": None, "missing_contract": True})
+            codes.add(str(info["contract_code"]))
+    return result
+
+
 class DbTools:
     FIELD_LIMITS = {
         'open_price': 999999.99,
@@ -8124,6 +8145,7 @@ class DbTools:
             daily.pre_settle_source,
             daily.volume,
             daily.turnover,
+            info.listed_date,
             info.last_trade_date,
             info.expire_date
         FROM option_exchange_contract_daily_data daily
@@ -8144,7 +8166,20 @@ class DbTools:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(query, params)
-                return list(await cursor.fetchall())
+                rows = list(await cursor.fetchall())
+                if "159922" not in normalized_codes:
+                    return rows
+                await cursor.execute("""
+                    SELECT exchange,contract_code,contract_trade_code,contract_name,
+                           underlying_code,underlying_name,option_type,contract_month,
+                           strike_price,listed_date,last_trade_date,expire_date
+                    FROM option_exchange_contract_info
+                    WHERE exchange='SZSE' AND underlying_code='159922'
+                      AND listed_date<=%s AND last_trade_date>%s
+                    ORDER BY contract_code
+                """, (str(end_date), str(start_date)))
+                contracts = list(await cursor.fetchall())
+                return add_missing_szse_159922_contract_rows(rows, contracts)
 
     async def get_quant_index_dashboard_etf_closes(
         self,

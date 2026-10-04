@@ -1685,23 +1685,32 @@ def build_exchange_option_price_payload(trade_date, etf_close, product_rows):
     return payload
 
 
-def build_exchange_option_flow_payload(trade_date, product_rows):
+def build_exchange_option_flow_payload(trade_date, product_rows, *, require_complete_turnover=False):
     totals = {
         "CALL": {"volume": 0.0, "turnover": 0.0, "volume_seen": False, "turnover_seen": False},
         "PUT": {"volume": 0.0, "turnover": 0.0, "volume_seen": False, "turnover_seen": False},
     }
+    expected = 0
+    missing_contracts = []
+    missing_turnover = []
     for row in product_rows or []:
         if is_exchange_option_contract_expired(row, trade_date):
             continue
         option_type = str(row.get("option_type") or "").strip().upper()
         if option_type not in totals:
             continue
+        expected += 1
+        code = str(row.get("contract_code") or "")
+        if row.get("missing_contract"):
+            missing_contracts.append(code)
         volume = to_float(row.get("volume"))
         turnover = to_float(row.get("turnover"))
+        if turnover is None or not math.isfinite(turnover) or turnover < 0:
+            missing_turnover.append(code)
         if volume is not None and volume >= 0:
             totals[option_type]["volume"] += volume
             totals[option_type]["volume_seen"] = True
-        if turnover is not None and turnover >= 0:
+        if turnover is not None and math.isfinite(turnover) and turnover >= 0:
             totals[option_type]["turnover"] += turnover
             totals[option_type]["turnover_seen"] = True
 
@@ -1710,6 +1719,19 @@ def build_exchange_option_flow_payload(trade_date, product_rows):
         payload["option_volume_pc_ratio"] = totals["PUT"]["volume"] / totals["CALL"]["volume"]
     if totals["CALL"]["turnover_seen"] and totals["CALL"]["turnover"] > 0:
         payload["option_turnover_pc_ratio"] = totals["PUT"]["turnover"] / totals["CALL"]["turnover"]
+    if require_complete_turnover:
+        complete = (expected > 0 and not missing_contracts and not missing_turnover
+                    and all(totals[kind]["turnover_seen"] for kind in ("CALL", "PUT")))
+        if not complete:
+            payload["option_turnover_pc_ratio"] = None
+        payload["turnover_coverage"] = {
+            "complete": complete, "expected_contracts": expected,
+            "present_contracts": expected - len(missing_contracts),
+            "missing_contracts": missing_contracts,
+            "missing_turnover_contracts": missing_turnover,
+            "source_date": normalize_date_text(trade_date),
+            "missing_reason": None if complete else "Full official contract turnover is incomplete",
+        }
     return payload
 
 
@@ -1753,7 +1775,10 @@ def build_exchange_option_pc_map(option_rows, etf_close_map):
                 product_rows,
             )
         )
-        payload.update(build_exchange_option_flow_payload(trade_date, product_rows))
+        payload.update(build_exchange_option_flow_payload(
+            trade_date, product_rows,
+            require_complete_turnover=(exchange == "SZSE" and underlying_code == "159922"),
+        ))
         index_name = index_names_by_source[(exchange, underlying_code)]
         result.setdefault((trade_date, index_name), {})[payload["source_key"]] = payload
     return result
