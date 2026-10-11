@@ -17,6 +17,9 @@ from playwright.async_api import async_playwright
 from rapidocr_onnxruntime import RapidOCR
 
 from akshare_project.collectors import quant_index
+from akshare_project.collectors.douyin_local_asr import (
+    ASR_METHOD, MAX_ATTEMPTS, transcribe_official_source, validate_player_snapshot, validate_media_url,
+)
 from akshare_project.core.logging_utils import echo_and_log, get_logger
 from akshare_project.core.paths import get_cache_dir, get_state_path
 from akshare_project.db.db_tool import DbTools
@@ -79,6 +82,25 @@ class DuplicateTranscriptError(RuntimeError):
     pass
 
 
+class IncompleteEmotionTranscriptError(ValueError):
+    """Verified local transcript has some metrics but cannot satisfy four."""
+
+    def __init__(self, transcript, values):
+        self.transcript = transcript
+        self.values = dict(values)
+        confirmed = "、".join(
+            f"{aliases[0]}={values[field]:g}"
+            for field, aliases in INDEX_SPECS.items() if field in values
+        )
+        missing = "、".join(
+            aliases[0] for field, aliases in INDEX_SPECS.items() if field not in values
+        )
+        super().__init__(
+            f"本次转写指标不完整：已确认 {len(values)}/4 项（{confirmed}）；"
+            f"尚无可核验数值：{missing}"
+        )
+
+
 def print(*args, **kwargs):
     echo_and_log(LOGGER, *args, **kwargs)
 
@@ -131,7 +153,7 @@ async def assert_transcript_is_new(video_card, transcript):
             previous_transcript = str(previous.get("raw_ocr_text") or "").strip()
             if transcripts_are_duplicates(transcript, previous_transcript):
                 raise DuplicateTranscriptError(
-                    f"Coze 返回了 {previous_date.isoformat()} 作品 "
+                    f"转写返回了 {previous_date.isoformat()} 作品 "
                     f"{previous.get('video_id') or '-'} 的旧文案"
                 )
     finally:
@@ -184,6 +206,7 @@ def is_profile_works_card(raw_card):
     href = str(raw_card.get("href") or "").strip().lower()
     return (
         not bool(raw_card.get("inside_footer"))
+        and not bool(raw_card.get("is_pinned"))
         and "source=baiduspider" not in href
     )
 
@@ -422,7 +445,7 @@ def select_latest_video(video_cards, target_date=None, excluded_video_ids=None):
     valid_cards = [
         card
         for card in video_cards
-        if isinstance(card.get("published_at"), datetime)
+        if isinstance(card.get("published_at"), datetime) and not card.get("is_pinned")
     ]
     if not valid_cards:
         raise ValueError("无法确定抖音视频发布时间")
@@ -665,7 +688,7 @@ def _extract_unique_metric(text, aliases, label):
     return distinct_values[0]
 
 
-def parse_transcript_emotions(transcript):
+def _extract_transcript_emotions(transcript, *, allow_missing=False):
     text = clean_text(transcript)
     text = re.sub(
         r"(上证|沪深|中证)\s+(50|300|500|1000)",
@@ -673,7 +696,7 @@ def parse_transcript_emotions(transcript):
         text,
     )
     if not text:
-        raise ValueError("Coze 未返回可解析文案")
+        raise ValueError("未返回可解析文案")
 
     result = {}
     sz50_hs300 = _extract_pair_metrics(
@@ -699,8 +722,28 @@ def parse_transcript_emotions(transcript):
     for field_name, aliases in INDEX_SPECS.items():
         if field_name in result:
             continue
-        result[field_name] = _extract_unique_metric(text, aliases, aliases[0])
+        try:
+            result[field_name] = _extract_unique_metric(text, aliases, aliases[0])
+        except ValueError as exc:
+            if not allow_missing or not str(exc).startswith("文案缺少"):
+                raise
     return result
+
+
+def parse_transcript_emotions(transcript):
+    return _extract_transcript_emotions(transcript)
+
+
+def _parse_video_transcript(transcript):
+    try:
+        return parse_transcript_emotions(transcript)
+    except ValueError as exc:
+        if not str(exc).startswith("文案缺少"):
+            raise
+        partial = _extract_transcript_emotions(transcript, allow_missing=True)
+        if partial:
+            raise IncompleteEmotionTranscriptError(transcript, partial) from exc
+        raise
 
 
 def build_extraction_status(values):
@@ -848,44 +891,27 @@ async def initialize_login(timeout_seconds=900):
     async with async_playwright() as playwright:
         context = await launch_browser_context(playwright, headless=False)
         douyin_page = await context.new_page()
-        coze_page = await context.new_page()
         try:
             await douyin_page.goto(ACCOUNT_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-            await coze_page.goto(COZE_AGENT_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-            print("已打开抖音和 Coze，请在两个页面完成登录。脚本会自动检测登录状态。")
-
+            print("已打开抖音，请完成登录。脚本会自动检测登录状态。")
             deadline = asyncio.get_running_loop().time() + timeout_seconds
-            last_status = None
             while asyncio.get_running_loop().time() < deadline:
-                douyin_ready = await is_douyin_authenticated(douyin_page)
-                coze_ready = await is_coze_authenticated(coze_page)
-                status = (douyin_ready, coze_ready)
-                if status != last_status:
-                    print(f"登录状态：抖音={'已登录' if douyin_ready else '待登录'}，Coze={'已登录' if coze_ready else '待登录'}")
-                    last_status = status
-                if douyin_ready and coze_ready:
+                if await is_douyin_authenticated(douyin_page):
                     await persist_browser_storage_state(context)
                     LOGIN_STATE_PATH.write_text(
-                        json.dumps(
-                            {
-                                "ready": True,
-                                "verified_at": datetime.now(SHANGHAI_TZ).isoformat(),
-                                "account_url": ACCOUNT_URL,
-                                "coze_agent_url": COZE_AGENT_URL,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        encoding="utf-8",
+                        json.dumps({"ready": True,
+                                    "verified_at": datetime.now(SHANGHAI_TZ).isoformat(),
+                                    "account_url": ACCOUNT_URL,
+                                    "extraction_engine": "local_turbo_asr"},
+                                   ensure_ascii=False, indent=2), encoding="utf-8",
                     )
                     os.chmod(LOGIN_STATE_PATH, 0o600)
-                    print("抖音和 Coze 登录已确认，持久化会话已保存。")
+                    print("抖音登录已确认，持久化会话已保存。")
                     return {"status": "SUCCESS", "verified_at": datetime.now(SHANGHAI_TZ).isoformat()}
                 await asyncio.sleep(2)
         finally:
             await context.close()
-
-    raise TimeoutError("等待抖音和 Coze 登录超时")
+    raise TimeoutError("等待抖音登录超时")
 
 
 async def _open_douyin_account(page):
@@ -909,6 +935,7 @@ async def collect_video_cards(page, *, max_cards=MAX_VIDEO_CARDS, stop_before_da
             elements => elements.map(element => ({
                 href: element.href || element.getAttribute('href') || '',
                 inside_footer: Boolean(element.closest('footer, [data-e2e="page-footer"]')),
+                is_pinned: /置顶/.test(element.innerText || ''),
                 title: (
                     element.getAttribute('aria-label')
                     || element.getAttribute('title')
@@ -1198,9 +1225,33 @@ def _build_raw_row(video_card, values, transcript, status):
         "extraction_method": (
             "note_rapidocr+local_parser"
             if video_card.get("content_type", "video") == "note"
-            else "coze_transcript+local_parser"
+            else video_card.get("extraction_method", ASR_METHOD)
         ),
         "extraction_status": status,
+    }
+
+
+async def _persist_partial(video_card, error):
+    emotion_date = video_card["published_at"].astimezone(SHANGHAI_TZ).date().isoformat()
+    db_tools = DbTools()
+    await db_tools.init_pool()
+    try:
+        normalized = await db_tools.batch_douyin_emotion_to_excel(
+            emotion_date, video_card["video_id"], error.values,
+            data_source="douyin_local_asr", allow_partial=True,
+        )
+        await db_tools.upsert_douyin_emotion_daily(
+            [_build_raw_row(video_card, error.values, error.transcript, "PARTIAL")]
+        )
+    finally:
+        await db_tools.close()
+    return {
+        "status": "PARTIAL", "target_date": emotion_date,
+        "video_id": video_card["video_id"], "video_url": video_card["video_url"],
+        "values": error.values,
+        "missing_fields": [field for field in INDEX_SPECS if field not in error.values],
+        "missing_reason": "作品转写未提供可核验数值", "normalized": normalized,
+        "extraction_method": ASR_METHOD,
     }
 
 
@@ -1216,6 +1267,7 @@ async def _persist_success(video_card, values, transcript):
             emotion_date,
             video_card["video_id"],
             values,
+            data_source=("douyin_local_asr" if video_card.get("content_type", "video") != "note" else "douyin_coze"),
         )
         if normalized["available_rows"] != 4:
             raise RuntimeError(
@@ -1264,6 +1316,11 @@ async def _already_processed(video_card):
         existing = await db_tools.get_douyin_emotion_by_video_id(video_card["video_id"])
         if not existing or str(existing.get("extraction_status") or "").upper() != "SUCCESS":
             return None
+        emotion_date = video_card["published_at"].astimezone(SHANGHAI_TZ).date().isoformat()
+        if str(existing.get("emotion_date")) != emotion_date:
+            raise ValueError("已落库作品日期与目标作品不一致")
+        if str(existing.get("account_id") or "") != ACCOUNT_ID:
+            raise ValueError("已落库作品作者与指定账号不一致")
         values = {field_name: existing.get(field_name) for field_name in INDEX_SPECS}
         if any(value is None for value in values.values()):
             return None
@@ -1271,6 +1328,7 @@ async def _already_processed(video_card):
             video_card["published_at"].astimezone(SHANGHAI_TZ).date().isoformat(),
             video_card["video_id"],
             values,
+            data_source=("douyin_local_asr" if existing.get("extraction_method") == ASR_METHOD else "douyin_coze"),
         )
         return values, normalized
     finally:
@@ -1284,14 +1342,101 @@ async def _recover_existing_transcript(video_card):
         existing = await db_tools.get_douyin_emotion_by_video_id(video_card["video_id"])
     finally:
         await db_tools.close()
-    transcript = str((existing or {}).get("raw_ocr_text") or "").strip()
+    expected_method = "note_rapidocr+local_parser" if video_card.get("content_type", "video") == "note" else ASR_METHOD
+    emotion_date = video_card["published_at"].astimezone(SHANGHAI_TZ).date().isoformat()
+    if (not existing or existing.get("extraction_method") != expected_method
+            or str(existing.get("emotion_date")) != emotion_date
+            or str(existing.get("account_id") or "") != ACCOUNT_ID):
+        return None
+    transcript = str(existing.get("raw_ocr_text") or "").split("\n\nERROR:\n", 1)[0].strip()
     if not transcript:
         return None
     try:
+        transcript_date = extract_labeled_transcript_date(transcript)
+        if transcript_date and transcript_date != emotion_date:
+            return None
         await assert_transcript_is_new(video_card, transcript)
-        return transcript, parse_transcript_emotions(transcript)
+        values = (
+            parse_transcript_emotions(transcript)
+            if video_card.get("content_type", "video") == "note"
+            else _parse_video_transcript(transcript)
+        )
+        return transcript, values
+    except IncompleteEmotionTranscriptError:
+        raise
     except (ValueError, DuplicateTranscriptError):
         return None
+
+
+async def read_official_video_source(page, selected):
+    official_media_urls = set()
+    official_response_diagnostics = set()
+
+    def record_official_media_response(response):
+        try:
+            validate_media_url(response.url)
+            official_response_diagnostics.add((response.status, response.request.resource_type, response.headers.get("content-type", "").split(";", 1)[0], response.request.frame == page.main_frame))
+            if (response.status in (200, 206)
+                    and response.request.frame == page.main_frame
+                    and response.request.resource_type in {"media", "xhr", "fetch"}
+                    and response.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "video/mp4"):
+                official_media_urls.add(response.url)
+        except Exception:
+            # Ignore unrelated resources without logging signed URLs.
+            return
+
+    page.on("response", record_official_media_response)
+    try:
+        await page.goto(selected["video_url"], wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        for _ in range(15):
+            await page.wait_for_timeout(2000)
+            if not await is_douyin_authenticated(page):
+                raise AuthenticationRequiredError("抖音登录已失效，请运行 python run.py douyin login")
+            snapshot = await page.evaluate("""videoId => {
+                const visible = element => {
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const detail = document.querySelector('[data-e2e="detail-video-info"][data-e2e-aweme-id="' + videoId + '"]');
+                const published = detail && detail.querySelector('[data-e2e="detail-video-publish-time"]');
+                const authorCard = [...document.querySelectorAll('[data-e2e="user-info"]')].find(visible);
+                const authorLinks = authorCard ? [...authorCard.querySelectorAll('a[href*="/user/"]')]
+                    .filter(visible).filter(element => element.innerText.trim()) : [];
+                return {
+                    page_url: location.href, page_title: document.title,
+                    detail_video_id: detail ? detail.getAttribute('data-e2e-aweme-id') : '',
+                    published_text: published ? published.innerText : '',
+                    author_name: authorLinks.length ? authorLinks[0].innerText.trim() : '',
+                    author_links: authorLinks.map(element => element.href),
+                    players: [...document.querySelectorAll('video')].filter(visible)
+                        .map(element => ({current_src: element.currentSrc, duration: element.duration, video_width: element.videoWidth, video_height: element.videoHeight})),
+                };
+            }""", str(selected["video_id"]))
+            snapshot["official_media_urls"] = sorted(official_media_urls)
+            players = snapshot.get("players") or []
+            if players and str(players[0].get("current_src") or "").startswith("blob:") and not official_media_urls:
+                continue
+            if players and all(player.get("current_src") and player.get("duration") for player in players):
+                source = validate_player_snapshot(snapshot, selected, account_url=ACCOUNT_URL, account_name=ACCOUNT_NAME)
+                selected["video_title"] = clean_text(source["page_title"]) or selected.get("video_title")
+                return source
+        raise TimeoutError(f"等待抖音官方播放器媒体源超时；官方响应概要={sorted(official_response_diagnostics)}")
+    finally:
+        page.remove_listener("response", record_official_media_response)
+
+async def request_local_video_transcript(page, selected):
+    if page is None:
+        raise RuntimeError("本地视频转写缺少抖音页面")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        source = await read_official_video_source(page, selected)
+        try:
+            return await transcribe_official_source(source)
+        except ConnectionError:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            print(f"官方视频下载第 {attempt} 次连接失败，重新取得播放器地址后重试。")
+            await page.wait_for_timeout(2000)
 
 
 async def _process_video_card(coze_page, selected, douyin_page=None):
@@ -1310,7 +1455,10 @@ async def _process_video_card(coze_page, selected, douyin_page=None):
             "dashboard_rows": dashboard_rows,
         }
 
-    recovered = await _recover_existing_transcript(selected)
+    try:
+        recovered = await _recover_existing_transcript(selected)
+    except IncompleteEmotionTranscriptError as exc:
+        return await _persist_partial(selected, exc)
     if recovered is not None:
         transcript, values = recovered
         normalized, dashboard_rows = await _persist_success(selected, values, transcript)
@@ -1336,30 +1484,21 @@ async def _process_video_card(coze_page, selected, douyin_page=None):
                 selected["video_url"],
             )
         else:
-            coze_video_url = selected["video_url"]
-            if douyin_page is not None:
-                coze_video_url = await resolve_douyin_share_url(
-                    douyin_page,
-                    selected["video_url"],
-                )
-            async def validate_transcript(candidate):
-                await assert_transcript_is_new(selected, candidate)
-                parse_transcript_emotions(candidate)
-
-            transcript = await request_coze_transcript_with_retry(
-                coze_page,
-                coze_video_url,
-                transcript_validator=validate_transcript,
-            )
+            transcript, asr_metadata = await request_local_video_transcript(douyin_page, selected)
+            selected["extraction_method"] = ASR_METHOD
+            selected["asr_metadata"] = asr_metadata
+            await assert_transcript_is_new(selected, transcript)
         transcript_date = extract_labeled_transcript_date(transcript)
         if transcript_date and transcript_date != emotion_date:
             raise ValueError(
                 f"文案日期 {transcript_date} 与作品发布日期 {emotion_date} 不一致"
             )
         if content_type != "note":
-            values = parse_transcript_emotions(transcript)
+            values = _parse_video_transcript(transcript)
         normalized, dashboard_rows = await _persist_success(selected, values, transcript)
     except Exception as exc:
+        if isinstance(exc, IncompleteEmotionTranscriptError):
+            return await _persist_partial(selected, exc)
         if is_non_emotion_content_failure(selected, values, exc):
             await _persist_failed(
                 selected,
@@ -1446,9 +1585,9 @@ async def run_pipeline_with_context(
                 "latest_video_id": latest["video_id"],
                 "minimum_publish_time": EMOTION_CONTENT_MIN_PUBLISH_TIME.strftime("%H:%M"),
             }
-        async def process_selected(coze_page):
+        async def process_selected():
             try:
-                result = await _process_video_card(coze_page, selected, douyin_page=douyin_page)
+                result = await _process_video_card(None, selected, douyin_page=douyin_page)
             except NonEmotionContentError:
                 await persist_browser_storage_state(context)
                 return {
@@ -1467,23 +1606,9 @@ async def run_pipeline_with_context(
             await persist_browser_storage_state(context)
             return result
 
-        if show_coze and selected.get("content_type", "video") != "note":
-            async with async_playwright() as coze_playwright:
-                browser, coze_context = await launch_visible_coze_context(coze_playwright)
-                try:
-                    coze_page = await coze_context.new_page()
-                    return await process_selected(coze_page)
-                finally:
-                    try:
-                        await persist_browser_storage_state(coze_context)
-                    finally:
-                        await browser.close()
-
-        coze_page = await context.new_page()
-        try:
-            return await process_selected(coze_page)
-        finally:
-            await coze_page.close()
+        # Keep show_coze as a compatibility argument; formal collection needs
+        # only the authenticated Douyin page and the offline ASR worker.
+        return await process_selected()
     finally:
         if owns_douyin_page:
             await douyin_page.close()
@@ -1580,7 +1705,7 @@ class PersistentDouyinBrowserSession:
                     douyin_page=self._douyin_page,
                     show_coze=self.show_coze,
                 )
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 await self._close_browser()
                 raise
 
@@ -1608,7 +1733,7 @@ class PersistentDouyinBrowserSession:
 
 async def run_pipeline(target_date=None):
     if not LOGIN_STATE_PATH.exists() or not STORAGE_STATE_PATH.exists():
-        raise AuthenticationRequiredError("尚未初始化抖音和 Coze 登录，请运行 python run.py douyin login")
+        raise AuthenticationRequiredError("尚未初始化抖音登录，请运行 python run.py douyin login")
 
     with single_instance_lock():
         async with async_playwright() as playwright:
@@ -1633,7 +1758,7 @@ async def sync_daily(target_date=None):
 
 async def backfill_history(start_date=None, end_date=None):
     if not LOGIN_STATE_PATH.exists() or not STORAGE_STATE_PATH.exists():
-        raise AuthenticationRequiredError("尚未初始化抖音和 Coze 登录，请运行 python run.py douyin login")
+        raise AuthenticationRequiredError("尚未初始化抖音登录，请运行 python run.py douyin login")
 
     today = datetime.now(SHANGHAI_TZ).date()
     normalized_start = date.fromisoformat(str(start_date)) if start_date else today.replace(day=1)
@@ -1679,7 +1804,6 @@ async def backfill_history(start_date=None, end_date=None):
                 headless=os.getenv("DOUYIN_COZE_HEADLESS", "0").strip() == "1",
             )
             douyin_page = await context.new_page()
-            coze_page = await context.new_page()
             try:
                 await _open_douyin_account(douyin_page)
                 await persist_browser_storage_state(context)
@@ -1710,7 +1834,7 @@ async def backfill_history(start_date=None, end_date=None):
                     print(f"douyin backfill {trade_date}: processing video {card['video_id']}")
                     try:
                         result = await _process_video_card(
-                            coze_page,
+                            None,
                             card,
                             douyin_page=douyin_page,
                         )

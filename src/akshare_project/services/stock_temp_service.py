@@ -2,7 +2,7 @@ import asyncio
 import json
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +14,7 @@ from akshare_project.collectors import (
     bank_liquidity,
     cffex,
     douyin_emotion,
+    douyin_local_asr,
     etf,
     exchange_option,
     excel_emotion,
@@ -67,7 +68,7 @@ class DouyinPersistentBrowserRunner:
         self._loop = loop
         self._session = douyin_emotion.PersistentDouyinBrowserSession(
             headless=True,
-            show_coze=True,
+            show_coze=False,
         )
         self._ready.set()
         try:
@@ -112,7 +113,11 @@ class DouyinPersistentBrowserRunner:
             self._run(target_date, keep_browser_open, browser_close_at),
             self._loop,
         )
-        return future.result(timeout=1800)
+        try:
+            return future.result(timeout=1800)
+        except TimeoutError as exc:
+            future.cancel()
+            raise RuntimeError("抖音情绪采集总超时，已请求取消浏览器与本地转写任务") from exc
 
     def close(self):
         with self._state_lock:
@@ -133,6 +138,24 @@ class DouyinPersistentBrowserRunner:
 
 
 DOUYIN_BROWSER_RUNNER = DouyinPersistentBrowserRunner()
+_ACTIVE_REQUESTS_LOCK = threading.Lock()
+_ACTIVE_REQUESTS = {}
+
+
+@contextmanager
+def track_service_request(task_name, *, daily=False):
+    token = object()
+    with _ACTIVE_REQUESTS_LOCK:
+        _ACTIVE_REQUESTS[token] = {
+            "task_name": task_name,
+            "started_at": now_text(),
+            "daily": bool(daily),
+        }
+    try:
+        yield
+    finally:
+        with _ACTIVE_REQUESTS_LOCK:
+            _ACTIVE_REQUESTS.pop(token, None)
 
 
 def print(*args, **kwargs):
@@ -153,12 +176,20 @@ def load_service_config():
 
 def build_health_payload():
     config = load_service_config()
+    with _ACTIVE_REQUESTS_LOCK:
+        active_requests = [dict(item) for item in _ACTIVE_REQUESTS.values()]
+    active_daily_requests = [item for item in active_requests if item["daily"]]
     return {
         "status": "ok",
         "service": "stock_temp_service",
         "host": config["host"],
         "port": config["port"],
         "thread": threading.current_thread().name,
+        "active_request_count": len(active_requests),
+        "active_requests": active_requests,
+        "active_daily_request_count": len(active_daily_requests),
+        "active_daily_requests": active_daily_requests,
+        "douyin": douyin_local_asr.runtime_readiness(),
     }
 
 
@@ -490,6 +521,7 @@ def build_daily_routes() -> Dict[str, DailyRoute]:
             task_name="excel_emotion_import",
             handler=lambda: excel_emotion.import_excel("情绪指标.xlsx"),
         ),
+        # Preserve the existing FIT route/task contract; videos now use local ASR.
         "/collect-douyin-coze-emotion-daily": DailyRoute(
             path="/collect-douyin-coze-emotion-daily",
             task_name="douyin_coze_emotion_daily",
@@ -640,7 +672,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
         started_monotonic = time.perf_counter()
         try:
             context = without_proxy_env() if route.direct_network else nullcontext()
-            with context:
+            with context, track_service_request(route.task_name, daily=True):
                 if route.task_name in payload_task_names:
                     allowed_keys = {"target_date"}
                     if route.task_name == "douyin_coze_emotion_daily":
@@ -716,11 +748,12 @@ class StockTempHandler(BaseHTTPRequestHandler):
 
         if normalized_path == "/collect-forex":
             try:
-                result = asyncio.run(
-                    forex.collect_symbol_history_for_request(
-                        symbol_code=payload.get("symbol_code"),
+                with track_service_request("forex_history_request"):
+                    result = asyncio.run(
+                        forex.collect_symbol_history_for_request(
+                            symbol_code=payload.get("symbol_code"),
+                        )
                     )
-                )
                 self._send_json(200, result)
             except ValueError as exc:
                 self._send_json(400, {"status": "INVALID_REQUEST", "error": str(exc)})
@@ -730,7 +763,7 @@ class StockTempHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with without_proxy_env():
+            with without_proxy_env(), track_service_request("stock_hfq_request"):
                 result = asyncio.run(
                     stock.collect_hfq_for_request(
                         stock_code=payload.get("stock_code"),

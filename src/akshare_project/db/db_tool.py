@@ -3096,13 +3096,16 @@ class DbTools:
         query = """
         SELECT
             emotion_date,
+            account_id,
+            account_name,
             video_id,
             hs300_emotion,
             zz500_emotion,
             zz1000_emotion,
             sz50_emotion,
             raw_ocr_text,
-            extraction_status
+            extraction_status,
+            extraction_method
         FROM douyin_index_emotion_daily
         WHERE video_id = %s
         LIMIT 1
@@ -3120,6 +3123,8 @@ class DbTools:
         query = """
         SELECT
             emotion_date,
+            account_id,
+            account_name,
             video_id,
             video_title,
             video_url,
@@ -3128,7 +3133,8 @@ class DbTools:
             zz1000_emotion,
             sz50_emotion,
             raw_ocr_text,
-            extraction_status
+            extraction_status,
+            extraction_method
         FROM douyin_index_emotion_daily
         WHERE emotion_date = %s
         ORDER BY updated_at DESC, id DESC
@@ -3140,10 +3146,12 @@ class DbTools:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
-    async def batch_douyin_emotion_to_excel(self, emotion_date, video_id, values):
+    async def batch_douyin_emotion_to_excel(self, emotion_date, video_id, values, *, data_source="douyin_coze", allow_partial=False):
         if self.pool is None:
             await self.init_pool()
 
+        if data_source not in {"douyin_coze", "douyin_local_asr"}:
+            raise ValueError("unsupported douyin emotion data source")
         normalized_date = str(emotion_date or "").strip()
         normalized_video_id = str(video_id or "").strip()
         index_value_map = {
@@ -3152,8 +3160,12 @@ class DbTools:
             "中证500": self._normalize_numeric("douyin_emotion_value", values.get("zz500_emotion")),
             "中证1000": self._normalize_numeric("douyin_emotion_value", values.get("zz1000_emotion")),
         }
-        if not normalized_date or not normalized_video_id or any(value is None for value in index_value_map.values()):
-            raise ValueError("douyin emotion normalization requires a date, video id, and four values")
+        supplied = {name: value for name, value in index_value_map.items() if value is not None}
+        if not normalized_date or not normalized_video_id or not supplied or (not allow_partial and len(supplied) != 4):
+            raise ValueError("douyin emotion normalization requires a date, video id, and four values (or an explicit verified subset)")
+        if any(value is not None and (isinstance(value, bool) or self._normalize_numeric("douyin_emotion_value", value) is None or not 0 <= float(value) <= 100) for value in values.values()):
+            raise ValueError("douyin emotion values must be finite numbers in [0, 100]")
+        index_value_map = supplied
 
         source_file = f"douyin:{normalized_video_id}"
         async with self.pool.acquire() as conn:
@@ -3184,7 +3196,7 @@ class DbTools:
                             index_name,
                             round(float(emotion_value), 2),
                             source_file,
-                            "douyin_coze",
+                            data_source,
                         )
                     )
 
@@ -3207,6 +3219,20 @@ class DbTools:
                         rows_to_upsert,
                     )
 
+                # Update only existing dashboard emotions backed by this verified subset.
+                # Preserve manual/Excel precedence and all risk/strategy/derived fields.
+                if allow_partial:
+                    placeholders = ", ".join(["%s"] * len(index_value_map))
+                    await cursor.execute(
+                        f"""UPDATE quant_index_dashboard_daily AS dashboard
+                        JOIN excel_index_emotion_daily AS emotion
+                          ON emotion.emotion_date = dashboard.trade_date
+                         AND emotion.index_name = dashboard.index_name
+                        SET dashboard.emotion_value = emotion.emotion_value
+                        WHERE dashboard.trade_date = %s
+                          AND emotion.index_name IN ({placeholders})""",
+                        [normalized_date, *index_value_map],
+                    )
                 await cursor.execute(
                     """
                     SELECT COUNT(DISTINCT index_name) AS row_count
